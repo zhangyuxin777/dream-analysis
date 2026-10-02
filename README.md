@@ -59,5 +59,14 @@ pm2 start ecosystem.config.js && pm2 list && pm2 save
 |---|---|
 | `doctor` 报 OSS 不通 | `oss.endpoint` 是不是内网域名用在了非阿里云机器上（本机要用公网域名） |
 | 拉取全部跳过 | ETag 未变 = 数据没更新（正常）；要强制重扫用 `sync --force` |
+| `sync` 报"已有同步在进行" | 常驻进程正在跑（跨进程锁 `runtime/sync.lock`）；等下一轮，或确认没有僵尸进程后删掉该文件 |
+| 某天分片一直不拉、`status` 里有"失败退避中" | 同内容按 30min×2^n（上限 6h）退避；上传侧重算（ETag 变）会立刻重试；急着要就 `sync --force` |
 | 行数不符告警 | 上传侧分片与 `header.count` 不一致 → 看 `logs/` 里的 MISMATCH 明细 |
 | 结果标「暂定」 | 窗口里含 `final:false` 的当天数据（当天未封存，属正常） |
+| 报告里出现「数据口径变更」 | 上传侧 `whitelistVersion` 变了 —— 跨这次变更的统计不可直接比较 |
+
+## 开发约定
+
+- 零运行时依赖；测试 `npm test`（node:test，113 个用例，~0.25s）。
+- 覆盖率硬门槛：`npm run test:coverage`（Node 原生 `--test-coverage-*`，80/80/80，不达标 exit 1）。
+- 加测试 = 在 `__tests__/` 新建 `*.test.js`，`package.json` 不用改（集合 = 磁盘发现）。

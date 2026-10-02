@@ -9,6 +9,8 @@
  *   verify <key>     下载并校验某个分片（不入库、不动水位线）—— 契约核对用
  *
  * 约定：所有输出都不含凭据（AK/SK 只存在于 ossutil 配置文件里，本项目从不读取）。
+ * 可测性：命令函数接受显式 `CommandContext`（config/logger/store 全部注入），
+ * 单测可以用假 store + 临时目录把每条命令真正跑一遍，而不是只测参数解析。
  */
 import * as fs from 'fs';
 import * as os from 'os';
@@ -28,13 +30,23 @@ const ROOT_DIR = path.resolve(__dirname, '..', '..');
 /** 连接类稀疏事件的前缀：契约核对里要确认上传侧把它们放进来了（DESIGN §3.4-③） */
 const CONNECTION_EVENT_PREFIXES = ['UDS_', 'MARKET_STREAM_', 'WORKER_WS_', 'ORDER_CANCELED'];
 
-function buildStore(config: AppConfig): ObjectStore {
+export interface CommandContext {
+  config: AppConfig;
+  logger: ILogger;
+  store: ObjectStore;
+}
+
+export function buildStore(config: AppConfig): ObjectStore {
   return new OssutilStore({
     binary: config.oss.binary,
     endpoint: config.oss.endpoint,
     bucket: config.oss.bucket,
     configFile: config.oss.configFile || undefined,
   });
+}
+
+export function buildContext(config: AppConfig, logger: ILogger): CommandContext {
+  return { config, logger, store: buildStore(config) };
 }
 
 function buildLogger(config: AppConfig): ILogger {
@@ -44,7 +56,7 @@ function buildLogger(config: AppConfig): ILogger {
   });
 }
 
-function applyNice(config: AppConfig, logger: ILogger): void {
+export function applyNice(config: AppConfig, logger: ILogger): void {
   const nice = config.process.nice;
   if (!nice) return;
   try {
@@ -55,9 +67,16 @@ function applyNice(config: AppConfig, logger: ILogger): void {
   }
 }
 
-async function cmdRun(config: AppConfig, logger: ILogger): Promise<number> {
+/**
+ * `verify` / `doctor --deep` 用的临时路径：**故意与同步用的 `.tmp/<instance>/<date>.jsonl.gz` 分开**
+ * —— 否则在校验进行中触发同步（或反过来），两边会互相覆盖/删除同一个 tmp 文件，导致一次假失败。
+ */
+export function verifyTmpPathOf(config: AppConfig, instance: string, date: string): string {
+  return path.join(config.runtime.dataDir, '.tmp', 'verify', `${instance}-${date}.jsonl.gz`);
+}
+
+export async function cmdRun(config: AppConfig, logger: ILogger, store: ObjectStore = buildStore(config)): Promise<number> {
   applyNice(config, logger);
-  const store = buildStore(config);
   logger.info('启动常驻服务', {
     name: config.name,
     host: os.hostname(),
@@ -90,23 +109,23 @@ async function cmdRun(config: AppConfig, logger: ILogger): Promise<number> {
   return 0;
 }
 
-async function cmdSync(config: AppConfig, logger: ILogger, force: boolean): Promise<number> {
+export async function cmdSync(ctx: CommandContext, force: boolean): Promise<number> {
+  // 手动同步也是"在 002 上跑的分析任务"，同样要让位于实盘（早期版本漏了这一步）
+  applyNice(ctx.config, ctx.logger);
   const started = Date.now();
-  const result = await runSync({ store: buildStore(config), config, logger: logger.child('sync') }, { force });
-  console.log(`列举 ${result.listed} 个，拉取 ${result.pulled.length}，跳过 ${result.skipped}，忽略 ${result.ignored}，失败 ${result.failed.length}，共 ${formatBytes(result.bytes)}，耗时 ${formatDurationMs(Date.now() - started)}`);
+  const result = await runSync({ store: ctx.store, config: ctx.config, logger: ctx.logger.child('sync') }, { force });
+  if (result.refusedByLock) {
+    console.error('已有同步在进行（可能是常驻进程），本轮未执行；稍后重试即可');
+    return 1;
+  }
+  console.log(`列举 ${result.listed} 个，拉取 ${result.pulled.length}，跳过 ${result.skipped}，忽略 ${result.ignored}，失败 ${result.failed.length}，退避 ${result.deferred.length}，共 ${formatBytes(result.bytes)}，耗时 ${formatDurationMs(Date.now() - started)}`);
+  for (const c of result.whitelistChanges) console.log(`  ⚠️ 数据口径变更: ${c}`);
+  for (const d of result.deferred) console.log(`  ⏸ ${d.key}（已失败 ${d.count} 次，约 ${formatDurationMs(d.retryAfterMs)} 后重试）`);
   for (const f of result.failed) console.error(`  ❌ ${f.key}: ${f.error}`);
   return result.failed.length > 0 ? 1 : 0;
 }
 
-/**
- * `verify` / `doctor --deep` 用的临时路径：**故意与同步用的 `.tmp/<instance>/<date>.jsonl.gz` 分开**
- * —— 否则在校验进行中触发同步（或反过来），两边会互相覆盖/删除同一个 tmp 文件，导致一次假失败。
- */
-function verifyTmpPathOf(config: AppConfig, instance: string, date: string): string {
-  return path.join(config.runtime.dataDir, '.tmp', 'verify', `${instance}-${date}.jsonl.gz`);
-}
-
-async function cmdStatus(config: AppConfig): Promise<number> {
+export async function cmdStatus(config: AppConfig): Promise<number> {
   const stateFile = statePathOf(config);
   const { state, warnings } = loadState(stateFile);
   for (const w of warnings) console.warn(`⚠️  ${w}`);
@@ -121,6 +140,9 @@ async function cmdStatus(config: AppConfig): Promise<number> {
     console.log(
       `上次同步: ${r.finishedAt} 用时 ${formatDurationMs(dur)} | 列举 ${r.listed} / 拉取 ${r.pulled} / 跳过 ${r.skipped} / 忽略 ${r.ignored} / 失败 ${r.failed} (${formatBytes(r.bytes)})`,
     );
+    if (r.refusedByLock) console.log('  本轮因"已有同步在进行"被跳过（跨进程互斥）');
+    if (r.deferred) console.log(`  退避中: ${r.deferred} 个分片（同内容按 30min×2^n 退避，换内容立刻重试）`);
+    for (const c of r.whitelistChanges ?? []) console.log(`  ⚠️ 数据口径变更: ${c}`);
     for (const e of r.errors.slice(0, 5)) console.log(`  ❌ ${e}`);
   }
 
@@ -132,8 +154,9 @@ async function cmdStatus(config: AppConfig): Promise<number> {
     const parsed = parseShardKey(key, config.oss.prefix);
     const label = parsed ? `${parsed.instance.padEnd(10)} ${parsed.date}` : key;
     const flag = obj.final ? '已封存' : '未封存';
+    const wl = obj.whitelistVersion ? `  口径=${obj.whitelistVersion}` : '';
     const warn = obj.warnings.length > 0 ? `  ⚠️ ${obj.warnings.length} 条告警` : '';
-    console.log(`  ${label}  ${flag}  ${formatCount(obj.dataLines)} 行  ${formatBytes(obj.size)}  拉于 ${obj.pulledAt}${warn}`);
+    console.log(`  ${label}  ${flag}  ${formatCount(obj.dataLines)} 行  ${formatBytes(obj.size)}  拉于 ${obj.pulledAt}${wl}${warn}`);
   }
   if (entries.length > 20) console.log(`  … 另有 ${entries.length - 20} 条`);
 
@@ -152,10 +175,10 @@ async function cmdStatus(config: AppConfig): Promise<number> {
     console.log('还没有已封存的分片（final=true）');
   }
 
-  const suspects = Object.entries(state.suspects).filter(([, n]) => n > 0);
+  const suspects = Object.entries(state.suspects).filter(([, s]) => s.count > 0);
   if (suspects.length > 0) {
-    console.log(`连续失败中的分片: ${suspects.length} 个`);
-    for (const [k, n] of suspects.slice(0, 5)) console.log(`  ⚠️ ${k}（已失败 ${n} 次）`);
+    console.log(`失败退避中的分片: ${suspects.length} 个`);
+    for (const [k, s] of suspects.slice(0, 5)) console.log(`  ⏸ ${k}（已失败 ${s.count} 次，最后失败于 ${s.lastErrorAt}）`);
   }
   return 0;
 }
@@ -163,21 +186,20 @@ async function cmdStatus(config: AppConfig): Promise<number> {
 interface CheckResult {
   ok: boolean;
   text: string;
-  fatal?: boolean;
 }
 
-async function cmdDoctor(config: AppConfig, logger: ILogger, deep: boolean): Promise<number> {
-  const store = buildStore(config);
+export async function cmdDoctor(ctx: CommandContext, deep: boolean): Promise<number> {
+  const { config, store } = ctx;
   const checks: CheckResult[] = [];
 
   checks.push({ ok: true, text: `配置: ${config.name} → ${config.oss.bucket}/${config.oss.prefix} @ ${config.oss.endpoint}` });
 
   let version = '';
   try {
-    version = await (store as OssutilStore).version();
+    version = typeof (store as OssutilStore).version === 'function' ? await (store as OssutilStore).version() : '(自定义 store，跳过)';
     checks.push({ ok: true, text: `ossutil: ${version || '(版本未知)'} [${config.oss.binary}]` });
   } catch (err) {
-    checks.push({ ok: false, fatal: true, text: `ossutil 不可用：${err instanceof Error ? err.message : String(err)}` });
+    checks.push({ ok: false, text: `ossutil 不可用：${err instanceof Error ? err.message : String(err)}` });
   }
 
   let metas: Awaited<ReturnType<ObjectStore['list']>> = [];
@@ -247,8 +269,8 @@ async function cmdDoctor(config: AppConfig, logger: ILogger, deep: boolean): Pro
   return allOk ? 0 : 1;
 }
 
-async function cmdList(config: AppConfig): Promise<number> {
-  const store = buildStore(config);
+export async function cmdList(ctx: CommandContext): Promise<number> {
+  const { config, store } = ctx;
   const { state } = loadState(statePathOf(config));
   const metas = await store.list(config.oss.prefix);
   console.log(`远端 ${metas.length} 个对象：`);
@@ -261,18 +283,18 @@ async function cmdList(config: AppConfig): Promise<number> {
   return 0;
 }
 
-async function cmdVerify(config: AppConfig, key: string): Promise<number> {
+export async function cmdVerify(ctx: CommandContext, key: string): Promise<number> {
+  const { config, store } = ctx;
   if (!key) {
     console.error('用法: node dist/bin/analysis.js verify <key>（如 snapshot/boye888/2026-10-02.jsonl.gz）');
     return 1;
   }
-  if (!parseShardKey(key, config.oss.prefix)) {
+  const parsed = parseShardKey(key, config.oss.prefix);
+  if (!parsed) {
     console.error(`键不符合契约（前缀 ${config.oss.prefix}）：${key}`);
     return 1;
   }
-  const parsed = parseShardKey(key, config.oss.prefix)!;
   const tmp = verifyTmpPathOf(config, parsed.instance, parsed.date);
-  const store = buildStore(config);
   await store.getTo(key, tmp);
   const stats = await readShard(tmp, { countIncludesHeader: config.sync.countIncludesHeader });
   fs.rmSync(tmp, { force: true });
@@ -301,7 +323,7 @@ function usage(): void {
 
 命令:
   run                常驻：定时同步（启动立即跑一次）
-  sync [--force]     手动拉取一次（--force 忽略 ETag 强制重扫）
+  sync [--force]     手动拉取一次（--force 忽略 ETag/静默期强制重扫）
   status             数据新鲜度 / 上次同步结果 / 本地分片
   doctor [--deep]    自检（--deep 会下载最新分片做契约核对）
   list               远端对象 vs 本地状态对照
@@ -310,8 +332,7 @@ function usage(): void {
 `);
 }
 
-async function main(): Promise<number> {
-  const argv = process.argv.slice(2);
+export async function main(argv: string[] = process.argv.slice(2)): Promise<number> {
   const command = argv[0] ?? 'help';
 
   if (command === 'help' || command === '--help' || command === '-h') {
@@ -340,15 +361,15 @@ async function main(): Promise<number> {
     case 'run':
       return cmdRun(config, logger);
     case 'sync':
-      return cmdSync(config, logger, argv.includes('--force'));
+      return cmdSync(buildContext(config, logger), argv.includes('--force'));
     case 'status':
       return cmdStatus(config);
     case 'doctor':
-      return cmdDoctor(config, logger, argv.includes('--deep'));
+      return cmdDoctor(buildContext(config, logger), argv.includes('--deep'));
     case 'list':
-      return cmdList(config);
+      return cmdList(buildContext(config, logger));
     case 'verify':
-      return cmdVerify(config, argv[1] ?? '');
+      return cmdVerify(buildContext(config, logger), argv[1] ?? '');
     default:
       console.error(`未知命令: ${command}`);
       usage();
@@ -367,4 +388,4 @@ if (require.main === module) {
     });
 }
 
-export { main };
+export { ROOT_DIR, CONNECTION_EVENT_PREFIXES };

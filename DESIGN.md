@@ -96,11 +96,16 @@ snapshot/<instance>/<YYYY-MM-DD>.jsonl.gz
 
 | 校验 | 判据 | 失败处理 |
 |---|---|---|
-| 可解压 | gzip 解压无异常 | 丢弃 + 下轮重试；连续 3 轮告警 |
+| 可解压 | gzip 解压无异常 | 丢弃 + 退避重试（见 §五） |
 | 首行是 header | `type === "meta"` | 同上（可能拉到别人的对象） |
 | 行数自洽 | 数据行数 == `header.count`（**count 是否含 header 行待确认**，先按"不含"实现，配置留开关） | 告警 + 仍入库，但标注「行数不符」 |
 | 单行可解析 | 非法行计数，不抛 | 进 `warnings`，报告里体现 |
-| 时间自洽 | 行 `ts` ∈ [firstTs, lastTs] 且落在 `date` 当天（允许 ±2h 跨夜） | 告警 |
+| 日期自洽 | 行归属日 = **契约时区（Asia/Shanghai）的本地日**（优先用上传侧的 `localDate`，缺失才按 `ts` 推算），允许 ±2h 跨夜 | 告警 |
+| **独立完整性** | `final:true` 的分片，**我们自己算出来的**首条事件若晚于当天 04:00 ⇒ 疑似只含当日后段（上游尾部窗口截断） | 告警（§3.4-① 的兜底探测） |
+
+> ⚠️ **必须知道的口径弱点**：`header.count / firstTs / lastTs` 都是**上传侧自报**的，拿它们做"自洽性"校验必然通过。
+> 唯一**独立于上传侧**的信号是"我们自己从数据里算出来的首条事件时间"（上表最后一行）——
+> 它能抓住"只导出了尾部窗口"这类最常见的截断，但抓不住"当天中段整段缺失"。要彻底解决只能靠上传侧补 manifest 或独立心跳基准（见 §3.4-①）。
 
 > **"半写文件"这件事在天分片模式下不成立**：OSS 的 PUT（含分片上传 complete）是**原子替换**，消费者要么读到旧版本、要么读到新版本。原设计的"静默期 10 分钟"**取消**，只保留一条轻量竞态保护：**跳过 `LastModified` 不足 1 分钟的对象**。
 
@@ -132,7 +137,7 @@ snapshot/<instance>/<YYYY-MM-DD>.jsonl.gz
 |---|---|
 | `count` | **不含 header 行**（写死） |
 | account 行的 symbol | 固定保留值（建议 `"__account__"`），消费侧不猜 |
-| **新增 `whitelistVersion`** | 白名单版本号/哈希。白名单一变，历史天的"同类事件完整性"就不可比 → 消费侧必须在报告里标注「数据口径于 X 时变更」，否则会出现"利润莫名变化"的假警报 |
+| **新增 `whitelistVersion`** | 白名单版本号/哈希。白名单一变，历史天的"同类事件完整性"就不可比 → 消费侧必须在报告里标注「数据口径于 X 时变更」，否则会出现"利润莫名变化"的假警报。**已落地**：存进 `state.objects[].whitelistVersion`，`status` 显示，跨轮比较到变化时打 warn 并写进 `lastRun.whitelistChanges` |
 | `generatedAt` 的副作用 | 它每次都变 → gzip 字节每次都变 → **ETag 每次都变 → 当天文件每小时必然全量重下**。可接受（量小），但：① 同步频率与产出**同频（每小时）**，不要 10 分钟一次；② 分析服务放**同区**（内网免费）；③ 可选优化：把 `generatedAt` 移出压缩内容（放 OSS 对象 metadata）→ 恢复"内容确定 → ETag 稳定 → 零重下" |
 
 ---
@@ -171,30 +176,41 @@ dream-analysis/
 **一次同步（幂等、可中断）**：
 
 ```
-1. list(snapshot/) → 正则筛出合法天分片键 → [{key, size, lastModified, etag}]（不匹配的键忽略 + warn）
-2. 过滤：只保留 lastModified 早于 1 分钟的对象（竞态保护）
+0. 取跨进程锁 runtime/sync.lock（拿不到 ⇒ 明确拒绝本轮，不排队、不硬闯）
+1. list(prefix) → 正则筛出合法天分片键 → [{key, size, lastModified, etag}]（不匹配的键忽略 + warn）
+2. 过滤：只保留 lastModified 早于 minAgeSeconds 的对象（竞态保护）
 3. 对每个对象：
    a. state.etag == 当前 etag → 跳过（**这是幂等的核心**）
-   b. head(key) 拿到最新 etag/size（list 缓存可能过期）
-   c. getTo → data/raw/.tmp/<instance>/<date>.jsonl.gz
-   d. 校验：可解压 / 首行 header / 行数 == count / 时间自洽（§3.3）
-   e. 通过 → 原子 rename 到 data/raw/<instance>/<date>.jsonl.gz，写 state{etag,size,count,final,whitelistVersion}
-      失败 → 删除 tmp，记 suspect++（连续 3 轮 → 机器人告警）
-4. 更新 runtime/sync-state.json：每 (instance,date) 一条记录 + 全局 watermark（最大已封存日期）
-5. 清理：>1 小时的 tmp 残留；raw 按 retentionDays 淘汰最旧（记日志）
+   b. 同内容且上次失败未过退避期 → 跳过并记入 deferred（**换内容则立刻重试**）
+   c. getTo → data/.tmp/<instance>/<date>.jsonl.gz
+   d. 校验：可解压 / 首行 header / 行数 == count / 日期归属 / 独立完整性（§3.3）
+   e. 通过 → 原子 rename 到 data/<instance>/<date>.jsonl.gz，写 state{etag,size,count,final,whitelistVersion}
+      失败 → 删除 tmp，suspects[key] = {count, etag, lastErrorAt}（**退避，不是拉黑**）
+4. 更新 runtime/sync-state.json：每 (instance,date) 一条记录 + lastRun（含 deferred/whitelistChanges）
+5. 清理：>1 小时的 tmp 残留；raw 按 retentionDays / maxDiskGB 淘汰最旧（记日志）
+6. 释放锁（finally）
 ```
+
+**跨进程互斥**：常驻 `run` 与手动 `npm run sync` 是两个进程，共用同一批 tmp 与同一个状态文件
+⇒ 用 `runtime/sync.lock`（按年龄判过期，默认 30 分钟；token 归属防误删）。没有它会出现
+"互相删对方 tmp ⇒ 假失败 ⇒ 退避计数上涨"和"状态文件后写覆盖先写 ⇒ 水位线说谎"。
+
+**失败是退避，不是拉黑**：同内容按 `30min × 2^(n-1)`（上限 6h）退避重试，ETag 一变立刻重试；
+被推迟的分片进 `deferred`，在日志、`sync` 输出与 `status` 里**都看得见**。
+（早期实现是"连续失败 3 次就永久跳过"，那等于把自己关掉：`final:true` 的历史天 ETag 永不变，一旦被拉黑就永久缺失。）
 
 **边界情况**：
 
 | 情况 | 处理 |
 |---|---|
 | 同一对象重复拉到 | ETag 命中 → 跳过 |
-| 对象被重算覆盖（ETag 变） | 重拉 + **按天整体重建** + 记 `RECOMPUTED` 日志（当天属正常，历史天属 backfill，需在报告标注） |
-| 行数不符 / 解压失败 | 不入库（或入库但标注），告警，下轮重试 |
-| OSS 不可达 / 403 | 不抛出进程；指数退避；`status` 可见 |
-| 磁盘水位 | 超 `sync.maxDiskGB` → 淘汰最旧日期 |
-| 时区 | 全部 `Asia/Shanghai` |
-| 并发 | **全局单并发**（一个 promise 队列），分析任务同样串行（§九） |
+| 对象被重算覆盖（ETag 变） | 重拉 + **按天整体重建** + 记 `RECOMPUTED` 日志（当天属正常，历史天属 backfill，可在报告标注） |
+| 行数不符 / 解压失败 | 不入库（或入库但标注），退避重试，日志 + `lastRun.errors` |
+| 手动 sync 撞上常驻同步 | 后来者拿不到锁 ⇒ **明确拒绝**并在输出里说明（`status` 会显示 `refusedByLock`） |
+| OSS 不可达 / 403 | 不抛出进程；记 error；本轮结束、下一轮按间隔重试（**list 的指数退避重试列为 M4 待办**） |
+| 磁盘水位 | 超 `sync.maxDiskGB` → 淘汰最旧日期（至少留一份） |
+| 时区 | 全部 `Asia/Shanghai`（契约时区；判日期归属必须用它，不能拿 `ts` 的 UTC 日期前缀） |
+| 并发 | **进程内单并发**（调度器 promise 闸门）+ **跨进程单并发**（`sync.lock`）；分析任务同样串行（§九） |
 
 ---
 
@@ -375,6 +391,7 @@ tr / trend [instance] [窗口]
 
 ### 待办
 
+0. **M4：`list` 失败的指数退避重试**（现在失败只记 error + 等下一轮，间隔 60 分钟）。要加就加在有注入 sleep 的地方，并补"退避期间不重复调用"的单测。
 1. **只读用户**（建议，**不阻塞开工**）：给分析侧单独一对 AK（`GetObject` + `ListObjects` + `GetObjectMeta`，资源 `snapshot/*`）。**新增用户不动现有策略**。理由：分析服务挂着机器人、对外接收消息，是暴露面最大的一环，不宜持有"能写能删"的钥匙。
 2. **钉钉应用凭据**：AppKey/AppSecret 由大哥填进 002 的 `env.json`（不经我手）；随后在群里 @ 机器人一次，用 `whoami` 取 `staffId` / `conversationId` 回填白名单。
 3. **保留策略**：OSS 90 天 / 本地 90 天，独立可调。

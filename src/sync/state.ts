@@ -4,6 +4,12 @@
  * 幂等的**唯一判据是 ETag**：上传侧"当天分片反复重算覆盖"是设计意图，
  * 所以"内容变了"必须能被识别 → ETag 变了就重拉 + 按天整体重建（我们不做行级增量合并，
  * 天分片是自洽快照，整份替换天然不会出现"半新半旧"）。
+ *
+ * 失败处理的关键取舍（P5 review 之后改的，别再改回去）：
+ * **失败不是拉黑，是退避**。早期实现是"连续失败 3 次 ⇒ 永不重试"，
+ * 但失败原因绝大多数在**我们这侧**（403/网络/磁盘满/凭据轮换）或**上传侧已修好**（ETag 会变），
+ * 永久拉黑会把自己关掉 —— 而且 `final:true` 的历史天 ETag 永不变，那一天就永久缺失。
+ * 现在：① ETag 一变立刻允许重试 ② 未变时按 30min×2^n（上限 6h）冷却 ③ 冷却中的分片进 `deferred`，在日志与 status 里可见。
  */
 import * as fs from 'fs';
 import * as path from 'path';
@@ -19,6 +25,15 @@ export interface ObjectState {
   final: boolean;
   pulledAt: string;
   warnings: string[];
+  /** 上传侧的白名单版本（口径变更要能在报告里标注） */
+  whitelistVersion?: string;
+}
+
+/** 失败记录：**带 ETag 与时间**，才能既"换内容就重试"又"同内容退避" */
+export interface SuspectState {
+  count: number;
+  etag: string;
+  lastErrorAt: string;
 }
 
 export interface RunSummary {
@@ -31,14 +46,20 @@ export interface RunSummary {
   failed: number;
   bytes: number;
   errors: string[];
+  /** 因退避冷却被推迟的分片数 */
+  deferred?: number;
+  /** 本次检测到的口径（whitelistVersion）变更说明 */
+  whitelistChanges?: string[];
+  /** 本轮是否因为"另一个同步正在进行"而整体跳过 */
+  refusedByLock?: boolean;
 }
 
 export interface SyncState {
   version: 1;
   /** key → 已入库的对象状态 */
   objects: Record<string, ObjectState>;
-  /** key → 连续失败次数（连续 3 轮触发告警用） */
-  suspects: Record<string, number>;
+  /** key → 失败退避状态 */
+  suspects: Record<string, SuspectState>;
   lastRun: RunSummary | null;
 }
 
@@ -48,7 +69,7 @@ export function emptyState(): SyncState {
 
 /**
  * 读状态：文件缺失/损坏都**不抛**（宁可从头拉一遍，也不能因为状态文件坏了就起不来）。
- * 损坏时返回 warnings，由调用方记日志。
+ * 兼容旧格式：`suspects` 曾是裸数字，读到数字时迁移成 SuspectState（etag 空 = 视为不同内容，允许立刻重试）。
  */
 export function loadState(filePath: string): { state: SyncState; warnings: string[] } {
   const warnings: string[] = [];
@@ -59,13 +80,24 @@ export function loadState(filePath: string): { state: SyncState; warnings: strin
       warnings.push('状态文件版本/结构不符，按空状态处理');
       return { state: emptyState(), warnings };
     }
-    const state: SyncState = {
-      version: 1,
-      objects: raw.objects as Record<string, ObjectState>,
-      suspects: (raw.suspects as Record<string, number>) ?? {},
-      lastRun: raw.lastRun ?? null,
+    const suspects: Record<string, SuspectState> = {};
+    for (const [key, value] of Object.entries((raw.suspects as Record<string, unknown>) ?? {})) {
+      if (typeof value === 'number') {
+        suspects[key] = { count: value, etag: '', lastErrorAt: new Date(0).toISOString() };
+        warnings.push(`suspects 里有旧格式条目（${key}），已迁移`);
+      } else if (value && typeof value === 'object') {
+        const s = value as Partial<SuspectState>;
+        suspects[key] = {
+          count: Number(s.count ?? 0),
+          etag: String(s.etag ?? ''),
+          lastErrorAt: String(s.lastErrorAt ?? new Date(0).toISOString()),
+        };
+      }
+    }
+    return {
+      state: { version: 1, objects: raw.objects as Record<string, ObjectState>, suspects, lastRun: raw.lastRun ?? null },
+      warnings,
     };
-    return { state, warnings };
   } catch (err) {
     warnings.push(`状态文件解析失败（按空状态处理）：${err instanceof Error ? err.message : String(err)}`);
     return { state: emptyState(), warnings };
@@ -75,12 +107,7 @@ export function loadState(filePath: string): { state: SyncState; warnings: strin
 /** 原子写（tmp + rename），键排序保证 diff 稳定；父目录自动建 */
 export function saveState(filePath: string, state: SyncState): void {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  const sorted: SyncState = {
-    version: 1,
-    objects: {},
-    suspects: {},
-    lastRun: state.lastRun,
-  };
+  const sorted: SyncState = { version: 1, objects: {}, suspects: {}, lastRun: state.lastRun };
   for (const key of Object.keys(state.objects).sort()) sorted.objects[key] = state.objects[key];
   for (const key of Object.keys(state.suspects).sort()) sorted.suspects[key] = state.suspects[key];
   const tmp = `${filePath}.tmp`;
@@ -88,15 +115,31 @@ export function saveState(filePath: string, state: SyncState): void {
   fs.renameSync(tmp, filePath);
 }
 
-export type SkipReason = 'etag-unchanged' | 'too-fresh' | 'suspect-limit';
+/** 退避时长：30min × 2^(n-1)，上限 6h（n = 连续失败次数） */
+export function suspectCooldownMs(count: number): number {
+  const base = 30 * 60_000;
+  const cap = 6 * 3600_000;
+  const exponent = Math.max(0, Math.min(10, count - 1));
+  return Math.min(base * Math.pow(2, exponent), cap);
+}
+
+export type SkipReason = 'etag-unchanged' | 'too-fresh' | 'suspect-cooldown';
 export type IgnoreReason = 'key-not-matching-contract';
+
+export interface DeferredShard {
+  key: string;
+  count: number;
+  retryAfterMs: number;
+}
 
 export interface PullPlan {
   toPull: ObjectMeta[];
   skipped: Array<{ key: string; reason: SkipReason }>;
   ignored: Array<{ key: string; reason: IgnoreReason; detail: string }>;
-  /** 本轮识别出的"被重算覆盖"的键（ETag 变了）——用于日志/告警，不是失败 */
+  /** 本轮识别出的"被重算覆盖"的键（ETag 变了）—— 用于日志，不是失败 */
   recomputed: string[];
+  /** 因失败退避被推迟的分片（**必须可见**：静默推迟等于静默停同步） */
+  deferred: DeferredShard[];
 }
 
 export interface PlanOptions {
@@ -104,8 +147,6 @@ export interface PlanOptions {
   minAgeSeconds: number;
   now: Date;
   force?: boolean;
-  /** 连续失败达到这个次数就不再重试（防病态对象把每轮都拖住） */
-  maxSuspects?: number;
 }
 
 /**
@@ -115,16 +156,19 @@ export interface PlanOptions {
  * 1. 键不匹配契约 → ignored（**绝不猜、绝不拉**）
  * 2. ETag 相同 → skipped（幂等；`force` 时忽略此条）
  * 3. `LastModified` 太新（不足 minAgeSeconds）→ skipped（防竞态读半成品）
- * 4. 连续失败达上限 → skipped（suspect-limit）
+ * 4. 上一次失败且**内容未变**、冷却未到 → skipped + deferred（换内容则立刻重试）
  */
 export function planPull(metas: ObjectMeta[], state: SyncState, opts: PlanOptions): PullPlan {
-  const plan: PullPlan = { toPull: [], skipped: [], ignored: [], recomputed: [] };
-  const maxSuspects = opts.maxSuspects ?? 3;
+  const plan: PullPlan = { toPull: [], skipped: [], ignored: [], recomputed: [], deferred: [] };
 
   for (const meta of metas) {
     const parsed = parseShardKey(meta.key, opts.prefix);
     if (!parsed) {
-      plan.ignored.push({ key: meta.key, reason: 'key-not-matching-contract', detail: `前缀 ${opts.prefix} 下不符合 snapshot/<instance>/<date>.jsonl.gz` });
+      plan.ignored.push({
+        key: meta.key,
+        reason: 'key-not-matching-contract',
+        detail: `前缀 ${opts.prefix} 下不符合 <prefix><instance>/<date>.jsonl.gz`,
+      });
       continue;
     }
 
@@ -143,10 +187,23 @@ export function planPull(metas: ObjectMeta[], state: SyncState, opts: PlanOption
       }
     }
 
-    const suspects = state.suspects[meta.key] ?? 0;
-    if (suspects >= maxSuspects && !opts.force) {
-      plan.skipped.push({ key: meta.key, reason: 'suspect-limit' });
-      continue;
+    const suspect = state.suspects[meta.key];
+    if (suspect && !opts.force) {
+      // 内容没变才退避；ETag 变了 = 上传侧重算过，立刻给一次机会
+      const sameContent = suspect.etag !== '' && suspect.etag === meta.etag;
+      if (sameContent) {
+        const cooldown = suspectCooldownMs(suspect.count);
+        const waited = opts.now.getTime() - Date.parse(suspect.lastErrorAt);
+        if (!Number.isFinite(waited) || waited < cooldown) {
+          plan.skipped.push({ key: meta.key, reason: 'suspect-cooldown' });
+          plan.deferred.push({
+            key: meta.key,
+            count: suspect.count,
+            retryAfterMs: Number.isFinite(waited) ? Math.max(0, cooldown - waited) : cooldown,
+          });
+          continue;
+        }
+      }
     }
 
     plan.toPull.push(meta);

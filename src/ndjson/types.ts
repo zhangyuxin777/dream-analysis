@@ -82,6 +82,31 @@ export function buildShardKey(prefix: string, instance: string, date: string): s
   return `${prefix}${instance}/${date}.jsonl.gz`;
 }
 
+/** 契约规定的分桶时区（上传侧按本地日分桶；消费侧判日期归属必须用同一个时区） */
+export const SHARD_TZ_OFFSET_MINUTES = 8 * 60;
+
+/**
+ * 事件 `ts`（UTC ISO）→ **分桶时区（Asia/Shanghai）的本地日**。
+ *
+ * 为什么必须有它：主仓写的 `ts` 是 `new Date().toISOString()`（UTC），
+ * 而 `header.date` 是上传侧按 Asia/Shanghai 分出来的日。
+ * 直接拿 `ts.slice(0,10)` 去比 header.date，会把上海 00:00–08:00（= UTC 前一天 16:00–24:00）
+ * 的所有事件误判成"日期不一致" —— 每个真实分片都会刷出约 1/3 的假警告，真信号被淹掉。
+ */
+export function localDateOf(ts: string, offsetMinutes: number = SHARD_TZ_OFFSET_MINUTES): string | null {
+  const ms = Date.parse(ts);
+  if (!Number.isFinite(ms)) return null;
+  return new Date(ms + offsetMinutes * 60_000).toISOString().slice(0, 10);
+}
+
+/** 行上的本地日：优先用上传侧写的 `localDate`（它才是契约里的权威值），非法/缺失时按 ts 推算 */
+export function effectiveLocalDate(record: { ts: string; localDate?: unknown }): string | null {
+  if (typeof record.localDate === 'string' && DATE_RE.test(record.localDate) && isRealDate(record.localDate)) {
+    return record.localDate;
+  }
+  return localDateOf(record.ts);
+}
+
 /** header 形状校验（外部数据一律先校验再用） */
 export function isShardHeader(v: unknown): v is DayShardHeader {
   if (typeof v !== 'object' || v === null) return false;

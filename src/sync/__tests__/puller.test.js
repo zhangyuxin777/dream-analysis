@@ -121,7 +121,7 @@ test('上传侧重算覆盖（ETag 变）→ 整份重建，行数按新内容�
   assert.equal(state.objects[key].final, false);
 });
 
-test('校验失败（坏 gz）→ 不入库、不清水位线、suspects+1、tmp 清理', async () => {
+test('校验失败（坏 gz）→ 不入库、不清水位线、suspects 记录内容指纹、tmp 清理', async () => {
   const env = makeEnv();
   const key = 'snapshot/boye888/2026-10-02.jsonl.gz';
   const store = new FakeStore({ [key]: Buffer.from('这不是 gzip') });
@@ -133,15 +133,103 @@ test('校验失败（坏 gz）→ 不入库、不清水位线、suspects+1、tmp
 
   const { state } = loadState(statePathOf(env.config));
   assert.equal(state.objects[key], undefined, '校验不过的分片绝不能进水位线');
-  assert.equal(state.suspects[key], 1);
+  assert.equal(state.suspects[key].count, 1);
+  assert.equal(state.suspects[key].etag, store.metas[0].etag, '失败记录必须带内容指纹（否则无法判断"内容变了该重试"）');
   assert.ok(!fs.existsSync(path.join(env.config.runtime.dataDir, '.tmp', 'boye888', '2026-10-02.jsonl.gz')));
+});
 
-  // 连续失败到 3 次后，后续轮次不再重试（防病态对象拖住每轮）
+test('失败是**退避**不是拉黑：同内容按 30min×2^n 推迟，且 deferred 可见；时间到了继续重试', async () => {
+  const env = makeEnv();
+  let clock = new Date(NOW.getTime());
+  const now = () => clock;
+  const key = 'snapshot/boye888/2026-10-02.jsonl.gz';
+  const store = new FakeStore({ [key]: Buffer.from('坏数据') });
+  const deps = { store, config: env.config, logger: env.logger, now };
+
+  clock = new Date(clock.getTime() + 10 * 60_000);
+  assert.equal((await runSync(deps)).failed.length, 1, '第 1 次失败');
+
+  // 冷却期（count=1 ⇒ 30min）内：不再重试，但必须明确报出来
+  clock = new Date(clock.getTime() + 5 * 60_000);
+  const deferredRun = await runSync(deps);
+  assert.equal(deferredRun.failed.length, 0, '冷却期内不该再尝试');
+  assert.equal(deferredRun.deferred.length, 1, '被推迟的分片必须可见（静默推迟 = 静默停同步）');
+  assert.equal(deferredRun.deferred[0].count, 1);
+  assert.ok(deferredRun.deferred[0].retryAfterMs > 0);
+
+  // 冷却过后继续重试（不会永久停在这一天）
+  clock = new Date(clock.getTime() + 31 * 60_000);
+  assert.equal((await runSync(deps)).failed.length, 1, '冷却过后必须继续重试');
+
+  const { state } = loadState(statePathOf(env.config));
+  assert.equal(state.suspects[key].count, 2, '失败次数累加（用于指数退避与告警）');
+});
+
+test('失败后上传侧修好了（ETag 变）⇒ 立刻重试，不受冷却限制', async () => {
+  const env = makeEnv();
+  const key = 'snapshot/boye888/2026-10-02.jsonl.gz';
+  const store = new FakeStore({ [key]: Buffer.from('坏数据') });
   await runSync({ store, config: env.config, logger: env.logger, now: env.now });
+  assert.equal(loadState(statePathOf(env.config)).state.suspects[key].count, 1);
+
+  // 上传侧重算：内容换成合法分片，ETag 随之变化
+  store.contents[key] = shardBuffer('boye888', '2026-10-02', okEvents);
+  store.metas = [store.metaOf(key, 'E-FIXED', 5, store.contents[key].length)];
+
+  const result = await runSync({ store, config: env.config, logger: env.logger, now: env.now });
+  assert.deepEqual(result.pulled, [key], '内容变了就该立刻给一次机会');
+  assert.deepEqual(loadState(statePathOf(env.config)).state.suspects, {}, '成功后必须清掉失败记录');
+});
+
+test('跨进程互斥：锁被别的进程持有 → 本轮整体拒绝（不排队、不互相踩 tmp/状态文件）', async () => {
+  const env = makeEnv();
+  const key = 'snapshot/boye888/2026-10-02.jsonl.gz';
+  const store = new FakeStore({ [key]: shardBuffer('boye888', '2026-10-02', okEvents) });
+
+  const { acquireLock, releaseLock } = require('../../../dist/sync/lock');
+  const { lockPathOf } = require('../../../dist/sync/puller');
+  const lockPath = lockPathOf(env.config);
+  const held = acquireLock(lockPath, { now: NOW, staleMs: 30 * 60_000, token: 'other-process' });
+  assert.equal(held.ok, true);
+
+  const refused = await runSync({ store, config: env.config, logger: env.logger, now: env.now });
+  assert.equal(refused.refusedByLock, true);
+  assert.equal(refused.listed, 0);
+  assert.deepEqual(store.downloads, [], '拒绝时必须什么都没拉');
+
+  releaseLock(lockPath, 'other-process');
+  const ok = await runSync({ store, config: env.config, logger: env.logger, now: env.now });
+  assert.equal(ok.refusedByLock, false);
+  assert.deepEqual(ok.pulled, [key]);
+  assert.ok(!fs.existsSync(lockPath), '跑完必须释放锁（否则下一轮永远拿不到）');
+});
+
+test('口径版本会落盘（跨轮比较的基准）；只有一份时不该报"变更"', async () => {
+  const env = makeEnv();
+  const day1 = 'snapshot/boye888/2026-09-30.jsonl.gz';
+  const store = new FakeStore({ [day1]: shardBuffer('boye888', '2026-09-30', okEvents, { whitelistVersion: 'v1' }) });
+
+  const first = await runSync({ store, config: env.config, logger: env.logger, now: env.now });
+  assert.deepEqual(first.whitelistChanges, [], '只有一份时无从比较，不该报变更');
+
+  const { state } = loadState(statePathOf(env.config));
+  assert.equal(state.objects[day1].whitelistVersion, 'v1', '口径要落盘（否则跨天比较没有基准）');
+});
+
+test('口径变更在**跨轮**时被识别出来（先拉 v1，再拉到 v2）', async () => {
+  const env = makeEnv();
+  const day1 = 'snapshot/boye888/2026-09-30.jsonl.gz';
+  const day2 = 'snapshot/boye888/2026-10-01.jsonl.gz';
+  const store = new FakeStore({ [day1]: shardBuffer('boye888', '2026-09-30', okEvents, { whitelistVersion: 'v1' }) });
   await runSync({ store, config: env.config, logger: env.logger, now: env.now });
-  const third = await runSync({ store, config: env.config, logger: env.logger, now: env.now });
-  assert.equal(third.failed.length, 0);
-  assert.equal(third.skipped, 1, '达到 suspect 上限后应被跳过');
+
+  store.contents[day2] = shardBuffer('boye888', '2026-10-01', okEvents, { whitelistVersion: 'v2' });
+  store.metas = [store.metaOf(day1, 'E1', 5), store.metaOf(day2, 'E2', 5)];
+
+  const second = await runSync({ store, config: env.config, logger: env.logger, now: env.now });
+  assert.equal(second.whitelistChanges.length, 1);
+  assert.match(second.whitelistChanges[0], /v1 → v2/);
+  assert.equal(loadState(statePathOf(env.config)).state.lastRun.whitelistChanges.length, 1, '口径变更必须进 lastRun（status/告警能看到）');
 });
 
 test('契约外对象被忽略（不下载、计入 ignored）', async () => {

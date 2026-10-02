@@ -10,7 +10,8 @@
  */
 import * as fs from 'fs';
 import * as zlib from 'zlib';
-import { DayShardHeader, EventRecord, isEventRecord, isShardHeader } from './types';
+import { StringDecoder } from 'string_decoder';
+import { DayShardHeader, EventRecord, effectiveLocalDate, isEventRecord, isShardHeader } from './types';
 
 export interface ShardStats {
   filePath: string;
@@ -68,6 +69,7 @@ export function readShard(filePath: string, opts: ReadShardOptions = {}): Promis
 
   return new Promise<ShardStats>((resolve) => {
     let pending = '';
+    const decoder = new StringDecoder('utf8');
     let lineNo = 0;
     let sawHeader = false;
     let headerLineCounted = false;
@@ -130,9 +132,21 @@ export function readShard(filePath: string, opts: ReadShardOptions = {}): Promis
       if (stats.firstTs === null) stats.firstTs = parsed.ts;
       stats.lastTs = parsed.ts;
 
-      if (stats.header && parsed.ts.slice(0, 10) !== stats.header.date) {
-        dateMismatch.n++;
-        if (dateMismatch.sample === '') dateMismatch.sample = parsed.ts;
+      if (stats.header) {
+        // 日期归属：拿**契约规定的分桶时区（Asia/Shanghai）**的本地日比 header.date，
+        // 不能拿 ts 的 UTC 日期前缀比（那会把上海 00:00–08:00 的合法事件全判成"日期不一致"）。
+        // 另给 ±2h 跨夜容差（边界上的事件允许落在相邻日）。
+        const localDate = effectiveLocalDate(parsed);
+        if (localDate !== null && localDate !== stats.header.date) {
+          const eventMs = Date.parse(parsed.ts);
+          const dayMs = Date.parse(`${stats.header.date}T00:00:00+08:00`);
+          const driftMs = eventMs - dayMs;
+          const withinTolerance = Number.isFinite(driftMs) && (driftMs < 0 ? driftMs >= -2 * 3600_000 : driftMs <= 26 * 3600_000);
+          if (!withinTolerance) {
+            dateMismatch.n++;
+            if (dateMismatch.sample === '') dateMismatch.sample = `${parsed.ts}（localDate=${localDate}）`;
+          }
+        }
       }
 
       if (opts.onEvent) opts.onEvent(parsed, lineNo);
@@ -157,6 +171,18 @@ export function readShard(filePath: string, opts: ReadShardOptions = {}): Promis
       if (dateMismatch.n > 0) {
         stats.warnings.push(`${dateMismatch.n} 行的事件日期与 header.date 不一致（例：${dateMismatch.sample}）`);
       }
+      // 独立性最弱的那个信号恰恰最重要：header.count/firstTs 都是**上传侧自报**的，
+      // 只有"我们自己算出来的首条事件时间"是独立的 —— 已封存的分片却从下午才开始，基本就是
+      // "只导出了尾部窗口"（DESIGN §3.4-①）而不是"当天上午真的没事件"。
+      if (header && header.final && stats.firstTs) {
+        const dayMs = Date.parse(`${header.date}T00:00:00+08:00`);
+        const firstMs = Date.parse(stats.firstTs);
+        if (Number.isFinite(dayMs) && Number.isFinite(firstMs) && firstMs - dayMs > 4 * 3600_000) {
+          stats.warnings.push(
+            `已封存分片（final=true）的首条事件晚于当天 04:00（${stats.firstTs}）—— 疑似只含当天后段（上游尾部窗口截断？），请与上传侧确认`,
+          );
+        }
+      }
       if (headerLineCounted && stats.dataLines === 0 && stats.badLines === 0) {
         stats.warnings.push('只有 header、没有数据行');
       }
@@ -164,7 +190,9 @@ export function readShard(filePath: string, opts: ReadShardOptions = {}): Promis
     };
 
     const onData = (chunk: Buffer): void => {
-      pending += chunk.toString('utf8');
+      // 必须用 StringDecoder：gunzip 输出块按 16384B 硬切，多字节字符（中文）会被切在两块之间，
+      // 用 chunk.toString('utf8') 会各自解成 U+FFFD 且**不报错**（静默数据损坏）。
+      pending += decoder.write(chunk);
       let idx: number;
       while ((idx = pending.indexOf('\n')) >= 0) {
         const line = pending.slice(0, idx);
@@ -182,6 +210,7 @@ export function readShard(filePath: string, opts: ReadShardOptions = {}): Promis
       gunzip.on('data', (chunk: Buffer) => onData(chunk));
       gunzip.on('end', () => {
         if (settled) return;
+        pending += decoder.end(); // 收尾：吐出被留住的最后一截多字节序列
         if (pending.trim() !== '') handleLine(pending);
         finish();
       });

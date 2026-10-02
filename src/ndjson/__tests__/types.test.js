@@ -81,3 +81,21 @@ test('isEventRecord：ts 必须可解析', () => {
   assert.ok(!isEventRecord({ ts: '2026-10-02T13:00:00.000Z' }), 'event 必填');
   assert.ok(!isEventRecord({ ts: '2026-10-02T13:00:00.000Z', event: 'X', symbol: 1 }));
 });
+
+test('localDateOf：UTC ts → 分桶时区（Asia/Shanghai）的本地日', () => {
+  const { localDateOf } = require('../../../dist/ndjson/types');
+  assert.equal(localDateOf('2026-10-02T03:00:00.000Z'), '2026-10-02');
+  assert.equal(localDateOf('2026-10-01T16:30:00.000Z'), '2026-10-02', '上海 00:30 属于 10-02（UTC 日期是 10-01，这正是旧实现的坑）');
+  assert.equal(localDateOf('2026-10-01T15:59:59.000Z'), '2026-10-01', '上海 23:59:59 仍属前一天');
+  assert.equal(localDateOf('2026-10-01T16:00:00.000Z'), '2026-10-02', '上海 00:00:00 边界');
+  assert.equal(localDateOf('not-a-date'), null);
+});
+
+test('effectiveLocalDate：优先用上传侧的 localDate（契约权威值），非法/缺失才按 ts 推算', () => {
+  const { effectiveLocalDate } = require('../../../dist/ndjson/types');
+  assert.equal(effectiveLocalDate({ ts: '2026-10-01T16:30:00.000Z', localDate: '2026-10-02' }), '2026-10-02');
+  assert.equal(effectiveLocalDate({ ts: '2026-10-01T16:30:00.000Z' }), '2026-10-02', '缺 localDate 时按 ts 推算');
+  assert.equal(effectiveLocalDate({ ts: '2026-10-01T16:30:00.000Z', localDate: '2026-10-2' }), '2026-10-02', '格式非法则忽略');
+  assert.equal(effectiveLocalDate({ ts: '2026-10-01T16:30:00.000Z', localDate: '2026-02-30' }), '2026-10-02', '不存在的日子也忽略');
+  assert.equal(effectiveLocalDate({ ts: '2026-10-01T16:30:00.000Z', localDate: 123 }), '2026-10-02');
+});

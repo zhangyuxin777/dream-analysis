@@ -137,3 +137,79 @@ test('大分片跨多个 chunk 也要正确切行（每行 ~2KB × 300 行）', 
   assert.equal(stats.dataLines, 300);
   assert.equal(stats.badLines, 0);
 });
+
+test('UTF-8 跨 gunzip 块边界不能被撕坏（多字节字符静默变 U+FFFD 是数据损坏）', async () => {
+  const CHUNK = 16384; // Node zlib 默认 chunkSize
+  const target = '中文测试🀄';
+  const headerLine = header({ count: 1 });
+  const headerBytes = Buffer.byteLength(headerLine + '\n', 'utf8');
+
+  const makeLine = (padLen) =>
+    JSON.stringify({ ts: '2026-10-02T01:00:00.000Z', event: 'ZH', symbol: 'ETH', localDate: '2026-10-02', seq: 1, data: { pad: 'x'.repeat(padLen), note: target } });
+  const probe = makeLine(0);
+  const offsetInLine = Buffer.byteLength(probe.slice(0, probe.indexOf(target)), 'utf8');
+  const padLen = CHUNK - 1 - headerBytes - offsetInLine;
+  assert.ok(padLen > 0, '夹具构造失败（pad 必须为正）');
+  const line = makeLine(padLen);
+
+  const stream = headerLine + '\n' + line + '\n';
+  const targetByteOffset = Buffer.byteLength(stream.slice(0, stream.indexOf(target)), 'utf8');
+  assert.equal(targetByteOffset, CHUNK - 1, '夹具必须把多字节字符压在第 16384 字节的边界上，否则这条测试没测到东西');
+
+  const file = writeShard('utf8-boundary.jsonl.gz', [headerLine, line]);
+  const notes = [];
+  const stats = await readShard(file, { onEvent: (e) => notes.push(e.data.note) });
+  assert.equal(stats.ok, true);
+  assert.equal(stats.badLines, 0, '旧实现会把它当"合法 JSON"收下，只是内容被改写 —— 所以这里必须断言内容本身');
+  assert.deepEqual(notes, [target]);
+  assert.ok(!notes[0].includes('\uFFFD'), '多字节字符被替换成 U+FFFD = 静默数据损坏');
+});
+
+test('日期归属按契约时区（Asia/Shanghai）：上海凌晨的事件不该被误报"日期不一致"', async () => {
+  const file = writeShard('tz-ok.jsonl.gz', [
+    header({ count: 3, date: '2026-10-02' }),
+    ev('2026-10-01T16:30:00.000Z', 'A', 'ETH', { localDate: '2026-10-02' }), // 上海 10-02 00:30
+    ev('2026-10-02T03:00:00.000Z', 'B', 'ETH', { localDate: '2026-10-02' }), // 上海 10-02 11:00
+    ev('2026-10-02T15:30:00.000Z', 'C', 'ETH', { localDate: '2026-10-02' }), // 上海 10-02 23:30
+  ]);
+  const stats = await readShard(file);
+  assert.equal(stats.warnings.filter((w) => w.includes('日期与 header.date 不一致')).length, 0, stats.warnings.join('|'));
+});
+
+test('±2h 跨夜容差：本地次日凌晨的事件不算"日期不一致"', async () => {
+  const file = writeShard('tz-tolerance.jsonl.gz', [
+    header({ count: 1, date: '2026-10-02' }),
+    ev('2026-10-02T17:00:00.000Z', 'A', 'ETH', { localDate: '2026-10-03' }), // 上海 10-03 01:00
+  ]);
+  const stats = await readShard(file);
+  assert.equal(stats.warnings.filter((w) => w.includes('日期与 header.date 不一致')).length, 0);
+});
+
+test('事件真的落在别的日子 → 必须报"日期不一致"（容差不能把真信号吃掉）', async () => {
+  const file = writeShard('tz-bad.jsonl.gz', [
+    header({ count: 1, date: '2026-10-02' }),
+    ev('2026-10-05T03:00:00.000Z', 'A', 'ETH', { localDate: '2026-10-05' }),
+  ]);
+  const stats = await readShard(file);
+  assert.ok(stats.warnings.some((w) => w.includes('日期与 header.date 不一致')), stats.warnings.join('|'));
+});
+
+test('已封存分片却从当天下午才开始 → 报"疑似只含后段"（唯一独立于上传侧自报的完整性信号）', async () => {
+  const file = writeShard('partial.jsonl.gz', [
+    header({ count: 2, date: '2026-10-02', final: true }),
+    ev('2026-10-02T06:00:00.000Z', 'A'), // 上海 14:00
+    ev('2026-10-02T07:00:00.000Z', 'B'),
+  ]);
+  const stats = await readShard(file);
+  assert.ok(stats.warnings.some((w) => w.includes('疑似只含当天后段')), stats.warnings.join('|'));
+});
+
+test('已封存分片从当天凌晨就开始 → 不该误报"缺早段"', async () => {
+  const file = writeShard('complete.jsonl.gz', [
+    header({ count: 2, date: '2026-10-02', final: true }),
+    ev('2026-10-01T16:10:00.000Z', 'A'), // 上海 00:10
+    ev('2026-10-02T15:50:00.000Z', 'B'), // 上海 23:50
+  ]);
+  const stats = await readShard(file);
+  assert.equal(stats.warnings.filter((w) => w.includes('疑似只含当天后段')).length, 0);
+});

@@ -46,14 +46,47 @@ test('planPull：太新（不足 minAgeSeconds）→ 跳过（防竞态读半成
   assert.deepEqual(plan.skipped, [{ key: 'snapshot/a/2026-10-02.jsonl.gz', reason: 'too-fresh' }]);
 });
 
-test('planPull：连续失败达上限 → 不再重试（防病态对象拖住每轮）；force 可强制重试', () => {
+test('planPull：同内容失败过 → 冷却期内跳过且 deferred 可见；冷却过后允许重试', () => {
+  const key = 'snapshot/a/2026-10-02.jsonl.gz';
   const state = emptyState();
-  state.suspects['snapshot/a/2026-10-02.jsonl.gz'] = 3;
-  const blocked = planPull([meta('snapshot/a/2026-10-02.jsonl.gz', 'E9', 3)], state, { prefix: PREFIX, minAgeSeconds: 60, now: NOW });
-  assert.deepEqual(blocked.skipped, [{ key: 'snapshot/a/2026-10-02.jsonl.gz', reason: 'suspect-limit' }]);
+  state.suspects[key] = { count: 1, etag: 'E9', lastErrorAt: new Date(NOW.getTime() - 5 * 60_000).toISOString() };
 
-  const forced = planPull([meta('snapshot/a/2026-10-02.jsonl.gz', 'E9', 3)], state, { prefix: PREFIX, minAgeSeconds: 60, now: NOW, force: true });
-  assert.equal(forced.toPull.length, 1);
+  const within = planPull([meta(key, 'E9', 3)], state, { prefix: PREFIX, minAgeSeconds: 60, now: NOW });
+  assert.deepEqual(within.skipped, [{ key, reason: 'suspect-cooldown' }]);
+  assert.equal(within.deferred.length, 1);
+  assert.ok(within.deferred[0].retryAfterMs > 0, '必须告诉人还有多久重试');
+  assert.equal(within.deferred[0].count, 1);
+
+  // 冷却（30min × 2^(n-1)）过后放行
+  const after = planPull([meta(key, 'E9', 3)], state, { prefix: PREFIX, minAgeSeconds: 60, now: new Date(NOW.getTime() + 40 * 60_000) });
+  assert.equal(after.toPull.length, 1);
+  assert.equal(after.deferred.length, 0);
+});
+
+test('planPull：ETag 变了 ⇒ 立刻重试（绝不永久拉黑 —— 否则 final:true 的历史天会永久缺失）', () => {
+  const key = 'snapshot/a/2026-10-01.jsonl.gz';
+  const state = emptyState();
+  state.suspects[key] = { count: 9, etag: 'E-OLD', lastErrorAt: new Date(NOW.getTime() - 1000).toISOString() };
+  const plan = planPull([meta(key, 'E-NEW', 3)], state, { prefix: PREFIX, minAgeSeconds: 60, now: NOW });
+  assert.equal(plan.toPull.length, 1);
+  assert.equal(plan.deferred.length, 0);
+});
+
+test('planPull：force 绕过冷却（人工介入的出口）', () => {
+  const key = 'snapshot/a/2026-10-02.jsonl.gz';
+  const state = emptyState();
+  state.suspects[key] = { count: 5, etag: 'E9', lastErrorAt: NOW.toISOString() };
+  const plan = planPull([meta(key, 'E9', 3)], state, { prefix: PREFIX, minAgeSeconds: 60, now: NOW, force: true });
+  assert.equal(plan.toPull.length, 1);
+});
+
+test('suspectCooldownMs：30min 起步、指数增长、6h 封顶', () => {
+  const { suspectCooldownMs } = require('../../../dist/sync/state');
+  assert.equal(suspectCooldownMs(1), 30 * 60_000);
+  assert.equal(suspectCooldownMs(2), 60 * 60_000);
+  assert.equal(suspectCooldownMs(3), 120 * 60_000);
+  assert.equal(suspectCooldownMs(10), 6 * 3600_000, '上限 6h');
+  assert.equal(suspectCooldownMs(99), 6 * 3600_000);
 });
 
 test('planPull：force 忽略 ETag 与静默期（但仍不接受非法键）', () => {
@@ -82,7 +115,7 @@ test('saveState/loadState：往返一致、键排序稳定、原子写不留 tmp
   const state = emptyState();
   state.objects['snapshot/b/2026-10-01.jsonl.gz'] = { etag: 'B', size: 2, dataLines: 2, final: true, pulledAt: 't1', warnings: ['w'] };
   state.objects['snapshot/a/2026-10-01.jsonl.gz'] = { etag: 'A', size: 1, dataLines: 1, final: false, pulledAt: 't2', warnings: [] };
-  state.suspects['snapshot/c/2026-10-01.jsonl.gz'] = 2;
+  state.suspects['snapshot/c/2026-10-01.jsonl.gz'] = { count: 2, etag: 'C', lastErrorAt: '2026-10-02T00:00:00.000Z' };
   state.lastRun = { startedAt: 's', finishedAt: 'f', listed: 2, pulled: 2, skipped: 0, ignored: 0, failed: 0, bytes: 3, errors: [] };
   saveState(file, state);
 
@@ -94,8 +127,18 @@ test('saveState/loadState：往返一致、键排序稳定、原子写不留 tmp
   assert.deepEqual(loaded.warnings, []);
   assert.deepEqual(Object.keys(loaded.state.objects), ['snapshot/a/2026-10-01.jsonl.gz', 'snapshot/b/2026-10-01.jsonl.gz']);
   assert.equal(loaded.state.objects['snapshot/b/2026-10-01.jsonl.gz'].final, true);
-  assert.equal(loaded.state.suspects['snapshot/c/2026-10-01.jsonl.gz'], 2);
+  assert.equal(loaded.state.suspects['snapshot/c/2026-10-01.jsonl.gz'].count, 2);
   assert.equal(loaded.state.lastRun.pulled, 2);
+});
+
+test('loadState：suspects 旧格式（裸数字）迁移成 SuspectState，并留一条 warning', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'state-legacy-'));
+  const file = path.join(dir, 'legacy.json');
+  fs.writeFileSync(file, JSON.stringify({ version: 1, objects: {}, suspects: { 'snapshot/a/2026-10-01.jsonl.gz': 2 }, lastRun: null }));
+  const { state, warnings } = loadState(file);
+  assert.equal(state.suspects['snapshot/a/2026-10-01.jsonl.gz'].count, 2);
+  assert.equal(state.suspects['snapshot/a/2026-10-01.jsonl.gz'].etag, '', '旧格式没有 etag ⇒ 视为"内容已变"，允许立刻重试');
+  assert.ok(warnings.some((w) => w.includes('旧格式')));
 });
 
 test('loadState：文件缺失/损坏都不抛，按空状态处理并给 warning', () => {
