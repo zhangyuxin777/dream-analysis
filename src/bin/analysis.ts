@@ -1,36 +1,42 @@
 #!/usr/bin/env node
 /**
  * CLI 入口。命令：
- *   run              常驻：定时同步（M3 起再挂机器人）
+ *   run              常驻：定时同步 + 机器人（配了 bot 段才启）
  *   sync [--force]   手动拉取一次
  *   status           数据新鲜度 / 上次同步结果 / 本地分片
- *   doctor [--deep]  自检（配置 / ossutil / OSS 连通 / 目录 / 新鲜度；--deep 加契约核对）
+ *   doctor [--deep]  自检（配置 / ossutil / OSS 连通 / 目录；--deep 加契约核对）
  *   list             远端对象 vs 本地状态对照
  *   verify <key>     下载并校验某个分片（不入库、不动水位线）—— 契约核对用
+ *   analyses         列出可用分析器
+ *   analyze <名字> … 跑一次分析并打印报告
  *
- * 约定：所有输出都不含凭据（AK/SK 只存在于 ossutil 配置文件里，本项目从不读取）。
- * 可测性：命令函数接受显式 `CommandContext`（config/logger/store 全部注入），
- * 单测可以用假 store + 临时目录把每条命令真正跑一遍，而不是只测参数解析。
+ * 约定：
+ * - 所有输出都不含凭据（AK/SK 只在 ossutil 配置文件里，本项目从不打印）；
+ * - **状态文案与分析执行都走共享模块**（`report/status.ts`、`analysis/runner.ts`），
+ *   与机器人用的是同一份 —— 两边各写一套必然漂移；
+ * - 命令函数接受显式依赖（config/logger/store 注入），单测能用假 store + 临时目录真跑一遍。
  */
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { AppConfig, ConfigError, loadConfig } from '../config';
 import { createLogger, ILogger } from '../common/logger';
-import { formatBytes, formatCount, formatDurationMs } from '../common/format';
-import { OssutilStore, materializeOssutilCredentials } from '../oss/ossutilStore';
+import { formatBytes } from '../common/format';
 import { ObjectStore } from '../oss/store';
-import { runSync, lockPathOf, statePathOf } from '../sync/puller';
-import { isProcessAlive, readLock } from '../sync/lock';
+import { buildStore } from '../oss/storeFactory';
+import { OssutilStore } from '../oss/ossutilStore';
+import { runSync, statePathOf } from '../sync/puller';
 import { createScheduler } from '../sync/scheduler';
 import { loadState, listLocalShards } from '../sync/state';
 import { readShard } from '../ndjson/shard';
 import { parseShardKey } from '../ndjson/types';
 import { createAnalysisRegistry } from '../analysis';
-import { MAX_WINDOW_HOURS, POSITIONAL_PARAMS, WINDOW_ARG_RE } from '../analysis/types';
-import { parseWindow, WindowParseError, WindowTooLongError } from '../common/time';
-import { LocalEventSource } from '../store/eventSource';
-import { renderResult } from '../report/render';
+import { parseAnalysisArgs } from '../analysis/args';
+import { AnalysisRunError, runAnalysis } from '../analysis/runner';
+import { WindowParseError, WindowTooLongError } from '../common/time';
+import { buildStatusText } from '../report/status';
+import { DingTalkBot } from '../bot/dingtalk-bot';
+import { CommandRouter, buildHelpText } from '../bot/router';
 
 const ROOT_DIR = path.resolve(__dirname, '..', '..');
 /** 连接类稀疏事件的前缀：契约核对里要确认上传侧把它们放进来了（DESIGN §3.4-③） */
@@ -40,26 +46,6 @@ export interface CommandContext {
   config: AppConfig;
   logger: ILogger;
   store: ObjectStore;
-}
-
-export function buildStore(config: AppConfig): ObjectStore {
-  const { accessKeyId, accessKeySecret } = config.oss;
-  // env.json 直接给了凭据 ⇒ 落成 0600 的 ossutil 配置文件（绝不进命令行，防 ps 泄漏）；
-  // 没给 ⇒ 用 configFile 或 ossutil 默认的 ~/.ossutilconfig
-  const configFile = accessKeyId && accessKeySecret
-    ? materializeOssutilCredentials({
-        filePath: path.join(config.runtime.stateDir, 'ossutil-credentials'),
-        endpoint: config.oss.endpoint,
-        accessKeyId,
-        accessKeySecret,
-      })
-    : config.oss.configFile || undefined;
-  return new OssutilStore({
-    binary: config.oss.binary,
-    endpoint: config.oss.endpoint,
-    bucket: config.oss.bucket,
-    configFile,
-  });
 }
 
 export function buildContext(config: AppConfig, logger: ILogger): CommandContext {
@@ -92,6 +78,37 @@ export function verifyTmpPathOf(config: AppConfig, instance: string, date: strin
   return path.join(config.runtime.dataDir, '.tmp', 'verify', `${instance}-${date}.jsonl.gz`);
 }
 
+/**
+ * 配了 `bot` 段才启机器人；**任何失败都只记日志**（机器人不该有停掉同步/分析的权力）。
+ * 这里同时做三件接线：客户端、指令路由、以及"路由怎么二次回复"（绑到客户端的 replyText）。
+ */
+export function startBotIfConfigured(config: AppConfig, logger: ILogger): DingTalkBot | null {
+  const botCfg = config.bot;
+  if (!botCfg) {
+    logger.info('未配置 bot 段 —— 只跑定时同步（要对话请填 env.json 的 bot 段）');
+    return null;
+  }
+  if (botCfg.type !== 'dingtalk') {
+    logger.error('bot.type 目前只实现了 dingtalk，机器人未启动', { type: botCfg.type });
+    return null;
+  }
+  const botLogger = logger.child('bot');
+  const bot = new DingTalkBot(
+    { clientId: botCfg.appId, clientSecret: botCfg.appSecret, allowedStaffIds: botCfg.allowedStaffIds },
+    botLogger,
+  );
+  const router = new CommandRouter({
+    config,
+    logger: botLogger,
+    reply: (webhook, text) => bot.replyText(webhook, text),
+  });
+  bot.setHandler((msg) => router.handle(msg));
+  void bot.start().catch((err) => {
+    logger.error('机器人启动异常（不影响同步与分析）', { detail: err instanceof Error ? err.message : String(err) });
+  });
+  return bot;
+}
+
 export async function cmdRun(config: AppConfig, logger: ILogger, store: ObjectStore = buildStore(config)): Promise<number> {
   applyNice(config, logger);
   logger.info('启动常驻服务', {
@@ -101,6 +118,7 @@ export async function cmdRun(config: AppConfig, logger: ILogger, store: ObjectSt
     bucket: config.oss.bucket,
     prefix: config.oss.prefix,
     intervalMinutes: config.sync.intervalMinutes,
+    bot: config.bot ? config.bot.type : null,
     node: process.version,
   });
 
@@ -111,6 +129,9 @@ export async function cmdRun(config: AppConfig, logger: ILogger, store: ObjectSt
     run: () => runSync({ store, config, logger: syncLogger }),
   });
   scheduler.start();
+
+  // 先起机器人再跑首次同步：这样同步期间也能回 whoami/status（配置期最常用）
+  const bot = startBotIfConfigured(config, logger);
   await scheduler.triggerNow();
 
   // 保活：调度器的定时器是 unref 的（它不该单独决定进程生死），这里显式持有一个常驻句柄
@@ -118,6 +139,7 @@ export async function cmdRun(config: AppConfig, logger: ILogger, store: ObjectSt
   const shutdown = (signal: string): void => {
     logger.info('收到退出信号，正在停止', { signal });
     scheduler.stop();
+    bot?.close?.();
     clearInterval(keepAlive);
     process.exit(0);
   };
@@ -135,78 +157,16 @@ export async function cmdSync(ctx: CommandContext, force: boolean): Promise<numb
     console.error('已有同步在进行（可能是常驻进程），本轮未执行；稍后重试即可');
     return 1;
   }
-  console.log(`列举 ${result.listed} 个，拉取 ${result.pulled.length}，跳过 ${result.skipped}，忽略 ${result.ignored}，失败 ${result.failed.length}，退避 ${result.deferred.length}，共 ${formatBytes(result.bytes)}，耗时 ${formatDurationMs(Date.now() - started)}`);
+  console.log(`列举 ${result.listed} 个，拉取 ${result.pulled.length}，跳过 ${result.skipped}，忽略 ${result.ignored}，失败 ${result.failed.length}，退避 ${result.deferred.length}，共 ${formatBytes(result.bytes)}，耗时 ${Date.now() - started}ms`);
   for (const c of result.whitelistChanges) console.log(`  ⚠️ 数据口径变更: ${c}`);
-  for (const d of result.deferred) console.log(`  ⏸ ${d.key}（已失败 ${d.count} 次，约 ${formatDurationMs(d.retryAfterMs)} 后重试）`);
+  for (const d of result.deferred) console.log(`  ⏸ ${d.key}（已失败 ${d.count} 次）`);
   for (const f of result.failed) console.error(`  ❌ ${f.key}: ${f.error}`);
   return result.failed.length > 0 ? 1 : 0;
 }
 
+/** 状态文本与机器人共用（`report/status.ts`）；这里只负责打印 */
 export async function cmdStatus(config: AppConfig): Promise<number> {
-  const stateFile = statePathOf(config);
-  const { state, warnings } = loadState(stateFile);
-  for (const w of warnings) console.warn(`⚠️  ${w}`);
-
-  console.log('=== 同步状态 ===');
-  console.log(`状态文件: ${path.relative(ROOT_DIR, stateFile)}`);
-  if (!state.lastRun) {
-    console.log('上次同步: 从未跑过（先执行 npm run sync）');
-  } else {
-    const r = state.lastRun;
-    const dur = Date.parse(r.finishedAt) - Date.parse(r.startedAt);
-    console.log(
-      `上次同步: ${r.finishedAt} 用时 ${formatDurationMs(dur)} | 列举 ${r.listed} / 拉取 ${r.pulled} / 跳过 ${r.skipped} / 忽略 ${r.ignored} / 失败 ${r.failed} (${formatBytes(r.bytes)})`,
-    );
-    if (r.refusedByLock) console.log('  本轮因"已有同步在进行"被跳过（跨进程互斥）');
-    if (r.deferred) console.log(`  退避中: ${r.deferred} 个分片（同内容按 30min×2^n 退避，换内容立刻重试）`);
-    for (const c of r.whitelistChanges ?? []) console.log(`  ⚠️ 数据口径变更: ${c}`);
-    for (const e of r.errors.slice(0, 5)) console.log(`  ❌ ${e}`);
-  }
-
-  const shards = listLocalShards(config.runtime.dataDir);
-  const total = shards.reduce((s, x) => s + x.size, 0);
-  console.log(`本地分片: ${shards.length} 个，共 ${formatBytes(total)}`);
-  const entries = Object.entries(state.objects).sort((a, b) => b[0].localeCompare(a[0]));
-  for (const [key, obj] of entries.slice(0, 20)) {
-    const parsed = parseShardKey(key, config.oss.prefix);
-    const label = parsed ? `${parsed.instance.padEnd(10)} ${parsed.date}` : key;
-    const flag = obj.final ? '已封存' : '未封存';
-    const wl = obj.whitelistVersion ? `  口径=${obj.whitelistVersion}` : '';
-    const warn = obj.warnings.length > 0 ? `  ⚠️ ${obj.warnings.length} 条告警` : '';
-    console.log(`  ${label}  ${flag}  ${formatCount(obj.dataLines)} 行  ${formatBytes(obj.size)}  拉于 ${obj.pulledAt}${wl}${warn}`);
-  }
-  if (entries.length > 20) console.log(`  … 另有 ${entries.length - 20} 条`);
-
-  const latestFinal = entries
-    .filter(([, o]) => o.final)
-    .map(([k]) => parseShardKey(k, config.oss.prefix)?.date ?? '')
-    .filter((d) => d !== '')
-    .sort()
-    .pop();
-  const todayShanghai = new Date(Date.now() + 8 * 3600_000).toISOString().slice(0, 10);
-  if (latestFinal) {
-    const lagDays = Math.round((Date.parse(`${todayShanghai}T00:00:00Z`) - Date.parse(`${latestFinal}T00:00:00Z`)) / 86400_000);
-    console.log(`已封存最新日期: ${latestFinal}（今天 ${todayShanghai}，落后 ${lagDays} 天）`);
-    if (lagDays > 2) console.warn('⚠️  数据落后超过 2 天 —— 上游导出或本服务同步可能停了');
-  } else {
-    console.log('还没有已封存的分片（final=true）');
-  }
-
-  const suspects = Object.entries(state.suspects).filter(([, s]) => s.count > 0);
-  if (suspects.length > 0) {
-    console.log(`失败退避中的分片: ${suspects.length} 个`);
-    for (const [k, s] of suspects.slice(0, 5)) console.log(`  ⏸ ${k}（已失败 ${s.count} 次，最后失败于 ${s.lastErrorAt}）`);
-  }
-
-  // 锁是"此刻有没有同步在跑"的唯一准确来源（被拒轮次不写状态文件 —— 写了会和持有者互相覆盖）
-  const holder = readLock(lockPathOf(config));
-  if (holder) {
-    const heldMs = Date.now() - Date.parse(holder.acquiredAt);
-    console.log(`当前有同步在进行: pid=${holder.pid}@${holder.host} 自 ${holder.acquiredAt}（已 ${formatDurationMs(heldMs)}）`);
-    if (!isProcessAlive(holder.pid) && holder.host === os.hostname()) {
-      console.warn('⚠️  该持有进程已不存在（残留锁）—— 下一次同步会自动接管');
-    }
-  }
+  console.log(buildStatusText(config, { rootDir: ROOT_DIR }));
   return 0;
 }
 
@@ -248,7 +208,7 @@ export async function cmdDoctor(ctx: CommandContext, deep: boolean): Promise<num
       fs.mkdirSync(dir, { recursive: true });
       fs.writeFileSync(probe, 'ok', 'utf8');
       fs.rmSync(probe, { force: true });
-      checks.push({ ok: true, text: `目录可写: ${path.relative(ROOT_DIR, dir)}` });
+      checks.push({ ok: true, text: `目录可写: ${path.relative(ROOT_DIR, dir) || '.'}` });
     } catch (err) {
       checks.push({ ok: false, text: `目录不可写: ${path.relative(ROOT_DIR, dir)}（${err instanceof Error ? err.message : String(err)}）` });
     }
@@ -343,83 +303,39 @@ export async function cmdVerify(ctx: CommandContext, key: string): Promise<numbe
   return stats.ok ? 0 : 1;
 }
 
-/**
- * 解析 `analyze` 的参数：
- * - `key=value` 优先；
- * - 裸参数里**长得像窗口的**（`2026-10-02`、`昨天`、`近24h`、区间）一律当 `window`
- *   —— 否则 `analyze health 2026-10-02` 会把日期当币种（实测踩过）；
- * - 其余裸参数按 `POSITIONAL_PARAMS` 顺序填（symbol → instance → top），多出来的忽略。
- */
-export function parseAnalysisArgs(args: string[]): { name: string; params: Record<string, string> } {
-  const [name = '', ...rest] = args;
-  const params: Record<string, string> = {};
-  let positional = 0;
-  for (const arg of rest) {
-    const eq = arg.indexOf('=');
-    if (eq > 0) {
-      params[arg.slice(0, eq)] = arg.slice(eq + 1);
-      continue;
-    }
-    if (WINDOW_ARG_RE.test(arg)) {
-      params.window = arg;
-      continue;
-    }
-    const key = POSITIONAL_PARAMS[positional];
-    if (!key) break;
-    params[key] = arg;
-    positional++;
-  }
-  return { name, params };
-}
-
 export function cmdAnalyses(): number {
-  console.log(createAnalysisRegistry().helpText());
+  const registry = createAnalysisRegistry();
+  console.log(registry.helpText());
   console.log('\n用法: node dist/bin/analysis.js analyze <名字> [symbol] [window] [instance] [top=N]');
   console.log('      裸参数里长得像窗口的（2026-10-01 / 昨天 / 近24h / 2026-10-01~2026-10-03）一律当 window；');
   console.log('      其余裸参数按 symbol → instance → top 的顺序填，多出来的忽略。key=value 写法永远优先。');
   console.log('例:   node dist/bin/analysis.js analyze r eth 昨天');
   console.log('      node dist/bin/analysis.js analyze health instance=boye888 window=近24h');
+  void buildHelpText; // 机器人指令表由同一个注册表生成（这里不重复打印）
   return 0;
 }
 
 export async function cmdAnalyze(config: AppConfig, logger: ILogger, name: string, params: Record<string, string>): Promise<number> {
   const registry = createAnalysisRegistry();
-  const analysis = registry.get(name);
-  if (!analysis) {
-    console.error(`未知分析器: ${name}`);
-    console.error(registry.helpText());
-    return 1;
-  }
-
-  let window;
   try {
-    // 长度限制交给 parseWindow 在**枚举天数之前**执行（否则"近100000d"会先把天数数组撑爆）
-    window = parseWindow(params.window, new Date(), undefined, { maxHours: MAX_WINDOW_HOURS });
+    const out = await runAnalysis({ config, name, params, registry });
+    console.log(out.rendered.text);
+    if (out.rendered.truncated) logger.warn('报告超长已截断', { maxChars: config.report.inlineMaxChars });
+    logger.debug('分析完成', { analysis: out.analysis.name, ms: out.elapsedMs, warnings: out.result.warnings.length });
+    return 0;
   } catch (err) {
-    console.error(err instanceof WindowParseError || err instanceof WindowTooLongError ? err.message : String(err));
+    if (err instanceof AnalysisRunError) {
+      console.error(err.message);
+      if (err.kind === 'unknown-analysis') console.error(registry.helpText());
+      return 1;
+    }
+    if (err instanceof WindowParseError || err instanceof WindowTooLongError) {
+      console.error(err.message);
+      return 1;
+    }
+    console.error(`执行失败: ${err instanceof Error ? err.message : String(err)}`);
     return 1;
   }
-
-  const { state, warnings } = loadState(statePathOf(config));
-  for (const w of warnings) logger.warn('状态文件有问题', { detail: w });
-  const source = new LocalEventSource({
-    dataDir: config.runtime.dataDir,
-    prefix: config.oss.prefix,
-    state,
-    countIncludesHeader: config.sync.countIncludesHeader,
-  });
-  if (source.instances().length === 0) {
-    console.error('本地还没有任何分片 —— 先 `npm run sync`（或确认上传侧已产出数据）');
-    return 1;
-  }
-
-  const started = Date.now();
-  const result = await analysis.run({ source, now: new Date(), window, params });
-  const rendered = renderResult(result, { maxChars: config.report.inlineMaxChars });
-  console.log(rendered.text);
-  if (rendered.truncated) logger.warn('报告超长已截断', { maxChars: config.report.inlineMaxChars });
-  logger.debug('分析完成', { analysis: analysis.name, ms: Date.now() - started, events: result.summary.length > 0 });
-  return 0;
 }
 
 function usage(): void {
@@ -428,7 +344,7 @@ function usage(): void {
 用法: node dist/bin/analysis.js <命令> [参数]
 
 命令:
-  run                常驻：定时同步（启动立即跑一次）
+  run                常驻：定时同步 + 机器人（配了 bot 段才启）
   sync [--force]     手动拉取一次（--force 忽略 ETag/静默期强制重扫）
   status             数据新鲜度 / 上次同步结果 / 本地分片
   doctor [--deep]    自检（--deep 会下载最新分片做契约核对）

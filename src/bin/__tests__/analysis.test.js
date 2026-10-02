@@ -305,23 +305,26 @@ function installShard(config, instance, date, events, headerOver = {}) {
   saveState(statePath, state);
 }
 
-test('parseAnalysisArgs：窗口写法一眼识别；其余裸参数按 symbol/instance/top 填，多余的忽略', () => {
-  assert.deepEqual(cli.parseAnalysisArgs(['r', 'eth', '昨天']), { name: 'r', params: { symbol: 'eth', window: '昨天' } });
-  // 实测踩过的坑：日期不能被当成币种
-  assert.deepEqual(cli.parseAnalysisArgs(['health', '2026-10-02']), { name: 'health', params: { window: '2026-10-02' } });
-  assert.deepEqual(cli.parseAnalysisArgs(['r', '2026-10-01~2026-10-03', 'eth']), { name: 'r', params: { window: '2026-10-01~2026-10-03', symbol: 'eth' } });
-  assert.deepEqual(cli.parseAnalysisArgs(['r', 'eth', 'boye888', '近24h', 'top=3']), { name: 'r', params: { symbol: 'eth', instance: 'boye888', top: '3', window: '近24h' } });
-  assert.deepEqual(cli.parseAnalysisArgs(['rounds', 'symbol=btc', 'top=3']), { name: 'rounds', params: { symbol: 'btc', top: '3' } });
-  assert.deepEqual(cli.parseAnalysisArgs(['r', 'a', 'b', 'c', 'd', 'e']), { name: 'r', params: { symbol: 'a', instance: 'b', top: 'c' } }, '多出来的裸参数忽略');
-  assert.deepEqual(cli.parseAnalysisArgs([]), { name: '', params: {} });
-});
-
 test('cmdAnalyses：可用分析器由注册表生成（含别名与参数说明）', async () => {
   const { code, out } = await capture(() => Promise.resolve(cli.cmdAnalyses()));
   assert.equal(code, 0);
   assert.match(out, /rounds \(r\)/);
   assert.match(out, /health \(hc\)/);
   assert.match(out, /analyze <名字>/);
+});
+
+test('startBotIfConfigured：没配 bot 返回 null；配了 dingtalk 建实例；未实现的平台不静默启动', () => {
+  const env = makeEnv();
+  assert.equal(cli.startBotIfConfigured(env.config, env.logger), null, '没配 bot 段 = 只跑定时同步');
+
+  const botCfg = { type: 'dingtalk', appId: '', appSecret: '', allowedStaffIds: [], allowedConversationIds: [], adminStaffIds: [], notify: { warn: '' } };
+  const withBot = { ...env.config, bot: botCfg };
+  const bot = cli.startBotIfConfigured(withBot, env.logger);
+  assert.ok(bot, '配了就要建实例');
+  assert.equal(bot.platform, 'dingtalk');
+  bot.close(); // 凭据为空 ⇒ start() 早退，不会连真网
+
+  assert.equal(cli.startBotIfConfigured({ ...env.config, bot: { ...botCfg, type: 'lark' } }, env.logger), null, '未实现的平台必须拒绝而不是假装启动');
 });
 
 test('cmdAnalyze：端到端跑 rounds（真分片 + 真水位线）并渲染 markdown 报告', async () => {

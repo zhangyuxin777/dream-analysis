@@ -96,7 +96,16 @@ test('bot：全空 = 不配置；填一半 = 报错；填全 = 生效且空白�
   const filled = parseConfig(base({ bot: { type: 'dingtalk', appId: 'ding-abc', appSecret: 's3cr3t-value', allowedStaffIds: [], adminStaffIds: ['u1'], notify: { warn: 'cid' } } }), { rootDir: ROOT });
   assert.equal(filled.config.bot.type, 'dingtalk');
   assert.equal(filled.config.bot.adminStaffIds[0], 'u1');
-  assert.ok(filled.warnings.some((w) => w.includes('群内')));
+  assert.deepEqual(filled.config.bot.allowedConversationIds, [], '不填群白名单 = 不限制群');
+  assert.ok(filled.warnings.some((w) => w.includes('都能发指令')), filled.warnings.join('|'));
+});
+
+test('bot.allowedConversationIds：填了要能读到（whoami 取 conversationId 回填）', () => {
+  const { config } = parseConfig(
+    base({ bot: { type: 'dingtalk', appId: 'a', appSecret: 'b', allowedStaffIds: ['u'], allowedConversationIds: ['cid-1', 'cid-2'], adminStaffIds: [], notify: { warn: '' } } }),
+    { rootDir: ROOT },
+  );
+  assert.deepEqual(config.bot.allowedConversationIds, ['cid-1', 'cid-2']);
 });
 
 test('prefix：写 snapshot 或 snapshot/ 都接受（自动补斜杠并留 warning）', () => {

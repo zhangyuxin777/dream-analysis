@@ -39,6 +39,8 @@ export interface BotConfig {
   appId: string;
   appSecret: string;
   allowedStaffIds: string[];
+  /** 群白名单（`whoami` 取 conversationId）；为空 = 不限制群 */
+  allowedConversationIds: string[];
   adminStaffIds: string[];
   notify: { warn: string };
 }
@@ -176,10 +178,24 @@ export function parseConfig(raw: unknown, opts: { rootDir: string }): ParseResul
       if (!appId) problems.push('bot.appId 必填（填了 appSecret 就必须填 appId）');
       if (!appSecret) problems.push('bot.appSecret 必填');
       const allowedStaffIds = strArray(botRaw.allowedStaffIds, 'bot.allowedStaffIds', problems);
+      const allowedConversationIds = strArray(botRaw.allowedConversationIds, 'bot.allowedConversationIds', problems);
       const adminStaffIds = strArray(botRaw.adminStaffIds, 'bot.adminStaffIds', problems);
-      if (allowedStaffIds.length === 0) warnings.push('bot.allowedStaffIds 为空 ⇒ 群内**所有人**都能发指令');
+      if (allowedStaffIds.length === 0) {
+        warnings.push('bot.allowedStaffIds 为空 ⇒ **任何人**（含应用所在群里的人）都能发指令；配之前请确认应用只加在可信群里');
+      }
+      if (adminStaffIds.length === 0) {
+        warnings.push('bot.adminStaffIds 为空 ⇒ 所有人都能触发 sync（只读分析不受影响）');
+      }
       const notifyRaw = isObject(botRaw.notify) ? botRaw.notify : {};
-      bot = { type: type as BotConfig['type'], appId, appSecret, allowedStaffIds, adminStaffIds, notify: { warn: str(notifyRaw.warn, '') } };
+      bot = {
+        type: type as BotConfig['type'],
+        appId,
+        appSecret,
+        allowedStaffIds,
+        allowedConversationIds,
+        adminStaffIds,
+        notify: { warn: str(notifyRaw.warn, '') },
+      };
     }
   }
 
