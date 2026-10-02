@@ -283,3 +283,92 @@ test('runSync 与 cmdSync 共用同一把锁（命令级验证：同进程二次
   assert.equal(first.pulled.length, 1);
   assert.ok(!fs.existsSync(path.join(env.config.runtime.stateDir, 'sync.lock')), '正常路径也要释放锁');
 });
+
+// ---------- M2：分析命令 ----------
+
+/** 把一个真分片装进本地数据目录，并写进水位线（模拟"同步过"） */
+function installShard(config, instance, date, events, headerOver = {}) {
+  const dir = path.join(config.runtime.dataDir, instance);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, `${date}.jsonl.gz`), shardBuffer(instance, date, events, headerOver));
+  const statePath = statePathOf(config);
+  const { state } = (() => {
+    try {
+      return require('../../../dist/sync/state').loadState(statePath);
+    } catch {
+      return { state: emptyState() };
+    }
+  })();
+  state.objects[`${config.oss.prefix}${instance}/${date}.jsonl.gz`] = {
+    etag: 'E-TEST', size: 100, dataLines: events.length, final: headerOver.final ?? true, pulledAt: new Date().toISOString(), warnings: [],
+  };
+  saveState(statePath, state);
+}
+
+test('parseAnalysisArgs：窗口写法一眼识别；其余裸参数按 symbol/instance/top 填，多余的忽略', () => {
+  assert.deepEqual(cli.parseAnalysisArgs(['r', 'eth', '昨天']), { name: 'r', params: { symbol: 'eth', window: '昨天' } });
+  // 实测踩过的坑：日期不能被当成币种
+  assert.deepEqual(cli.parseAnalysisArgs(['health', '2026-10-02']), { name: 'health', params: { window: '2026-10-02' } });
+  assert.deepEqual(cli.parseAnalysisArgs(['r', '2026-10-01~2026-10-03', 'eth']), { name: 'r', params: { window: '2026-10-01~2026-10-03', symbol: 'eth' } });
+  assert.deepEqual(cli.parseAnalysisArgs(['r', 'eth', 'boye888', '近24h', 'top=3']), { name: 'r', params: { symbol: 'eth', instance: 'boye888', top: '3', window: '近24h' } });
+  assert.deepEqual(cli.parseAnalysisArgs(['rounds', 'symbol=btc', 'top=3']), { name: 'rounds', params: { symbol: 'btc', top: '3' } });
+  assert.deepEqual(cli.parseAnalysisArgs(['r', 'a', 'b', 'c', 'd', 'e']), { name: 'r', params: { symbol: 'a', instance: 'b', top: 'c' } }, '多出来的裸参数忽略');
+  assert.deepEqual(cli.parseAnalysisArgs([]), { name: '', params: {} });
+});
+
+test('cmdAnalyses：可用分析器由注册表生成（含别名与参数说明）', async () => {
+  const { code, out } = await capture(() => Promise.resolve(cli.cmdAnalyses()));
+  assert.equal(code, 0);
+  assert.match(out, /rounds \(r\)/);
+  assert.match(out, /health \(hc\)/);
+  assert.match(out, /analyze <名字>/);
+});
+
+test('cmdAnalyze：端到端跑 rounds（真分片 + 真水位线）并渲染 markdown 报告', async () => {
+  const env = makeEnv();
+  installShard(env.config, 'boye888', '2026-10-01', [
+    { ts: '2026-10-01T01:00:00.000Z', event: 'NEW_ROUND', symbol: 'ETHFDUSD', roundId: 'R001', localDate: '2026-10-01', seq: 1, data: {} },
+    { ts: '2026-10-01T02:00:00.000Z', event: 'SELL_FILLED', symbol: 'ETHFDUSD', roundId: 'R001', localDate: '2026-10-01', seq: 2, data: { profit: 1.5 } },
+    { ts: '2026-10-01T03:00:00.000Z', event: 'ROUND_COMPLETED', symbol: 'ETHFDUSD', roundId: 'R001', localDate: '2026-10-01', seq: 3, data: { profit: 1.6, durationHours: 2 } },
+  ]);
+
+  const { code, out } = await capture(() => cli.cmdAnalyze(env.config, env.logger, 'r', { window: '2026-10-01' }));
+  assert.equal(code, 0, out);
+  assert.match(out, /## 轮次与成交 · 2026-10-01/);
+  assert.match(out, /\| ETHFDUSD \| 1 \| 1 \| 0 \|/);
+  assert.match(out, /止盈利润合计 1\.50/);
+  assert.match(out, /最长卡轮/);
+});
+
+test('cmdAnalyze：短名取不到就报未知并打 help；非法窗口 / 超长窗口 / 本地没数据都返回 1', async () => {
+  const env = makeEnv();
+  const unknown = await capture(() => cli.cmdAnalyze(env.config, env.logger, 'nope', {}));
+  assert.equal(unknown.code, 1);
+  assert.match(unknown.err, /未知分析器: nope/);
+  assert.match(unknown.err, /rounds \(r\)/);
+
+  installShard(env.config, 'boye888', '2026-10-01', [{ ts: '2026-10-01T01:00:00.000Z', event: 'NEW_ROUND', symbol: 'ETHFDUSD', localDate: '2026-10-01', seq: 1, data: {} }]);
+  const badWindow = await capture(() => cli.cmdAnalyze(env.config, env.logger, 'r', { window: '上周' }));
+  assert.equal(badWindow.code, 1);
+  assert.match(badWindow.err, /无法解析的窗口写法/);
+
+  const tooLong = await capture(() => cli.cmdAnalyze(env.config, env.logger, 'r', { window: '2020-01-01~2026-01-01' }));
+  assert.equal(tooLong.code, 1);
+  assert.match(tooLong.err, /窗口太长/);
+
+  const empty = makeEnv();
+  const noData = await capture(() => cli.cmdAnalyze(empty.config, empty.logger, 'r', {}));
+  assert.equal(noData.code, 1);
+  assert.match(noData.err, /本地还没有任何分片/);
+});
+
+test('cmdAnalyze：未封存分片 ⇒ 报告顶部带"暂定"标记（结论不能被当定论）', async () => {
+  const env = makeEnv();
+  installShard(env.config, 'boye888', '2026-10-02', [
+    { ts: '2026-10-02T01:00:00.000Z', event: 'SELL_FILLED', symbol: 'ETHFDUSD', localDate: '2026-10-02', seq: 1, data: { profit: 2 } },
+  ], { final: false });
+
+  const { code, out } = await capture(() => cli.cmdAnalyze(env.config, env.logger, 'r', { window: '2026-10-02' }));
+  assert.equal(code, 0, out);
+  assert.match(out, /暂定/);
+});

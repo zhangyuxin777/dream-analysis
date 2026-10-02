@@ -26,6 +26,11 @@ import { createScheduler } from '../sync/scheduler';
 import { loadState, listLocalShards } from '../sync/state';
 import { readShard } from '../ndjson/shard';
 import { parseShardKey } from '../ndjson/types';
+import { createAnalysisRegistry } from '../analysis';
+import { MAX_WINDOW_HOURS, POSITIONAL_PARAMS, WINDOW_ARG_RE } from '../analysis/types';
+import { parseWindow, WindowParseError, windowHours } from '../common/time';
+import { LocalEventSource } from '../store/eventSource';
+import { renderResult } from '../report/render';
 
 const ROOT_DIR = path.resolve(__dirname, '..', '..');
 /** 连接类稀疏事件的前缀：契约核对里要确认上传侧把它们放进来了（DESIGN §3.4-③） */
@@ -338,6 +343,85 @@ export async function cmdVerify(ctx: CommandContext, key: string): Promise<numbe
   return stats.ok ? 0 : 1;
 }
 
+/**
+ * 解析 `analyze` 的参数：
+ * - `key=value` 优先；
+ * - 裸参数里**长得像窗口的**（`2026-10-02`、`昨天`、`近24h`、区间）一律当 `window`
+ *   —— 否则 `analyze health 2026-10-02` 会把日期当币种（实测踩过）；
+ * - 其余裸参数按 `POSITIONAL_PARAMS` 顺序填（symbol → instance → top），多出来的忽略。
+ */
+export function parseAnalysisArgs(args: string[]): { name: string; params: Record<string, string> } {
+  const [name = '', ...rest] = args;
+  const params: Record<string, string> = {};
+  let positional = 0;
+  for (const arg of rest) {
+    const eq = arg.indexOf('=');
+    if (eq > 0) {
+      params[arg.slice(0, eq)] = arg.slice(eq + 1);
+      continue;
+    }
+    if (WINDOW_ARG_RE.test(arg)) {
+      params.window = arg;
+      continue;
+    }
+    const key = POSITIONAL_PARAMS[positional];
+    if (!key) break;
+    params[key] = arg;
+    positional++;
+  }
+  return { name, params };
+}
+
+export function cmdAnalyses(): number {
+  console.log(createAnalysisRegistry().helpText());
+  console.log('\n用法: node dist/bin/analysis.js analyze <名字> [symbol] [window] [key=value ...]');
+  console.log('例:   node dist/bin/analysis.js analyze r eth 昨天');
+  return 0;
+}
+
+export async function cmdAnalyze(config: AppConfig, logger: ILogger, name: string, params: Record<string, string>): Promise<number> {
+  const registry = createAnalysisRegistry();
+  const analysis = registry.get(name);
+  if (!analysis) {
+    console.error(`未知分析器: ${name}`);
+    console.error(registry.helpText());
+    return 1;
+  }
+
+  let window;
+  try {
+    window = parseWindow(params.window, new Date());
+  } catch (err) {
+    console.error(err instanceof WindowParseError ? err.message : String(err));
+    return 1;
+  }
+  if (windowHours(window) > MAX_WINDOW_HOURS) {
+    console.error(`窗口太长（${windowHours(window).toFixed(0)}h > ${MAX_WINDOW_HOURS}h）—— 分批分析，别一次扫太多分片`);
+    return 1;
+  }
+
+  const { state, warnings } = loadState(statePathOf(config));
+  for (const w of warnings) logger.warn('状态文件有问题', { detail: w });
+  const source = new LocalEventSource({
+    dataDir: config.runtime.dataDir,
+    prefix: config.oss.prefix,
+    state,
+    countIncludesHeader: config.sync.countIncludesHeader,
+  });
+  if (source.instances().length === 0) {
+    console.error('本地还没有任何分片 —— 先 `npm run sync`（或确认上传侧已产出数据）');
+    return 1;
+  }
+
+  const started = Date.now();
+  const result = await analysis.run({ source, now: new Date(), window, params });
+  const rendered = renderResult(result, { maxChars: config.report.inlineMaxChars });
+  console.log(rendered.text);
+  if (rendered.truncated) logger.warn('报告超长已截断', { maxChars: config.report.inlineMaxChars });
+  logger.debug('分析完成', { analysis: analysis.name, ms: Date.now() - started, events: result.summary.length > 0 });
+  return 0;
+}
+
 function usage(): void {
   console.log(`dream-analysis CLI
 
@@ -350,6 +434,9 @@ function usage(): void {
   doctor [--deep]    自检（--deep 会下载最新分片做契约核对）
   list               远端对象 vs 本地状态对照
   verify <key>       下载并校验某个分片（不入库、不动水位线）
+  analyses           列出可用分析器（含参数说明）
+  analyze <名字> [symbol] [window] [key=value ...]
+                     跑一次分析并打印报告
   help               本说明
 `);
 }
@@ -392,6 +479,17 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
       return cmdList(buildContext(config, logger));
     case 'verify':
       return cmdVerify(buildContext(config, logger), argv[1] ?? '');
+    case 'analyses':
+      return cmdAnalyses();
+    case 'analyze': {
+      const { name, params } = parseAnalysisArgs(argv.slice(1));
+      if (!name) {
+        console.error('用法: analyze <名字> [symbol] [window] [key=value ...]');
+        console.error(createAnalysisRegistry().helpText());
+        return 1;
+      }
+      return cmdAnalyze(config, logger, name, params);
+    }
     default:
       console.error(`未知命令: ${command}`);
       usage();
