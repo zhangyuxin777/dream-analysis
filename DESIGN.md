@@ -252,8 +252,8 @@ interface Analysis {
 
 | name | 别名 | 说明 | 依赖事件 | 依赖上传侧 |
 |---|---|---|---|---|
-| `health` | `hc` | 数据新鲜度、事件密度、`ACCOUNT_OBSERVED` 心跳缺口 | 全部 + account | — |
-| `rounds` | `r` | 轮数、成交笔数、利润合计、最长卡轮 Top N | `NEW_ROUND` `SELL_FILLED` `ROUND_COMPLETED` | — |
+| `health` | `hc` | 数据新鲜度、事件密度、`ACCOUNT_OBSERVED` 心跳缺口、异常计数 | 全部 + account | — |
+| `rounds` | `r` | 轮数、成交笔数、止盈/整轮利润、未完成轮、卡轮 Top N | `NEW_ROUND` `SELL_FILLED` `ROUND_COMPLETED` | — |
 | `topup` | `tu` | 补仓次数/贡献、深跌期行为 | `TOPUP_*` `CRASH_*` | — |
 | `stopgaps` | `sg` | **有没有偷偷停轮**：`STOP_SIGNAL_RECEIVED` / `RESUME_SIGNAL_RECEIVED` 时间线 | 停轮/复轮 | — |
 | `errors` | `e` | 异常事件分组明细（按类型 + 最近 N 条） | `*_ERROR` `*_FAILED` `SELL_STATE_*` | 部分需 ③ |
@@ -261,6 +261,22 @@ interface Analysis {
 | `trend` | `tr` | 按小时/天的活跃度与收益趋势 | 同 `rounds` | — |
 
 > 若 §3.4-③ 不解决：`stream` 降级为"**疑似停摆**"（用 account 心跳间隔推断），并在结果里明确写"数据源不含连接事件，无法区分断流/停机"。
+
+### M2 已交付（2026-10-02）
+
+`health` / `rounds` 已实现并跑过真数据；配套的契约与基建：
+
+- **窗口**（`common/time.ts`）：`近Nh/近Nd/今天/昨天/单日/区间`，全部按契约时区算；
+  **格式对但不存在的日子（2026-02-30）必须拒绝**（`Date.parse` 会静默进位成 03-02，用户会拿到另一天的数字）；
+  **超长窗口在枚举天数之前就拦**（否则 `近100000d` 会先把天数数组撑爆）。
+- **事件源**（`store/eventSource.ts`）：按窗口/实例/币种过滤；**缺天必报**；
+  **读不出来的分片进 `failedShards`（不算"已覆盖"）**，同步时校验出的分片级告警（行数不符/缺前段）随 `shardWarnings` 一起带进报告
+  —— 这两条是 M2 review 的 Critical：不报就会把"静默低报"伪装成健康数字。
+- **渲染**（`report/render.ts`）：markdown + 长度预算；头部与告警**永不截断**，截断必须写明"仅显示前 K 行 / 共 N 行"。
+- **注册表**（`analysis/types.ts`）：`help`/指令表由注册表生成；加分析器 = 在 `analysis/index.ts` 挂一行。
+- 已知取舍：`health` 的心跳**按实例分开统计**（多实例混成一条游标会既漏报又错值）；
+  `rounds` 的"未完成轮"按 roundId 判（带/不带 id 的事件分别算），并额外给"未完成轮已运行时长 Top N"
+  —— 只看已结束的轮会把"哪一轮卡住"答反。
 
 ---
 
@@ -274,12 +290,17 @@ interface Analysis {
 h / help                      指令列表（注册表自动生成）
 whoami                        senderId / conversationId（配白名单用）
 status                        数据新鲜度：最新已封存日期、当天是否拉全、落后时长、上次同步结果、磁盘占用
-sync [--force]                手动拉取一次（--force 忽略 ETag 重扫）
-a / analyze <name> [params]   执行分析（rounds/health/topup/stopgaps/errors/stream/trend）
-r / report [instance] [窗口]  运行概览（rounds + health 摘要）
-st / stream [instance] [窗口]
-tr / trend [instance] [窗口]
+sync [--force]                手动拉取一次（--force 忽略 ETag/静默期重扫）
+a / analyze <name> [参数]     执行分析（名字与参数说明由注册表提供）
+hc / health [instance] [窗口] 运行健康（数据完整性 / 心跳 / 异常计数）
+r / rounds [symbol] [窗口]    轮次与成交（利润 / 未完成轮 / 卡轮）
+report [instance] [窗口]      M3：概览（health + rounds 摘要）——**与 rounds 别名分开**，别占用 `r`
 ```
+
+**参数规则（CLI 与机器人共用一套，`POSITIONAL_PARAMS` + `WINDOW_ARG_RE`）**：
+`key=value` 永远优先；裸参数里**长得像窗口的**（`2026-10-01` / `昨天` / `近24h` / `区间`）一律当 `window`；
+其余裸参数按 `symbol → instance → top` 顺序填。
+> 为什么窗口要特判：`analyze health 2026-10-02` 曾把日期当成 symbol ⇒ 窗口悄悄退回"昨天"、输出 0 事件（实测踩过）。
 
 窗口语法（`common/time.ts` 统一解析）：`近1h / 近24h / 近7d / 今天 / 昨天 / 2026-10-01 / 2026-10-01~2026-10-03`。
 
@@ -393,6 +414,7 @@ tr / trend [instance] [窗口]
 | OSS 前缀 | **`snapshot/`** —— 沿用现有严格策略，**不改线上策略** |
 | 上传侧阻塞项 | 已按 §3.4 修正 → **M1 用真数据核对** |
 | M1 交付状态 | 代码完成：121 个测试全绿、覆盖率 86.4/82.6/82.5（门槛 80/80/80）；**两轮四角色审查**（第一轮 3C+9W 全修；第二轮复检 6W，其中 5 条已修，1 条（锁的 stale 窗口）由"同机判活"从根上解决） |
+| M2 交付状态 | `health` + `rounds` 已实现并在真分片上验证（746 事件 / 暂定标记 / 账户估值 93683.55）；测试 177 全绿、覆盖率 89.4/84.4/84.7；四角色审查 4C+7W 已按条修复（分片读失败与分片级告警不再被吞、窗口日期校验、多实例心跳分实例、未完成轮按 id 混算 + 已运行时长 Top N） |
 
 ### 待办
 

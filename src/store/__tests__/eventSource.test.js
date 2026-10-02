@@ -116,3 +116,26 @@ test('matchSymbol：精确与短名都认，空过滤=全要，无 symbol 的不
   assert.equal(matchSymbol(undefined, 'eth'), false);
   assert.equal(matchSymbol('__account__', 'eth'), false);
 });
+
+test('分片存在但读不出来：进 failedShards、不算"已覆盖"，那天仍算缺数据（不许静默当成 0 事件）', async () => {
+  const env = makeEnv();
+  fs.writeFileSync(path.join(env.dataDir, 'boye888', '2026-10-02.jsonl.gz'), Buffer.from('这不是 gzip', 'utf8'));
+  const src = new LocalEventSource({ dataDir: env.dataDir, prefix: PREFIX, state: env.state });
+
+  const stats = await src.scan({ window: parseWindow('2026-10-02', NOW) }, () => undefined);
+  assert.equal(stats.shards, 0, '读失败不能算成"扫过了一个分片"');
+  assert.equal(stats.failedShards.length, 1);
+  assert.match(stats.failedShards[0].errors.join(' '), /gzip 解压失败/);
+  assert.deepEqual(stats.missingDays, ['2026-10-02'], '读不出来的那天也要算缺数据');
+});
+
+test('分片级告警（同步时校验出来的行数不符等）必须带进分析结果', async () => {
+  const env = makeEnv(); // 10-02 的水位线条目里带着 warnings: ['行数不符']
+  const src = new LocalEventSource({ dataDir: env.dataDir, prefix: PREFIX, state: env.state });
+
+  const stats = await src.scan({ window: parseWindow('2026-10-02', NOW) }, () => undefined);
+  assert.equal(stats.shards, 1);
+  assert.equal(stats.shardWarnings.length, 1);
+  assert.match(stats.shardWarnings[0].warnings.join(' '), /行数不符/);
+  assert.equal(stats.provisional, true, '未封存的分片同时要把 provisional 打开');
+});

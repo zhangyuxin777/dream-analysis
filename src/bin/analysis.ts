@@ -28,7 +28,7 @@ import { readShard } from '../ndjson/shard';
 import { parseShardKey } from '../ndjson/types';
 import { createAnalysisRegistry } from '../analysis';
 import { MAX_WINDOW_HOURS, POSITIONAL_PARAMS, WINDOW_ARG_RE } from '../analysis/types';
-import { parseWindow, WindowParseError, windowHours } from '../common/time';
+import { parseWindow, WindowParseError, WindowTooLongError } from '../common/time';
 import { LocalEventSource } from '../store/eventSource';
 import { renderResult } from '../report/render';
 
@@ -374,8 +374,11 @@ export function parseAnalysisArgs(args: string[]): { name: string; params: Recor
 
 export function cmdAnalyses(): number {
   console.log(createAnalysisRegistry().helpText());
-  console.log('\n用法: node dist/bin/analysis.js analyze <名字> [symbol] [window] [key=value ...]');
+  console.log('\n用法: node dist/bin/analysis.js analyze <名字> [symbol] [window] [instance] [top=N]');
+  console.log('      裸参数里长得像窗口的（2026-10-01 / 昨天 / 近24h / 2026-10-01~2026-10-03）一律当 window；');
+  console.log('      其余裸参数按 symbol → instance → top 的顺序填，多出来的忽略。key=value 写法永远优先。');
   console.log('例:   node dist/bin/analysis.js analyze r eth 昨天');
+  console.log('      node dist/bin/analysis.js analyze health instance=boye888 window=近24h');
   return 0;
 }
 
@@ -390,13 +393,10 @@ export async function cmdAnalyze(config: AppConfig, logger: ILogger, name: strin
 
   let window;
   try {
-    window = parseWindow(params.window, new Date());
+    // 长度限制交给 parseWindow 在**枚举天数之前**执行（否则"近100000d"会先把天数数组撑爆）
+    window = parseWindow(params.window, new Date(), undefined, { maxHours: MAX_WINDOW_HOURS });
   } catch (err) {
-    console.error(err instanceof WindowParseError ? err.message : String(err));
-    return 1;
-  }
-  if (windowHours(window) > MAX_WINDOW_HOURS) {
-    console.error(`窗口太长（${windowHours(window).toFixed(0)}h > ${MAX_WINDOW_HOURS}h）—— 分批分析，别一次扫太多分片`);
+    console.error(err instanceof WindowParseError || err instanceof WindowTooLongError ? err.message : String(err));
     return 1;
   }
 
@@ -435,8 +435,8 @@ function usage(): void {
   list               远端对象 vs 本地状态对照
   verify <key>       下载并校验某个分片（不入库、不动水位线）
   analyses           列出可用分析器（含参数说明）
-  analyze <名字> [symbol] [window] [key=value ...]
-                     跑一次分析并打印报告
+  analyze <名字> [symbol] [window] [instance] [top=N]
+                     跑一次分析并打印报告（长得像窗口的裸参数一律当 window）
   help               本说明
 `);
 }

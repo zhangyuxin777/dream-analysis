@@ -8,8 +8,11 @@
  */
 import { Window } from '../common/time';
 
-/** 单次分析允许的最大窗口（30 天）。超过就拒绝 —— 全量扫描会把 002 的磁盘/CPU 占满。 */
-export const MAX_WINDOW_HOURS = 24 * 30;
+/**
+ * 单次分析允许的最大窗口（30 天）。**实现只有一处**（`common/time.ts`），
+ * 这里 re-export 是为了给 CLI/机器人一个稳定的导入面；并把限制交给 `parseWindow` 在**枚举天数之前**执行。
+ */
+export { MAX_WINDOW_HOURS } from '../common/time';
 
 /**
  * 裸参数按顺序当作这些参数名（与机器人指令 `r ETH 昨天` 的写法一致）。
@@ -84,6 +87,14 @@ export interface ScanStats {
   missingDays: string[];
   /** 扫描到的分片里是否有未封存（final=false）的 */
   provisional: boolean;
+  /**
+   * **存在但读不出来**的分片（gzip 坏 / 首行不是 header / IO 失败）。
+   * 绝不能把它们当成"这天已覆盖、只是没事件" —— 那正是静默低报（M2 review 的 Critical）。
+   * 注意：若读取在中途失败，失败前的事件**已经**回调出去了 ⇒ 统计可能不完整，必须配一条告警说清。
+   */
+  failedShards: Array<{ key: string; errors: string[] }>;
+  /** 分片级告警（同步时记下的"行数不符/缺前段" + 本次读取发现的），必须在报告里露出来 */
+  shardWarnings: Array<{ key: string; warnings: string[] }>;
 }
 
 export interface ShardInfo {

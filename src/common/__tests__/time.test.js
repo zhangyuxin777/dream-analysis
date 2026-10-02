@@ -12,6 +12,7 @@ const {
   windowHours,
   formatShanghai,
   WindowParseError,
+  WindowTooLongError,
 } = require('../../../dist/common/time');
 
 // 北京时间 2026-10-02 20:00
@@ -76,6 +77,21 @@ test('parseWindow：缺省与非法输入', () => {
 
 test('formatShanghai：显示用本地时间', () => {
   assert.equal(formatShanghai(Date.parse('2026-10-02T12:34:56.000Z')), '2026-10-02 20:34');
+});
+
+test('parseWindow：格式对但日子不存在必须拒绝（Date.parse 会静默进位成另一天，用户拿到别的日子）', () => {
+  for (const bad of ['2026-02-30', '2026-04-31', '2026-13-01', '2026-02-29', '2026-10-01~2026-02-30']) {
+    assert.throws(() => parseWindow(bad, NOW), WindowParseError, `应判非法: ${bad}`);
+  }
+  assert.equal(parseWindow('2024-02-29', NOW).days.length, 1, '闰年 2-29 是合法日子');
+});
+
+test('parseWindow：超长窗口在**枚举天数之前**就拒绝（否则"近100000d"会先把天数数组撑爆）', () => {
+  assert.throws(() => parseWindow('近100000d', NOW), WindowTooLongError);
+  assert.throws(() => parseWindow('2020-01-01~2026-01-01', NOW), /窗口太长/);
+  assert.equal(windowHours(parseWindow('近720h', NOW)), 720, '恰好等于上限应当放行');
+  assert.throws(() => parseWindow('近721h', NOW), WindowTooLongError);
+  assert.throws(() => parseWindow('近100000d', NOW, '昨天', { maxHours: 1 }), /窗口太长/);
 });
 
 function pick(w) {

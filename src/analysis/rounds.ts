@@ -63,6 +63,8 @@ export function roundsAnalysis(): Analysis {
     async run(ctx: AnalysisContext): Promise<AnalysisResult> {
       const bySymbol = new Map<string, SymbolStats>();
       const worst: WorstRound[] = [];
+      /** roundId → 该轮在窗口内第一次出现的时间（用于算"还在开的轮已经跑了多久"） */
+      const roundFirst = new Map<string, { symbol: string; firstMs: number }>();
       const topN = Math.max(1, Math.min(50, Number(ctx.params.top ?? '5') || 5));
       let events = 0;
 
@@ -82,6 +84,8 @@ export function roundsAnalysis(): Analysis {
           const symbol = e.symbol ?? '(无 symbol)';
           const s = statOf(symbol);
           const roundId = e.roundId ?? strOf(e.data, 'roundId') ?? '';
+          const ms = Date.parse(e.ts);
+          if (roundId !== '' && !roundFirst.has(roundId)) roundFirst.set(roundId, { symbol, firstMs: ms });
           switch (e.event) {
             case 'NEW_ROUND':
               s.newRounds++;
@@ -131,9 +135,22 @@ export function roundsAnalysis(): Analysis {
       if (stats.missingDays.length > 0) {
         warnings.push(`窗口内缺 ${stats.missingDays.length} 天的本地数据: ${stats.missingDays.join(', ')}（下面的轮数/利润按现有数据算，会偏低）`);
       }
+      if (stats.failedShards.length > 0) {
+        warnings.push(
+          `有 ${stats.failedShards.length} 个分片**读不出来**（这些天的轮数/利润没算进来；读取中途失败的，已读到的部分可能已计入）: ` +
+            stats.failedShards.slice(0, 3).map((f) => `${f.key}（${f.errors.join('；')}）`).join(' | '),
+        );
+      }
+      if (stats.shardWarnings.length > 0) {
+        warnings.push(
+          `有 ${stats.shardWarnings.length} 个分片带数据告警（行数不符/缺前段等）⇒ 轮数与利润可能偏低：` +
+            stats.shardWarnings.slice(0, 3).map((s) => `${s.key}: ${s.warnings.slice(0, 2).join('；')}`).join(' | '),
+        );
+      }
       if (events === 0) warnings.push('窗口内没有任何轮次/成交类事件');
 
       const rows: string[][] = [];
+      const unfinishedAging: Array<{ symbol: string; roundId: string; ageHours: number }> = [];
       let totalNew = 0;
       let totalCompleted = 0;
       let totalUnfinished = 0;
@@ -141,10 +158,18 @@ export function roundsAnalysis(): Analysis {
       let totalRoundProfitCents = 0;
 
       for (const [symbol, s] of [...bySymbol.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
-        // 未完成轮：以"有 NEW_ROUND 但没有 ROUND_COMPLETED"的 roundId 计算；没有 roundId 时退化为计数差
-        const unfinished = s.newRoundIds.size > 0 || s.completedRoundIds.size > 0
-          ? [...s.newRoundIds].filter((id) => !s.completedRoundIds.has(id)).length
-          : Math.max(0, s.newRounds - s.completedRounds);
+        // 未完成轮：**带 roundId 与不带 roundId 的事件要分别算**（旧版本日志不带 roundId，跨版本窗口会混）
+        // 只走"集合分支"会漏掉"新轮带 id、完成轮不带 id"这一侧 ⇒ 未完成被少算（M2 review 的 Warning）
+        const idlessNew = Math.max(0, s.newRounds - s.newRoundIds.size);
+        const idlessCompleted = Math.max(0, s.completedRounds - s.completedRoundIds.size);
+        const unfinishedIds = [...s.newRoundIds].filter((id) => !s.completedRoundIds.has(id));
+        const unfinished = unfinishedIds.length + Math.max(0, idlessNew - idlessCompleted);
+
+        for (const id of unfinishedIds) {
+          const first = roundFirst.get(id);
+          if (first) unfinishedAging.push({ symbol, roundId: id, ageHours: (ctx.window.toMs - first.firstMs) / 3_600_000 });
+        }
+
         totalNew += s.newRounds;
         totalCompleted += s.completedRounds;
         totalUnfinished += unfinished;
@@ -187,9 +212,20 @@ export function roundsAnalysis(): Analysis {
       const worstSorted = [...worst].sort((a, b) => b.durationHours - a.durationHours).slice(0, topN);
       if (worstSorted.length > 0) {
         sections.push({
-          heading: `最长卡轮 Top ${worstSorted.length}（按 ROUND_COMPLETED.durationHours）`,
+          heading: `最长卡轮 Top ${worstSorted.length}（已结束的轮，按 ROUND_COMPLETED.durationHours = 首笔买入→卖出）`,
           headers: ['币种', '轮次', '时长(h)', '整轮利润', '深跌'],
           rows: worstSorted.map((w) => [w.symbol, w.roundId || '-', w.durationHours.toFixed(2), yuan(w.profitCents), w.crash ? '是' : '']),
+        });
+      }
+
+      // 正在开的轮也要能看出"卡了多久" —— 只看已结束的轮会把"哪一轮卡住了"答反（M2 review 的 Warning）
+      const agingSorted = [...unfinishedAging].sort((a, b) => b.ageHours - a.ageHours).slice(0, topN);
+      if (agingSorted.length > 0) {
+        sections.push({
+          heading: `未完成轮 Top ${agingSorted.length}（窗口内已运行时长，越大越像卡住）`,
+          headers: ['币种', '轮次', '已运行(h)'],
+          rows: agingSorted.map((a) => [a.symbol, a.roundId, a.ageHours.toFixed(1)]),
+          note: '已运行 = 窗口结束时刻 − 该轮在窗口内的首条事件；窗口结束不等于"卖出"，所以它衡量的是"还在开多久"。',
         });
       }
 

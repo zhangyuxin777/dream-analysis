@@ -24,7 +24,15 @@ function fakeSource(events, opts = {}) {
         n++;
         cb(e);
       }
-      return { shards: opts.shards ?? 1, events: n, badLines: 0, missingDays: opts.missingDays ?? [], provisional: opts.provisional ?? false };
+      return {
+        shards: opts.shards ?? 1,
+        events: n,
+        badLines: 0,
+        missingDays: opts.missingDays ?? [],
+        provisional: opts.provisional ?? false,
+        failedShards: opts.failedShards ?? [],
+        shardWarnings: opts.shardWarnings ?? [],
+      };
     },
   };
 }
@@ -112,4 +120,42 @@ test('缺 roundId 时退化为"新轮 - 完成轮"（旧数据也要能算，不
   ];
   const result = await run(events);
   assert.equal(rowOf(result, 'ETHFDUSD')[3], '1', '2 个新轮 - 1 个完成 = 1 个未完成');
+});
+
+test('带 id 与不带 id 混在同一窗口：未完成轮不能被少算（跨版本日志的混合场景）', async () => {
+  const events = [
+    ev('2026-10-01T01:00:00.000Z', 'NEW_ROUND', 'ETHFDUSD', {}, 'R001'), // 新轮带 id
+    ev('2026-10-01T03:00:00.000Z', 'ROUND_COMPLETED', 'ETHFDUSD', { profit: 1, durationHours: 2 }), // 完成轮不带 id
+    ev('2026-10-01T04:00:00.000Z', 'NEW_ROUND', 'ETHFDUSD', {}), // 另一个新轮也不带 id
+    ev('2026-10-01T05:00:00.000Z', 'NEW_ROUND', 'ETHFDUSD', {}), // 再来一个
+  ];
+  const result = await run(events);
+  const row = rowOf(result, 'ETHFDUSD');
+  assert.equal(row[1], '3', '新轮 3（1 个带 id + 2 个不带）');
+  assert.equal(row[2], '1', '完成 1（不带 id）');
+  assert.equal(row[3], '2', '未完成 = 带 id 没完成的 1 + 不带 id 的 2-1=1 ⇒ 2（早期实现会算成 1）');
+});
+
+test('未完成轮也要能看出"卡了多久"（只看已结束的轮会把"哪一轮卡住"答反）', async () => {
+  const events = [
+    ev('2026-10-01T01:00:00.000Z', 'NEW_ROUND', 'ETHFDUSD', {}, 'R001'), // 窗口内最早 → 已运行最久
+    ev('2026-10-01T10:00:00.000Z', 'NEW_ROUND', 'BTCFDUSD', {}, 'R002'),
+    ev('2026-10-01T04:00:00.000Z', 'ROUND_COMPLETED', 'SOLFDUSD', { profit: 1, durationHours: 30 }, 'R003'),
+  ];
+  const result = await run(events, {}, { window: '2026-10-01' });
+  const aging = result.sections.find((s) => s.heading.startsWith('未完成轮'));
+  // 窗口 2026-10-01（上海日）= [09-30T16:00Z, 10-01T16:00Z)；该轮首现 10-01T01:00Z ⇒ 已运行 15h
+  assert.deepEqual(aging.rows[0], ['ETHFDUSD', 'R001', '15.0']);
+  assert.deepEqual(aging.rows[1].slice(0, 2), ['BTCFDUSD', 'R002']);
+  assert.match(aging.note, /已运行 = 窗口结束时刻/);
+});
+
+test('分片读不出来 / 带数据告警时，轮数结论必须打折说明', async () => {
+  const result = await run(SCENARIO, {
+    failedShards: [{ key: 'snapshot/a/2026-09-30.jsonl.gz', errors: ['文件不存在'] }],
+    shardWarnings: [{ key: 'snapshot/a/2026-10-01.jsonl.gz', warnings: ['行数不符'] }],
+  });
+  const warning = result.warnings.join('\n');
+  assert.match(warning, /1 个分片\*\*读不出来\*\*/);
+  assert.match(warning, /轮数与利润可能偏低/);
 });

@@ -16,6 +16,15 @@ const ERROR_EVENT_RE = /(_ERROR|_FAILED|UNRECOVERED|_ALERT)$/;
 /** 心跳间隔超过这个值 ⇒ 疑似停摆（上传侧每小时一次观测，2 小时足够宽松） */
 export const HEARTBEAT_GAP_ALERT_MS = 2 * 3_600_000;
 
+export interface InstanceHeartbeat {
+  instance: string;
+  count: number;
+  lastMs: number;
+  maxGapMs: number | null;
+  lastTotalValue: number | null;
+  lastExchange: string | null;
+}
+
 export interface HealthTotals {
   events: number;
   shards: number;
@@ -27,6 +36,10 @@ export interface HealthTotals {
   errorCounts: Map<string, number>;
   heartbeatCount: number;
   heartbeatMaxGapMs: number | null;
+  /** 最大间隔出现在哪个实例（多实例混成一条游标会既漏报又错值 —— M2 review 的 Warning） */
+  heartbeatWorstInstance: string | null;
+  heartbeats: Map<string, InstanceHeartbeat>;
+  /** 最近一次观测的估值（按"最新那条心跳"取，而不是扫描顺序里最后一条） */
   lastTotalValue: number | null;
   lastExchange: string | null;
 }
@@ -49,9 +62,9 @@ export function healthAnalysis(): Analysis {
       const totals: HealthTotals = {
         events: 0, shards: 0, badLines: 0, firstTs: null, lastTs: null,
         eventCounts: new Map(), symbolCounts: new Map(), errorCounts: new Map(),
-        heartbeatCount: 0, heartbeatMaxGapMs: null, lastTotalValue: null, lastExchange: null,
+        heartbeatCount: 0, heartbeatMaxGapMs: null, heartbeatWorstInstance: null, heartbeats: new Map(),
+        lastTotalValue: null, lastExchange: null,
       };
-      let lastHeartbeatMs: number | null = null;
 
       const stats = await ctx.source.scan({ window: ctx.window, instance: ctx.params.instance }, (e) => {
         totals.events++;
@@ -66,34 +79,68 @@ export function healthAnalysis(): Analysis {
 
         if (e.event === 'ACCOUNT_OBSERVED') {
           totals.heartbeatCount++;
-          if (lastHeartbeatMs !== null) {
-            const gap = ms - lastHeartbeatMs;
-            if (totals.heartbeatMaxGapMs === null || gap > totals.heartbeatMaxGapMs) totals.heartbeatMaxGapMs = gap;
+          // 按实例各记一条游标：多实例混成一条会把"实例 A 停了 5 小时"和"实例 B 正常"互相抵消
+          const hb: InstanceHeartbeat = totals.heartbeats.get(e.instance) ?? {
+            instance: e.instance, count: 0, lastMs: 0, maxGapMs: null, lastTotalValue: null, lastExchange: null,
+          };
+          hb.count++;
+          if (hb.lastMs > 0) {
+            const gap = ms - hb.lastMs;
+            if (hb.maxGapMs === null || gap > hb.maxGapMs) hb.maxGapMs = gap;
           }
-          lastHeartbeatMs = ms;
+          hb.lastMs = ms;
           const value = numOf(e.data, 'totalValue');
-          if (value !== null) totals.lastTotalValue = value;
+          if (value !== null) hb.lastTotalValue = value;
           const exchange = strOf(e.data, 'exchange');
-          if (exchange) totals.lastExchange = exchange;
+          if (exchange) hb.lastExchange = exchange;
+          totals.heartbeats.set(e.instance, hb);
+
+          if (hb.maxGapMs !== null && (totals.heartbeatMaxGapMs === null || hb.maxGapMs > totals.heartbeatMaxGapMs)) {
+            totals.heartbeatMaxGapMs = hb.maxGapMs;
+            totals.heartbeatWorstInstance = e.instance;
+          }
         }
       });
       totals.shards = stats.shards;
       totals.badLines = stats.badLines;
 
+      // "最近账户估值"取**最新那条心跳**（而不是扫描顺序里最后一条，否则会显示几小时前的旧值）
+      const latest = [...totals.heartbeats.values()].sort((a, b) => b.lastMs - a.lastMs)[0];
+      if (latest) {
+        totals.lastTotalValue = latest.lastTotalValue;
+        totals.lastExchange = latest.lastExchange;
+      }
+
       const warnings: string[] = [];
       if (stats.missingDays.length > 0) {
         warnings.push(`窗口内缺 ${stats.missingDays.length} 天的本地数据: ${stats.missingDays.join(', ')}（结果按现有数据算，不要把缺口当成"没有异常"）`);
+      }
+      if (stats.failedShards.length > 0) {
+        warnings.push(
+          `有 ${stats.failedShards.length} 个分片**读不出来**（这些天的数据没算进来；若读取中途失败，已读到的部分可能已经计入 ⇒ 统计可能不完整）: ` +
+            stats.failedShards.slice(0, 3).map((f) => `${f.key}（${f.errors.join('；')}）`).join(' | '),
+        );
+      }
+      if (stats.shardWarnings.length > 0) {
+        const detail = stats.shardWarnings
+          .slice(0, 3)
+          .map((s) => `${s.key}: ${s.warnings.slice(0, 2).join('；')}`)
+          .join(' | ');
+        warnings.push(`有 ${stats.shardWarnings.length} 个分片带数据告警（行数不符/缺前段/日期不一致等）⇒ 结果完整性打折：${detail}`);
       }
       if (stats.badLines > 0) warnings.push(`有 ${stats.badLines} 行无法解析（分片本身可疑，见 verify）`);
       if (totals.events === 0) warnings.push('窗口内没有任何事件 —— 先确认上传侧是否在产出、本机是否同步过（doctor --deep）');
       if (totals.heartbeatMaxGapMs !== null && totals.heartbeatMaxGapMs > HEARTBEAT_GAP_ALERT_MS) {
         warnings.push(
-          `ACCOUNT_OBSERVED 最大间隔 ${(totals.heartbeatMaxGapMs / 3_600_000).toFixed(1)}h（阈值 ${HEARTBEAT_GAP_ALERT_MS / 3_600_000}h）—— 疑似停摆/断流；` +
+          `ACCOUNT_OBSERVED 最大间隔 ${(totals.heartbeatMaxGapMs / 3_600_000).toFixed(1)}h（实例 ${totals.heartbeatWorstInstance ?? '-'}，阈值 ${HEARTBEAT_GAP_ALERT_MS / 3_600_000}h）—— 疑似停摆/断流；` +
             '当前数据源不含 UDS_*/MARKET_STREAM_* 连接事件，无法区分"断流"与"进程停机"',
         );
       }
       if (totals.heartbeatCount === 0 && totals.events > 0) {
         warnings.push('窗口内没有 ACCOUNT_OBSERVED —— 无法用心跳判断停摆（上传侧白名单里是否包含它？）');
+      }
+      if (totals.heartbeats.size > 1) {
+        warnings.push(`窗口里有 ${totals.heartbeats.size} 个实例在发心跳，心跳间隔与估值按实例分别统计（别把多实例混着看）`);
       }
 
       const sections: Section[] = [
@@ -125,6 +172,23 @@ export function healthAnalysis(): Analysis {
         headers: ['事件', '次数'],
         rows: [...totals.eventCounts.entries()].sort(byCountThenName).slice(0, 15).map(([name, n]) => [name, String(n)]),
       });
+
+      if (totals.heartbeats.size > 0) {
+        sections.push({
+          heading: '心跳（按实例）',
+          headers: ['实例', '次数', '最大间隔', '最近观测', '最近估值'],
+          rows: [...totals.heartbeats.values()]
+            .sort((a, b) => b.lastMs - a.lastMs)
+            .map((hb) => [
+              hb.instance,
+              String(hb.count),
+              hb.maxGapMs === null ? '-' : `${(hb.maxGapMs / 60_000).toFixed(0)}min`,
+              formatShanghai(hb.lastMs),
+              hb.lastTotalValue === null ? '-' : `${hb.lastTotalValue.toFixed(2)}${hb.lastExchange ? ` @${hb.lastExchange}` : ''}`,
+            ]),
+          note: '心跳 = ACCOUNT_OBSERVED（上传侧每小时一次）。间隔按实例分开算：多实例混成一条游标会既漏报又错值。',
+        });
+      }
 
       const symbolRows = [...totals.symbolCounts.entries()].sort(byCountThenName).map(([sym, n]) => [sym, String(n)]);
       if (symbolRows.length > 0) sections.push({ heading: '按 symbol', headers: ['symbol', '事件数'], rows: symbolRows });

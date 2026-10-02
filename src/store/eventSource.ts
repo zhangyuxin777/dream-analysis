@@ -66,7 +66,15 @@ export class LocalEventSource implements EventSourceLike {
     const wanted = new Set(filter.window.days);
     const target = inScope.filter((s) => wanted.has(s.date));
 
-    const stats: ScanStats = { shards: 0, events: 0, badLines: 0, missingDays: [], provisional: false };
+    const stats: ScanStats = {
+      shards: 0,
+      events: 0,
+      badLines: 0,
+      missingDays: [],
+      provisional: false,
+      failedShards: [],
+      shardWarnings: [],
+    };
     const coveredDays = new Set<string>();
 
     // 按 (date, instance) 顺序扫，保证事件在分析器里是时间有序的
@@ -81,10 +89,21 @@ export class LocalEventSource implements EventSourceLike {
           onEvent({ ...record, instance: shard.instance, date: shard.date, lineNo });
         },
       });
+
+      if (!result.ok) {
+        // 读不出来的分片：不记入 coveredDays（该天要么进 missingDays，要么由这条失败记录解释）
+        stats.failedShards.push({ key: shard.key, errors: result.errors });
+        continue;
+      }
+
       stats.shards++;
       stats.badLines += result.badLines;
       coveredDays.add(shard.date);
       if (!shard.final) stats.provisional = true;
+
+      // 分片级告警：同步时校验出来的（行数不符/缺前段/日期不一致）+ 本次读取发现的
+      const warnings = [...(shard.warnings ?? []), ...result.warnings];
+      if (warnings.length > 0) stats.shardWarnings.push({ key: shard.key, warnings });
     }
 
     // 窗口内"应该有但没有"的本地日：按窗口逐日比对（多实例时只要有一个实例有数据就算覆盖到了那一天）
