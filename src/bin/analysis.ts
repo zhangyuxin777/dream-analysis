@@ -31,7 +31,7 @@ import { loadState, listLocalShards } from '../sync/state';
 import { readShard } from '../ndjson/shard';
 import { parseShardKey } from '../ndjson/types';
 import { createAnalysisRegistry } from '../analysis';
-import { parseAnalysisArgs } from '../analysis/args';
+import { parseAnalyzeCommand } from '../analysis/args';
 import { AnalysisRunError, runAnalysis } from '../analysis/runner';
 import { WindowParseError, WindowTooLongError } from '../common/time';
 import { buildStatusText } from '../report/status';
@@ -398,13 +398,14 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     case 'analyses':
       return cmdAnalyses();
     case 'analyze': {
-      const { name, params } = parseAnalysisArgs(argv.slice(1));
-      if (!name) {
+      // tokens[0] = 分析器名；位置参数顺序按该分析器自己声明的 params 决定
+      const parsed = parseAnalyzeCommand(argv.slice(1), (n) => createAnalysisRegistry().get(n));
+      if (!parsed.name) {
         console.error('用法: analyze <名字> [symbol] [window] [key=value ...]');
         console.error(createAnalysisRegistry().helpText());
         return 1;
       }
-      return cmdAnalyze(config, logger, name, params);
+      return cmdAnalyze(config, logger, parsed.name, parsed.params);
     }
     default:
       console.error(`未知命令: ${command}`);

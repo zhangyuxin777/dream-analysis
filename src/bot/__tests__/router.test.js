@@ -13,7 +13,7 @@ const { AnalysisRegistry } = require('../../../dist/analysis/types');
 const { createDefaultRegistry } = require('../../../dist/analysis/types');
 const { parseConfig } = require('../../../dist/config/index');
 const { createLogger } = require('../../../dist/common/logger');
-const { emptyState, saveState } = require('../../../dist/sync/state');
+const { emptyState, saveState, loadState } = require('../../../dist/sync/state');
 const { statePathOf } = require('../../../dist/sync/puller');
 const { healthAnalysis } = require('../../../dist/analysis/health');
 const { roundsAnalysis } = require('../../../dist/analysis/rounds');
@@ -45,14 +45,14 @@ function makeEnv(botOver = {}, reportOver = {}) {
   return { rootDir, config, logger };
 }
 
-/** 装一天真分片（含水位线），让分析器有数据可算 */
-function installShard(config, instance, date, events, headerOver = {}) {
+/** 装一天真分片（含水位线）；append=true 时追加为第二个实例 */
+function installShard(config, instance, date, events, headerOver = {}, opts = {}) {
   const dir = path.join(config.runtime.dataDir, instance);
   fs.mkdirSync(dir, { recursive: true });
   const header = JSON.stringify({ type: 'meta', schema: 2, instance, date, final: headerOver.final ?? true, count: events.length });
   const body = [header, ...events.map((e) => JSON.stringify(e))].join('\n') + '\n';
   fs.writeFileSync(path.join(dir, `${date}.jsonl.gz`), zlib.gzipSync(Buffer.from(body, 'utf8')));
-  const state = emptyState();
+  const state = opts.append ? loadState(statePathOf(config)).state : emptyState();
   state.objects[`${config.oss.prefix}${instance}/${date}.jsonl.gz`] = {
     etag: 'E1', size: 100, dataLines: events.length, final: headerOver.final ?? true, pulledAt: new Date().toISOString(), warnings: [],
   };
@@ -274,7 +274,53 @@ test('formatAnalysisError：错误 → 群里能看懂的一句话', () => {
   assert.match(formatAnalysisError(new Error('boom'), 'rounds', registry), /分析 rounds 失败：boom/);
 });
 
-test('buildHelpText：由注册表生成，不手写两份', () => {
+test('★回归钉子（M3 Critical）：快捷指令不吃掉第一个参数 —— r eth … 的币种过滤必须生效', async () => {
+  const env = makeEnv();
+  installShard(env.config, 'boye888', '2026-10-01', [
+    { ts: '2026-10-01T01:00:00.000Z', event: 'SELL_FILLED', symbol: 'ETHFDUSD', localDate: '2026-10-01', seq: 1, data: { profit: 1 } },
+    { ts: '2026-10-01T02:00:00.000Z', event: 'SELL_FILLED', symbol: 'BTCFDUSD', localDate: '2026-10-01', seq: 2, data: { profit: 2 } },
+  ]);
+  const out = await makeRouter(env).handle(msg('r eth 2026-10-01'));
+  assert.match(out, /ETHFDUSD/);
+  assert.ok(!out.includes('BTCFDUSD'), '币种过滤失效会把别的币种一起算进来：' + out);
+  assert.match(out, /止盈利润合计 1\.00/, '只算 ETH 那 1.00');
+});
+
+test('★回归钉子：hc 的第一个裸参数是 instance（health 不声明 symbol）', async () => {
+  const env = makeEnv();
+  installShard(env.config, 'a1', '2026-10-01', [{ ts: '2026-10-01T01:00:00.000Z', event: 'SELL_FILLED', symbol: 'ETHFDUSD', localDate: '2026-10-01', seq: 1, data: {} }]);
+  installShard(env.config, 'a2', '2026-10-01', [{ ts: '2026-10-01T02:00:00.000Z', event: 'SELL_FILLED', symbol: 'ETHFDUSD', localDate: '2026-10-01', seq: 1, data: {} }], {}, { append: true });
+
+  const all = await makeRouter(env).handle(msg('hc 2026-10-01'));
+  assert.match(all, /\| 分片 \/ 事件 \| 2 \/ 2 \|/);
+
+  const one = await makeRouter(env).handle(msg('hc a1 2026-10-01'));
+  assert.match(one, /\| 分片 \/ 事件 \| 1 \/ 1 \|/, '实例过滤失效会把别的实例也算进来：' + one);
+});
+
+test('进程级并发上限：不同会话也不能同时跑分析（这台机器还要让着实盘）', async () => {
+  let release;
+  const gate = new Promise((r) => {
+    release = r;
+  });
+  const registry = createDefaultRegistry([
+    { name: 'slow', aliases: [], help: '慢分析', run: async () => { await gate; return { title: 'slow', summary: 'done', warnings: [] }; } },
+  ]);
+  const env = makeEnv({ allowedConversationIds: [] }); // 放开群白名单：本用例测的是并发闸门，不是鉴权
+  installShard(env.config, 'boye888', '2026-10-01', ROUND_EVENTS);
+  const router = makeRouter(env, { registry, syncReplyBudgetMs: 0, maxConcurrentAnalyses: 1 });
+
+  const first = router.handle(msg('analyze slow', { conversationId: 'cid-1' }));
+  const second = await router.handle(msg('analyze slow', { conversationId: 'cid-2' }));
+  assert.match(second, /并发上限 1/);
+
+  release();
+  assert.match(await first, /## slow/);
+  release = () => undefined;
+  assert.match(await router.handle(msg('analyze slow', { conversationId: 'cid-2' })), /## slow/, '释放后要能继续服务');
+});
+
+test('cmdAnalyses/机器人共用的 help：由注册表生成，不手写两份', async () => {
   const text = buildHelpText(createDefaultRegistry([healthAnalysis(), roundsAnalysis()]));
   assert.match(text, /hc \/ health/);
   assert.match(text, /r \/ rounds/);

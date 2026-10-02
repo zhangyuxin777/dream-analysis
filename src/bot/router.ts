@@ -20,7 +20,7 @@ import { ILogger } from '../common/logger';
 import { formatBytes } from '../common/format';
 import { AnalysisRegistry } from '../analysis/types';
 import { createAnalysisRegistry } from '../analysis/index';
-import { parseAnalysisArgs } from '../analysis/args';
+import { parseAnalysisParams, parseAnalyzeCommand, positionalNamesOf } from '../analysis/args';
 import { AnalysisRunError, RunAnalysisOutput, runAnalysis } from '../analysis/runner';
 import { WindowParseError, WindowTooLongError } from '../common/time';
 import { buildStatusText } from '../report/status';
@@ -31,6 +31,12 @@ import { IncomingMessage } from './types';
 import { DingTalkIncomingMessage } from './dingtalk-bot';
 
 export const DEFAULT_SYNC_REPLY_BUDGET_MS = 4000;
+/**
+ * 进程级并发上限（默认 1）。**为什么必须有**：这台机器（dream-002）还跑着实盘，
+ * 而"按会话"的闸门挡不住多群并发 —— 两个群各来一条就能同时扫两份整天分片。
+ * 分析都在同一条 JS 线程上，并发不会更快，只会让所有人都等，还会抢实盘的 CPU。
+ */
+export const DEFAULT_MAX_CONCURRENT_ANALYSES = 1;
 /** 落盘用的"无上限"预算（约 1MB 文本；报告不可能到这个量级） */
 const FULL_REPORT_MAX_CHARS = 1_000_000;
 
@@ -42,6 +48,8 @@ export interface RouterDeps {
   reply?: (webhook: string, text: string) => Promise<void>;
   /** 分析完成要多快才走"一条回复"；超时则先回"正在分析"再补结果（0 = 永远等） */
   syncReplyBudgetMs?: number;
+  /** 进程级并发上限（默认 1：这台机器还跑着实盘） */
+  maxConcurrentAnalyses?: number;
   /** 注入同步实现（测试用；默认真跑 OSS + 本地） */
   runSyncFn?: (opts: { force: boolean }) => Promise<PullResult>;
   now?: () => Date;
@@ -72,6 +80,7 @@ export function buildHelpText(registry: AnalysisRegistry): string {
 export class CommandRouter {
   private registry: AnalysisRegistry;
   private inflight = new Set<string>();
+  private running = 0;
   private now: () => Date;
 
   constructor(private readonly deps: RouterDeps) {
@@ -115,16 +124,18 @@ export class CommandRouter {
         return this.handleSync(msg, rest);
       case 'a':
       case 'analyze': {
-        const parsed = parseAnalysisArgs(rest); // rest[0] = 分析器名
+        const parsed = parseAnalyzeCommand(rest, (n) => this.registry.get(n));
         if (!parsed.name) return `用法: analyze <名字> …\n\n${this.registry.helpText()}`;
         return this.runNamed(parsed.name, parsed.params, msg);
       }
       case 'hc':
       case 'health':
-        return this.runNamed('health', parseAnalysisArgs(rest).params, msg);
+        // ⚠️ 快捷指令用 parseAnalysisParams（不消耗"名字"位）：否则第一个参数被当成分析器名吃掉，
+        //    实例/币种过滤静默失效（M3 review 的 Critical）
+        return this.runNamed('health', parseAnalysisParams(rest, positionalNamesOf(this.registry.get('health'))), msg);
       case 'r':
       case 'rounds':
-        return this.runNamed('rounds', parseAnalysisArgs(rest).params, msg);
+        return this.runNamed('rounds', parseAnalysisParams(rest, positionalNamesOf(this.registry.get('rounds'))), msg);
       default:
         if (command === '') return buildHelpText(this.registry);
         return `未知指令: ${command}（发 h 看指令列表）`;
@@ -151,12 +162,22 @@ export class CommandRouter {
   private async runNamed(name: string, params: Record<string, string>, msg: IncomingMessage): Promise<string> {
     const key = msg.conversationId || msg.senderId;
     if (this.inflight.has(key)) return '上一个任务还在跑，稍后再试';
+
+    const maxConcurrent = this.deps.maxConcurrentAnalyses ?? DEFAULT_MAX_CONCURRENT_ANALYSES;
+    if (this.running >= maxConcurrent) {
+      return `当前有 ${this.running} 个分析在跑（并发上限 ${maxConcurrent}，这台机器还要让着实盘），稍后再试`;
+    }
     this.inflight.add(key);
+    this.running++;
 
     const webhook = (msg as DingTalkIncomingMessage).sessionWebhook ?? '';
     const budget = this.deps.syncReplyBudgetMs ?? DEFAULT_SYNC_REPLY_BUDGET_MS;
     const canFollowUp = budget > 0 && webhook !== '' && typeof this.deps.reply === 'function';
-    let keepInflight = false;
+    let keepGate = false;
+    const release = (): void => {
+      this.inflight.delete(key);
+      this.running = Math.max(0, this.running - 1);
+    };
 
     const work = runAnalysis({
       config: this.deps.config,
@@ -173,17 +194,17 @@ export class CommandRouter {
           delay(budget).then(() => ({ kind: 'slow' as const })),
         ]);
         if (outcome.kind === 'slow') {
-          keepInflight = true;
+          keepGate = true;
           // 闸门在**分析结束那一刻**就释放（不等网络发送）：闸门是防 CPU 打满的，
           // 回复发送失败不该让这个会话卡住
           void work
             .then(async (out) => {
-              this.inflight.delete(key);
-              await this.sendFollowUp(webhook, out);
+              release();
+              await this.safeFollowUp(webhook, out);
             })
             .catch(async (err) => {
-              this.inflight.delete(key);
-              await this.sendFollowUp(webhook, null, err);
+              release();
+              await this.safeFollowUp(webhook, null, err);
             });
           return `⏳ 正在分析 ${name}（${params.window ?? '昨天'}）…结果稍后单独发`;
         }
@@ -193,7 +214,7 @@ export class CommandRouter {
     } catch (err) {
       return formatAnalysisError(err, name, this.registry);
     } finally {
-      if (!keepInflight) this.inflight.delete(key);
+      if (!keepGate) release();
     }
   }
 
@@ -208,9 +229,14 @@ export class CommandRouter {
     return text;
   }
 
-  private async sendFollowUp(webhook: string, out: RunAnalysisOutput | null, err?: unknown): Promise<void> {
-    const text = out ? this.format(out) : formatAnalysisError(err, '分析', this.registry);
-    await this.deps.reply!(webhook, text);
+  /** 二次回复：任何失败都自己吞掉并记日志（否则会漏出未捕获拒绝，而用户以为结果还在路上） */
+  private async safeFollowUp(webhook: string, out: RunAnalysisOutput | null, err?: unknown): Promise<void> {
+    try {
+      const text = out ? this.format(out) : formatAnalysisError(err, '分析', this.registry);
+      await this.deps.reply!(webhook, text);
+    } catch (e) {
+      this.deps.logger.error('[router] 二次回复失败（结果只在日志里）', { detail: errorText(e) });
+    }
   }
 
   private saveFullReport(out: RunAnalysisOutput): string | null {

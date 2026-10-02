@@ -315,6 +315,18 @@ report [instance] [窗口]      M3：概览（health + rounds 摘要）——**�
 - CLI 与机器人**共用**：状态文案（`report/status.ts`）、分析执行（`analysis/runner.ts`）、参数解析（`analysis/args.ts`）、
   store 构建（`oss/storeFactory.ts`）—— 两边各写一套必然出现"CLI 能跑、机器人报另一个错"这种最难查的漂移。
 
+### M3 review 之后的加固（2026-10-02）
+
+| 修的问题 | 做法 |
+|---|---|
+| **快捷指令吃掉第一个参数**（`r eth 昨天` 的 `eth` 被当成分析器名 ⇒ 币种过滤静默失效、报告全部币种混算） | 参数解析拆成两个入口：快捷指令用 `parseAnalysisParams`（不消耗"名字"位），`analyze` 才用 `parseAnalyzeCommand` |
+| **位置参数顺序一刀切**（`hc boye888` 落到 symbol 上 ⇒ 实例过滤静默失效） | 顺序**按分析器自己声明的 `params`**（health 首位 `instance`、rounds 首位 `symbol`），没声明才退回全局默认 |
+| 进程级没有并发上限（两个群就能各扫一份整天分片，还跟实盘抢 CPU） | 新增 `maxConcurrentAnalyses`（默认 **1**），超了直接回"并发上限 1，稍后再试" |
+| 二次回复失败会漏出**未捕获拒绝** | 二次回复走 `safeFollowUp`：任何失败都吞掉并记日志（结果至少留在日志里） |
+| `connect()` 从不 reject ⇒ 日志无条件"连接成功"，凭据错也静默 | 启动时**额外用 access_token 验凭据**（配置错最常见的形态），并把日志改成"已发起连接 + 凭据校验通过"；注释写明 SDK 把网关错误吞在内部 |
+| 回复只看 HTTP 状态码 ⇒ 钉钉 200+`errcode≠0` 被判成功 | `businessError()`：HTTP 200 但业务码非 0 也算失败（sessionWebhook 就是这种） |
+| `bot` 段只填白名单时整段被静默丢弃 | 只要 bot 段写了**任何**字段就必须给全 `appId`/`appSecret`，否则 **fail-fast 报错** |
+
 窗口语法（`common/time.ts` 统一解析）：`近1h / 近24h / 近7d / 今天 / 昨天 / 2026-10-01 / 2026-10-01~2026-10-03`。
 
 **异步应答（硬要求）**：飞书 3 秒不 ack 会重推同一条消息；分析可能跑数秒 → **先答"⏳ 正在分析…"，再异步回结果**。`router.dispatch(msg) → { immediate?: string; job?: Promise<string> }`；同一会话并发上限 1，超出回"上一个任务还在跑"。

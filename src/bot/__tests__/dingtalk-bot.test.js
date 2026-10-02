@@ -5,7 +5,7 @@
  */
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { DingTalkBot } = require('../../../dist/bot/dingtalk-bot');
+const { DingTalkBot, businessError } = require('../../../dist/bot/dingtalk-bot');
 const { createLogger } = require('../../../dist/common/logger');
 
 function capture() {
@@ -31,6 +31,17 @@ test('setHandler 可设置；handler 只在收到消息时才被调用（这里�
     return 'ok';
   });
   assert.equal(calls, 0);
+});
+
+test('businessError：HTTP 200 但业务码非 0 也算失败（sessionWebhook 就是这种，判成功会让结果永久丢失）', () => {
+  assert.equal(businessError({ errcode: 0, errmsg: 'ok' }), null);
+  assert.match(businessError({ errcode: 300001, errmsg: 'invalid webhook' }), /errcode=300001/);
+  assert.match(businessError({ errcode: '300001', errmsg: 'x' }), /errcode=300001/);
+  assert.equal(businessError({ accessToken: 'x', expireIn: 7200 }), null, 'token 响应没有 errcode，不能误判为失败');
+  assert.match(businessError({ code: 'Forbidden', message: 'denied' }), /code=Forbidden/);
+  assert.equal(businessError({ code: 0 }), null);
+  assert.equal(businessError(null), null);
+  assert.equal(businessError('text'), null);
 });
 
 test('replyText：网络失败只记 error、不抛（回复失败不能把进程带崩）', async () => {

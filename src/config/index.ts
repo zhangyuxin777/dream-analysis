@@ -172,7 +172,16 @@ export function parseConfig(raw: unknown, opts: { rootDir: string }): ParseResul
     const type = String(botRaw.type ?? 'dingtalk');
     const appId = typeof botRaw.appId === 'string' ? botRaw.appId : '';
     const appSecret = typeof botRaw.appSecret === 'string' ? botRaw.appSecret : '';
-    const anyFilled = appId !== '' || appSecret !== '' || type !== 'dingtalk';
+    // 只要 bot 段里写了**任何**东西就算"想配机器人" —— 只填白名单/notify 也要报错，
+    // 否则整段被静默丢弃（日志说"未配置 bot 段"，与 env.json 里明明写了 bot 相矛盾，排障时是死路）
+    const notifyRawCandidate = isObject(botRaw.notify) ? botRaw.notify : {};
+    const anyFilled = appId !== ''
+      || appSecret !== ''
+      || type !== 'dingtalk'
+      || (Array.isArray(botRaw.allowedStaffIds) && botRaw.allowedStaffIds.length > 0)
+      || (Array.isArray(botRaw.allowedConversationIds) && botRaw.allowedConversationIds.length > 0)
+      || (Array.isArray(botRaw.adminStaffIds) && botRaw.adminStaffIds.length > 0)
+      || str(notifyRawCandidate.warn, '') !== '';
     if (anyFilled) {
       if (type !== 'dingtalk' && type !== 'lark') problems.push('bot.type 只能是 "dingtalk" 或 "lark"');
       if (!appId) problems.push('bot.appId 必填（填了 appSecret 就必须填 appId）');

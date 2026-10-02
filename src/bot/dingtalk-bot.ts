@@ -55,7 +55,25 @@ export interface DingTalkExtras {
 
 export type DingTalkIncomingMessage = IncomingMessage & DingTalkExtras;
 
-/** POST JSON（原生 fetch + 超时）；非 2xx 抛错，空响应体返回 null */
+/**
+ * 钉钉的**业务层**失败：HTTP 200 + body 里 `errcode`/`code` ≠ 0（sessionWebhook 就是这种）。
+ * 只看 HTTP 状态码会把"回复失败"判成成功 —— 用户永远收不到结果，日志却干干净净。
+ */
+export function businessError(body: unknown): string | null {
+  if (typeof body !== 'object' || body === null) return null;
+  const b = body as Record<string, unknown>;
+  const errcode = b.errcode;
+  if ((typeof errcode === 'number' && errcode !== 0) || (typeof errcode === 'string' && errcode !== '' && errcode !== '0')) {
+    return `errcode=${String(errcode)} ${String(b.errmsg ?? '')}`.trim();
+  }
+  const code = b.code;
+  if ((typeof code === 'number' && code !== 0) || (typeof code === 'string' && code !== '' && code !== '0')) {
+    return `code=${String(code)} ${String(b.message ?? b.msg ?? '')}`.trim();
+  }
+  return null;
+}
+
+/** POST JSON（原生 fetch + 超时）；非 2xx 或业务 errcode ≠ 0 都抛错 */
 async function postJson(url: string, body: unknown, headers: Record<string, string> = {}): Promise<any> {
   const res = await fetch(url, {
     method: 'POST',
@@ -65,7 +83,10 @@ async function postJson(url: string, body: unknown, headers: Record<string, stri
   });
   if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
   const text = await res.text();
-  return text === '' ? null : JSON.parse(text);
+  const parsed: any = text === '' ? null : JSON.parse(text);
+  const err = businessError(parsed);
+  if (err) throw new Error(`钉钉业务失败: ${err}`);
+  return parsed;
 }
 
 export class DingTalkBot implements IChatBot {
@@ -104,6 +125,9 @@ export class DingTalkBot implements IChatBot {
       return;
     }
 
+    // ⚠️ 这个重试循环只能覆盖**同步抛错**（构造函数/connect 直接抛）。钉钉 SDK 把网关与 WebSocket
+    // 错误吞在内部（catch 后 scheduleReconnect() 再正常 return，从不 reject）⇒ connect() 一定 resolve，
+    // 所以下面那句"连接成功"**不能**当"连上了"的证据（M3 review 的 Warning）。
     for (let attempt = 1; attempt <= DingTalkBot.MAX_START_RETRIES; attempt++) {
       try {
         this.client = new DWClient({
@@ -124,7 +148,16 @@ export class DingTalkBot implements IChatBot {
         });
 
         await this.client.connect();
-        this.logger.info('[DingTalkBot] Stream 连接成功');
+        // 补一个**我们能真验证**的存活信号：凭据能不能换到 access_token。
+        // 配置错（appId/appSecret 写错）是最常见的故障，而且它在 SDK 那里是完全静默的。
+        try {
+          await this._ensureToken();
+          this.logger.info('[DingTalkBot] Stream 已发起连接 + 凭据校验通过（SDK 内部自动重连）');
+        } catch (err) {
+          this.logger.error('[DingTalkBot] 凭据校验失败：拿不到 access_token —— 机器人不会回消息，请检查 appId/appSecret', {
+            detail: err instanceof Error ? err.message : String(err),
+          });
+        }
         return;
       } catch (err) {
         this.logger.error(`[DingTalkBot] 启动失败(${attempt}/${DingTalkBot.MAX_START_RETRIES}): ${err instanceof Error ? err.message : String(err)}`);

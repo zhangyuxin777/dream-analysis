@@ -138,6 +138,17 @@ test('凭据：可以像上传侧那样直接写在 env.json，但必须成对',
   assert.equal(none.config.oss.accessKeyId, '', '不填凭据 = 走 ossutil 自己的配置文件');
 });
 
+test('bot：只填白名单也算"想配机器人"⇒ 报错（整段被静默丢弃是最难查的故障）', () => {
+  assert.throws(
+    () => parseConfig(base({ bot: { type: 'dingtalk', appId: '', appSecret: '', allowedStaffIds: ['u1'], adminStaffIds: [], notify: { warn: '' } } }), { rootDir: ROOT }),
+    /bot\.appId 必填/,
+  );
+  assert.throws(
+    () => parseConfig(base({ bot: { type: 'dingtalk', appId: '', appSecret: '', allowedStaffIds: [], adminStaffIds: [], notify: { warn: 'cid' } } }), { rootDir: ROOT }),
+    /bot\.appId 必填/,
+  );
+});
+
 test('bot.allowedStaffIds 里有非字符串 → 报错（不许静默丢弃）', () => {
   assert.throws(
     () => parseConfig(base({ bot: { type: 'dingtalk', appId: 'a', appSecret: 'b', allowedStaffIds: ['ok', 42], adminStaffIds: [] } }), { rootDir: ROOT }),
