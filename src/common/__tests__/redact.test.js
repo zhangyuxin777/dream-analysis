@@ -28,20 +28,28 @@ test('redactForLog：命中敏感键名一律替换（大小写/下划线/连字
   assert.equal(out.endpoint, 'oss-cn-hongkong.aliyuncs.com', '非敏感键必须原样保留');
 });
 
-test('redactForLog：**不能脱敏过度**（`skipped`/`tasks` 这类含 sk/ak 子串的正常字段要保留）', () => {
-  const out = redactForLog({ skipped: 3, tasks: 12, skew: 0.1, mask: 'x', risk: 1, keyField: 'v' });
+test('redactForLog：**不能脱敏过度**（`skipped`/`tasks`/`key` 这类正常字段要保留）', () => {
+  const out = redactForLog({ skipped: 3, tasks: 12, skew: 0.1, mask: 'x', risk: 1, keyField: 'v', key: 'snapshot/zyx666/2026-10-02.jsonl.gz' });
   assert.equal(out.skipped, 3, 'skipped 被打码 = 把正常数据藏起来（实测踩过）');
   assert.equal(out.tasks, 12);
   assert.equal(out.skew, 0.1);
   assert.equal(out.mask, 'x');
   assert.equal(out.risk, 1);
   assert.equal(out.keyField, 'v');
+  assert.equal(out.key, 'snapshot/zyx666/2026-10-02.jsonl.gz', '对象键是排障最需要的信息，绝不能打码');
 
   // 但短缩写作为独立段出现时仍必须打码
   const secret = redactForLog({ sk: 'abc', ak: 'def', 'x-oss-sign': 'sig' });
   assert.equal(secret.sk, REDACTED);
   assert.equal(secret.ak, REDACTED);
   assert.equal(secret['x-oss-sign'], REDACTED);
+
+  // 真正的密钥字段名仍要覆盖
+  const keys = redactForLog({ apiKey: 'a', api_key: 'b', secretKey: 'c', accessKeyId: 'd' });
+  assert.equal(keys.apiKey, REDACTED);
+  assert.equal(keys.api_key, REDACTED);
+  assert.equal(keys.secretKey, REDACTED);
+  assert.equal(keys.accessKeyId, REDACTED);
 });
 
 test('redactForLog：空值保持原样（便于区分"没配"与"配了但被打码"）', () => {

@@ -14,8 +14,14 @@
  * 为什么必须分段：早期实现把 `sk` 当子串，结果 `skipped`/`tasks`/`skew` 全被打成 `***REDACTED***`
  * —— 脱敏过度会把正常数据藏起来（2026-10-02 在 sync 日志里实测踩到：`"skipped":"***REDACTED***"`）。
  */
-const LONG_SENSITIVE_RE = /(secret|token|password|passwd|credential|signature|privatekey|private_key|accesskey|access_key)/i;
-const SHORT_SENSITIVE_SEGMENTS = new Set(['ak', 'sk', 'pwd', 'key', 'secret', 'token', 'sign', 'sig']);
+const LONG_SENSITIVE_RE = /(secret|token|password|passwd|credential|signature|privatekey|private_key|accesskey|access_key|apikey|api_key|secretkey|secret_key)/i;
+/**
+ * 短缩写只能**整段**比。
+ * ⚠️ 别把 `key` 放进来：日志里 `{ key: 'snapshot/zyx666/2026-10-02.jsonl.gz' }` 是极常见的上下文，
+ * 打码它等于把排障最需要的信息藏起来（实测踩到：日志里出现 `"key":"***REDACTED***"`）。
+ * 真正的密钥字段名（accessKeyId/apiKey/secretKey…）由上面的长词子串规则覆盖。
+ */
+const SHORT_SENSITIVE_SEGMENTS = new Set(['ak', 'sk', 'pwd', 'secret', 'token', 'sign', 'sig']);
 
 function isSensitiveKey(key: string): boolean {
   if (LONG_SENSITIVE_RE.test(key)) return true;
