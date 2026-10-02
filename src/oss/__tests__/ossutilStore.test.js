@@ -8,7 +8,7 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { parseLsOutput, parseOssTime, OssutilStore } = require('../../../dist/oss/ossutilStore');
+const { parseLsOutput, parseOssTime, OssutilStore, materializeOssutilCredentials } = require('../../../dist/oss/ossutilStore');
 const { ObjectStoreError } = require('../../../dist/oss/store');
 
 /** 真机输出原样（含表头 / 对象行 / 结尾统计行） */
@@ -84,6 +84,8 @@ test('list() 失败：抛 ObjectStoreError，且 stderr 里的疑似凭据被脱
   assert.equal(err.kind, 'list');
   assert.ok(!err.detail.includes('LTAI5tREALLOOKINGSECRET'), 'stderr 里的 AK 必须被脱敏：' + err.detail);
   assert.match(err.detail, /LTAI\*\*\*REDACTED\*\*\*/);
+  // 详情必须进 message：否则 CLI 只看到"退出码 1"，真实原因被自己的错误处理吞掉
+  assert.match(err.message, /AccessDenied|LTAI/, '真实 stderr 必须出现在 message 里：' + err.message);
 });
 
 test('list() 输出无法解析的行 → 抛错（ossutil 版本变了要立刻发现）', async () => {
@@ -123,6 +125,53 @@ test('getTo()：下载成功后再确认文件存在；文件没落地视为失�
     exec: async () => ({ stdout: 'Succeed: OK num:1', stderr: '', code: 0 }),
   });
   await assert.rejects(() => liarStore.getTo('snapshot/a/2026-10-02.jsonl.gz', path.join(dir, 'missing.jsonl.gz')), /目标文件不存在/);
+});
+
+test('materializeOssutilCredentials：凭据落成配置文件（内容一致时不重写）', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ossutil-cred-'));
+  const file = path.join(dir, 'nested', 'ossutil-credentials');
+  const ret = materializeOssutilCredentials({ filePath: file, endpoint: 'oss-cn-hongkong.aliyuncs.com', accessKeyId: 'AK-FAKE', accessKeySecret: 'SK-FAKE' });
+  assert.equal(ret, file);
+  const content = fs.readFileSync(file, 'utf8');
+  assert.match(content, /^\[Credentials\]/, '段头不能省：ossutil v1.7 靠它定位凭据段（实测缺了会报 Unable to find Credentials）');
+  assert.match(content, /accessKeyID=AK-FAKE/);
+  assert.match(content, /accessKeySecret=SK-FAKE/);
+  assert.match(content, /endpoint=oss-cn-hongkong\.aliyuncs\.com/);
+
+  // 内容一致 ⇒ 不重写（拿 mtime 判：避免每次启动都动磁盘）
+  const before = fs.statSync(file).mtimeMs;
+  materializeOssutilCredentials({ filePath: file, endpoint: 'oss-cn-hongkong.aliyuncs.com', accessKeyId: 'AK-FAKE', accessKeySecret: 'SK-FAKE' });
+  assert.equal(fs.statSync(file).mtimeMs, before);
+
+  // 内容变了 ⇒ 重写
+  materializeOssutilCredentials({ filePath: file, endpoint: 'oss-cn-hongkong.aliyuncs.com', accessKeyId: 'AK-NEW', accessKeySecret: 'SK-NEW' });
+  assert.match(fs.readFileSync(file, 'utf8'), /accessKeyID=AK-NEW/);
+});
+
+test('凭据**绝不进命令行**（`ps` 能看到 argv，等于广播 AK）', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ossutil-args-'));
+  const credFile = materializeOssutilCredentials({
+    filePath: path.join(dir, 'ossutil-credentials'),
+    endpoint: 'oss-cn-hongkong.aliyuncs.com',
+    accessKeyId: 'AK-MUST-NOT-APPEAR',
+    accessKeySecret: 'SK-MUST-NOT-APPEAR',
+  });
+  const calls = [];
+  const store = new OssutilStore({
+    binary: 'ossutil',
+    endpoint: 'oss-cn-hongkong.aliyuncs.com',
+    bucket: 'dream-ana',
+    configFile: credFile,
+    exec: async (file, args) => {
+      calls.push(args);
+      return { stdout: REAL_LS_OUTPUT, stderr: '', code: 0 };
+    },
+  });
+  await store.list('snapshot/');
+  const flat = calls.flat().join(' ');
+  assert.ok(flat.includes('-c') && flat.includes(credFile), '必须用 -c 指配置文件');
+  assert.ok(!flat.includes('AK-MUST-NOT-APPEAR'), 'AK 出现在 argv 里了：' + flat);
+  assert.ok(!flat.includes('SK-MUST-NOT-APPEAR'), 'SK 出现在 argv 里了：' + flat);
 });
 
 test('version()：可用来做 doctor 的第一次连通检查', async () => {

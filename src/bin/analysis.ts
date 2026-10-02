@@ -18,7 +18,7 @@ import * as path from 'path';
 import { AppConfig, ConfigError, loadConfig } from '../config';
 import { createLogger, ILogger } from '../common/logger';
 import { formatBytes, formatCount, formatDurationMs } from '../common/format';
-import { OssutilStore } from '../oss/ossutilStore';
+import { OssutilStore, materializeOssutilCredentials } from '../oss/ossutilStore';
 import { ObjectStore } from '../oss/store';
 import { runSync, lockPathOf, statePathOf } from '../sync/puller';
 import { isProcessAlive, readLock } from '../sync/lock';
@@ -38,11 +38,22 @@ export interface CommandContext {
 }
 
 export function buildStore(config: AppConfig): ObjectStore {
+  const { accessKeyId, accessKeySecret } = config.oss;
+  // env.json 直接给了凭据 ⇒ 落成 0600 的 ossutil 配置文件（绝不进命令行，防 ps 泄漏）；
+  // 没给 ⇒ 用 configFile 或 ossutil 默认的 ~/.ossutilconfig
+  const configFile = accessKeyId && accessKeySecret
+    ? materializeOssutilCredentials({
+        filePath: path.join(config.runtime.stateDir, 'ossutil-credentials'),
+        endpoint: config.oss.endpoint,
+        accessKeyId,
+        accessKeySecret,
+      })
+    : config.oss.configFile || undefined;
   return new OssutilStore({
     binary: config.oss.binary,
     endpoint: config.oss.endpoint,
     bucket: config.oss.bucket,
-    configFile: config.oss.configFile || undefined,
+    configFile,
   });
 }
 

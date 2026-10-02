@@ -28,6 +28,22 @@ test('redactForLog：命中敏感键名一律替换（大小写/下划线/连字
   assert.equal(out.endpoint, 'oss-cn-hongkong.aliyuncs.com', '非敏感键必须原样保留');
 });
 
+test('redactForLog：**不能脱敏过度**（`skipped`/`tasks` 这类含 sk/ak 子串的正常字段要保留）', () => {
+  const out = redactForLog({ skipped: 3, tasks: 12, skew: 0.1, mask: 'x', risk: 1, keyField: 'v' });
+  assert.equal(out.skipped, 3, 'skipped 被打码 = 把正常数据藏起来（实测踩过）');
+  assert.equal(out.tasks, 12);
+  assert.equal(out.skew, 0.1);
+  assert.equal(out.mask, 'x');
+  assert.equal(out.risk, 1);
+  assert.equal(out.keyField, 'v');
+
+  // 但短缩写作为独立段出现时仍必须打码
+  const secret = redactForLog({ sk: 'abc', ak: 'def', 'x-oss-sign': 'sig' });
+  assert.equal(secret.sk, REDACTED);
+  assert.equal(secret.ak, REDACTED);
+  assert.equal(secret['x-oss-sign'], REDACTED);
+});
+
 test('redactForLog：空值保持原样（便于区分"没配"与"配了但被打码"）', () => {
   const out = redactForLog({ accessKeyId: '', accessKeySecret: null });
   assert.equal(out.accessKeyId, '', '空串不该变成 REDACTED');

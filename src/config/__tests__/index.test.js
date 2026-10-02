@@ -41,7 +41,7 @@ test('最小合法配置：缺省值都落在安全处，且目录解析成绝�
 test('缺必填字段时一次报出全部问题', () => {
   let err;
   try {
-    parseConfig({ name: '', oss: { bucket: 'X', prefix: 'snapshot' }, sync: { intervalMinutes: 0 } }, { rootDir: ROOT });
+    parseConfig({ name: '', oss: { bucket: 'X', prefix: 'bad prefix' }, sync: { intervalMinutes: 0 } }, { rootDir: ROOT });
   } catch (e) {
     err = e;
   }
@@ -67,9 +67,9 @@ test('错误信息里绝不回显值（把"值"塞进密钥字段也不会泄漏
   assert.ok(!err.message.includes('LTAI_SUPER_SECRET_AK'), '错误信息里出现了疑似凭据的值：' + err.message);
 });
 
-test('prefix 必须以 / 结尾；bucket 名走 OSS 规则', () => {
-  assert.throws(() => parseConfig(base({ oss: { ...base().oss, prefix: 'snapshot' } }), { rootDir: ROOT }), /prefix/);
+test('bucket 名走 OSS 规则（大写/下划线一律拒绝）', () => {
   assert.throws(() => parseConfig(base({ oss: { ...base().oss, bucket: 'Dream-Ana' } }), { rootDir: ROOT }), /bucket/);
+  assert.throws(() => parseConfig(base({ oss: { ...base().oss, bucket: 'dream_ana' } }), { rootDir: ROOT }), /bucket/);
 });
 
 test('内网 endpoint 只告警不拦（同区机器合法用法）', () => {
@@ -97,6 +97,36 @@ test('bot：全空 = 不配置；填一半 = 报错；填全 = 生效且空白�
   assert.equal(filled.config.bot.type, 'dingtalk');
   assert.equal(filled.config.bot.adminStaffIds[0], 'u1');
   assert.ok(filled.warnings.some((w) => w.includes('群内')));
+});
+
+test('prefix：写 snapshot 或 snapshot/ 都接受（自动补斜杠并留 warning）', () => {
+  const noSlash = parseConfig(base({ oss: { ...base().oss, prefix: 'snapshot' } }), { rootDir: ROOT });
+  assert.equal(noSlash.config.oss.prefix, 'snapshot/', '两个仓的配置写法必须互通');
+  assert.ok(noSlash.warnings.some((w) => w.includes('自动按目录前缀处理')));
+
+  const withSlash = parseConfig(base(), { rootDir: ROOT });
+  assert.equal(withSlash.config.oss.prefix, 'snapshot/');
+  assert.equal(withSlash.warnings.filter((w) => w.includes('自动按目录前缀')).length, 0, '写法正确时不该有噪音');
+
+  assert.throws(() => parseConfig(base({ oss: { ...base().oss, prefix: 'snap shot/' } }), { rootDir: ROOT }), /prefix/);
+});
+
+test('凭据：可以像上传侧那样直接写在 env.json，但必须成对', () => {
+  const both = parseConfig(base({ oss: { ...base().oss, accessKeyId: 'LTAI-fake-id', accessKeySecret: 'fake-secret' } }), { rootDir: ROOT });
+  assert.equal(both.config.oss.accessKeyId, 'LTAI-fake-id');
+  assert.equal(both.config.oss.accessKeySecret, 'fake-secret');
+
+  assert.throws(
+    () => parseConfig(base({ oss: { ...base().oss, accessKeyId: 'LTAI-fake-id' } }), { rootDir: ROOT }),
+    /必须同时提供/,
+  );
+  assert.throws(
+    () => parseConfig(base({ oss: { ...base().oss, accessKeySecret: 'fake-secret' } }), { rootDir: ROOT }),
+    /必须同时提供/,
+  );
+
+  const none = parseConfig(base(), { rootDir: ROOT });
+  assert.equal(none.config.oss.accessKeyId, '', '不填凭据 = 走 ossutil 自己的配置文件');
 });
 
 test('bot.allowedStaffIds 里有非字符串 → 报错（不许静默丢弃）', () => {

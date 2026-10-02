@@ -6,7 +6,24 @@
  * 而"这个字段叫 accessKeySecret"是确定的；两者都做会互相掩盖，只留确定的那个。
  */
 
-const SENSITIVE_KEY_RE = /(secret|token|password|passwd|pwd|accesskey|access_key|ak|sk|credential|signature|privatekey|private_key)/i;
+/**
+ * 敏感键判定。两条规则合起来用，缺一个都会出问题：
+ * - **长词按子串**（`secret`/`token`/`credential`… 拼在 `appSecret`、`security_token` 里也认）
+ * - **短词按分段精确匹配**（`ak`/`sk`/`pwd` 这类两字母缩写只能整段比）
+ *
+ * 为什么必须分段：早期实现把 `sk` 当子串，结果 `skipped`/`tasks`/`skew` 全被打成 `***REDACTED***`
+ * —— 脱敏过度会把正常数据藏起来（2026-10-02 在 sync 日志里实测踩到：`"skipped":"***REDACTED***"`）。
+ */
+const LONG_SENSITIVE_RE = /(secret|token|password|passwd|credential|signature|privatekey|private_key|accesskey|access_key)/i;
+const SHORT_SENSITIVE_SEGMENTS = new Set(['ak', 'sk', 'pwd', 'key', 'secret', 'token', 'sign', 'sig']);
+
+function isSensitiveKey(key: string): boolean {
+  if (LONG_SENSITIVE_RE.test(key)) return true;
+  return key
+    .split(/[^A-Za-z0-9]+/)
+    .filter((seg) => seg !== '')
+    .some((seg) => SHORT_SENSITIVE_SEGMENTS.has(seg.toLowerCase()));
+}
 
 /** 命中敏感键名时替换成的占位符（保留长度信息，便于排查"配了没配"） */
 export const REDACTED = '***REDACTED***';
@@ -26,7 +43,7 @@ export function redactForLog(value: unknown, depth = 0): unknown {
 
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(value)) {
-    if (SENSITIVE_KEY_RE.test(k)) {
+    if (isSensitiveKey(k)) {
       out[k] = v === '' || v === null || v === undefined ? v : REDACTED;
     } else {
       out[k] = redactForLog(v, depth + 1);

@@ -15,8 +15,14 @@ export interface OssConfig {
   endpoint: string;
   bucket: string;
   prefix: string;
-  /** 空串 = 用 ossutil 默认配置（`~/.ossutilconfig`） */
+  /** ossutil 配置文件路径（空 = 用默认 `~/.ossutilconfig`）；只在没直接给凭据时生效 */
   configFile: string;
+  /**
+   * 可选凭据：与上传侧 `env.json` 同形状，方便"一个文件填完"。
+   * **绝不进命令行**（`ps` 能看到 argv）—— 使用时会被落成 0600 的 ossutil 配置文件再 `-c` 传进去。
+   */
+  accessKeyId: string;
+  accessKeySecret: string;
 }
 
 export interface SyncConfig {
@@ -101,11 +107,22 @@ export function parseConfig(raw: unknown, opts: { rootDir: string }): ParseResul
   const bucket = typeof ossRaw.bucket === 'string' ? ossRaw.bucket : '';
   if (!BUCKET_RE.test(bucket)) problems.push('oss.bucket 必须是合法的 OSS 桶名（小写字母/数字/连字符，3~63 位）');
 
-  const prefix = typeof ossRaw.prefix === 'string' ? ossRaw.prefix : '';
-  if (!PREFIX_RE.test(prefix)) problems.push('oss.prefix 必须以 "/" 结尾且只含安全字符（如 "snapshot/"）');
-  if (prefix && !prefix.endsWith('/')) problems.push('oss.prefix 必须以 "/" 结尾');
+  // prefix：目录前缀。两个仓的写法都接受（`snapshot` 与 `snapshot/` 等价），自动补斜杠并留一条 warning
+  let prefix = typeof ossRaw.prefix === 'string' ? ossRaw.prefix.trim() : '';
+  if (prefix !== '' && !prefix.endsWith('/')) {
+    prefix = `${prefix}/`;
+    warnings.push(`oss.prefix 未以 "/" 结尾，已自动按目录前缀处理为 "${prefix}"`);
+  }
+  if (!PREFIX_RE.test(prefix)) problems.push('oss.prefix 必须是目录前缀（如 "snapshot/"），且只含安全字符');
 
   const configFile = typeof ossRaw.configFile === 'string' ? ossRaw.configFile : '';
+
+  // 凭据：允许直接写在 env.json（与上传侧同形状），但必须成对
+  const accessKeyId = typeof ossRaw.accessKeyId === 'string' ? ossRaw.accessKeyId.trim() : '';
+  const accessKeySecret = typeof ossRaw.accessKeySecret === 'string' ? ossRaw.accessKeySecret.trim() : '';
+  if ((accessKeyId === '') !== (accessKeySecret === '')) {
+    problems.push('oss.accessKeyId 与 oss.accessKeySecret 必须同时提供（只填一个无法认证）');
+  }
 
   // ---- sync ----
   const syncRaw = isObject(raw.sync) ? raw.sync : {};
@@ -171,7 +188,7 @@ export function parseConfig(raw: unknown, opts: { rootDir: string }): ParseResul
   return {
     config: {
       name,
-      oss: { provider: 'ossutil', binary, endpoint, bucket, prefix, configFile },
+      oss: { provider: 'ossutil', binary, endpoint, bucket, prefix, configFile, accessKeyId, accessKeySecret },
       sync,
       process: { nice },
       runtime: {

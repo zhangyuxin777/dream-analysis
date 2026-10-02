@@ -32,7 +32,9 @@ export class ObjectStoreError extends Error {
     public readonly kind: 'list' | 'download' | 'config',
     public readonly detail?: string,
   ) {
-    super(message);
+    // detail（已脱敏的 stderr）**必须进 message**：否则 CLI/sync 的报错只剩"退出码 1"，
+    // 真实原因（凭据缺失、配置段头写错、无权限…）被自己的错误处理吞掉 —— 2026-10-02 实测踩过。
+    super(detail ? `${message} —— ${detail}` : message);
     this.name = 'ObjectStoreError';
   }
 }

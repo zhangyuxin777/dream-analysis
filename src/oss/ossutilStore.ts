@@ -37,6 +37,40 @@ export interface OssutilStoreOptions {
 const DEFAULT_MAX_BUFFER = 32 * 1024 * 1024;
 
 /**
+ * 把 `env.json` 里的凭据落成 ossutil 能读的配置文件（0600），返回该文件路径。
+ *
+ * 为什么不直接 `-i/-k` 传：**命令行参数在 `ps` 里对同机其他用户可见**（Linux 上 `/proc/<pid>/cmdline` 默认可读），
+ * 等于把 AK 广播出去。落成一个只有本用户可读的文件、用 `-c` 指过去，就没有这个问题。
+ * 内容一致时不重写（避免每次启动都动磁盘/改 mtime）。
+ */
+export function materializeOssutilCredentials(opts: {
+  filePath: string;
+  endpoint: string;
+  accessKeyId: string;
+  accessKeySecret: string;
+}): string {
+  // ★ 段头 `[Credentials]` 不能省：ossutil v1.7 靠它定位凭据段，缺了就报
+  //   "Unable to find Credentials" 或 "accessKeyID and ecsUrl are both empty"（2026-10-02 实测踩过）
+  const content = `[Credentials]\nlanguage=EN\naccessKeyID=${opts.accessKeyId}\nendpoint=${opts.endpoint}\naccessKeySecret=${opts.accessKeySecret}\n`;
+  fs.mkdirSync(path.dirname(opts.filePath), { recursive: true });
+  let existing: string | null = null;
+  try {
+    existing = fs.readFileSync(opts.filePath, 'utf8');
+  } catch {
+    existing = null;
+  }
+  if (existing !== content) {
+    fs.writeFileSync(opts.filePath, content, { encoding: 'utf8', mode: 0o600 });
+    try {
+      fs.chmodSync(opts.filePath, 0o600); // Windows 上是空操作，Linux 上确保 0600
+    } catch {
+      // 权限设置失败不该阻止使用（文件仍在本用户目录下）
+    }
+  }
+  return opts.filePath;
+}
+
+/**
  * 解析 `ossutil ls` 的长格式输出。
  *
  * 真实样例（v1.7.19，2026-10-02 实测）：
