@@ -168,9 +168,17 @@ async function syncOnce(deps: PullDeps, opts: { force?: boolean }): Promise<Pull
 
       const whitelistVersion = stats.header?.whitelistVersion;
       if (whitelistVersion) {
-        const previous = newestWhitelistVersion(state, config.oss.prefix, parsed.instance, meta.key);
-        if (previous && previous !== whitelistVersion) {
-          const detail = `${parsed.instance}: ${previous} → ${whitelistVersion}（自 ${parsed.date}）`;
+        // 基准取两个，缺一个就会既报假变更又漏真变更（第二轮 review 的教训）：
+        //  ① 同一分片上一次记录的版本（重算/回填同一天时的真实变化）
+        //  ② **紧邻的前一天**的版本（跨天口径变更；不能拿"任意最新另一份"当基准 ——
+        //     回填一个旧日期时会与最新那天比较，凭空报出变更）
+        const sameKey = state.objects[meta.key]?.whitelistVersion;
+        const previousDay = precedingDayWhitelistVersion(state, config.oss.prefix, parsed.instance, parsed.date);
+        const baseline = sameKey && sameKey !== whitelistVersion ? { label: '同一分片', version: sameKey }
+          : previousDay && previousDay !== whitelistVersion ? { label: '前一天', version: previousDay }
+            : null;
+        if (baseline) {
+          const detail = `${parsed.instance} · ${parsed.date}（对比${baseline.label}）: ${baseline.version} → ${whitelistVersion}`;
           whitelistChanges.push(detail);
           logger.warn('数据口径（白名单版本）发生变化 —— 跨这次变更前后的统计不可直接比较', { detail });
         }
@@ -253,14 +261,16 @@ async function syncOnce(deps: PullDeps, opts: { force?: boolean }): Promise<Pull
   return result;
 }
 
-/** 同一实例下"最新的另一份分片"记录的口径版本（用于识别口径变更） */
-export function newestWhitelistVersion(state: SyncState, prefix: string, instance: string, excludeKey: string): string | undefined {
+/** 同一实例下、**日期严格早于 `date` 的最近一份**分片记录的口径版本（跨天口径变更的基准） */
+export function precedingDayWhitelistVersion(state: SyncState, prefix: string, instance: string, date: string): string | undefined {
   const scoped = `${prefix}${instance}/`;
-  const keys = Object.keys(state.objects)
-    .filter((k) => k.startsWith(scoped) && k !== excludeKey)
+  const dates = Object.keys(state.objects)
+    .filter((k) => k.startsWith(scoped))
+    .map((k) => k.slice(scoped.length).replace(/\.jsonl\.gz$/, ''))
+    .filter((d) => /^\d{4}-\d{2}-\d{2}$/.test(d) && d < date)
     .sort();
-  for (let i = keys.length - 1; i >= 0; i--) {
-    const version = state.objects[keys[i]].whitelistVersion;
+  for (let i = dates.length - 1; i >= 0; i--) {
+    const version = state.objects[`${scoped}${dates[i]}.jsonl.gz`]?.whitelistVersion;
     if (version) return version;
   }
   return undefined;

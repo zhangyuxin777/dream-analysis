@@ -39,7 +39,8 @@ export interface ShardKey {
   date: string;
 }
 
-const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+/** 契约里的日期格式（`YYYY-MM-DD`）；导出给分片校验复用，避免两处各写一份正则 */
+export const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
 /** 实例名/日期等只允许安全字符（防止键里混入奇怪字符导致路径穿越或匹配歧义） */
 const SAFE_SEGMENT_RE = /^[A-Za-z0-9._-]+$/;

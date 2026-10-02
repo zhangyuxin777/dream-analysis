@@ -11,7 +11,14 @@
 import * as fs from 'fs';
 import * as zlib from 'zlib';
 import { StringDecoder } from 'string_decoder';
-import { DayShardHeader, EventRecord, effectiveLocalDate, isEventRecord, isShardHeader } from './types';
+import { DATE_RE, DayShardHeader, EventRecord, isEventRecord, isShardHeader, localDateOf } from './types';
+
+/**
+ * "已封存分片的前段空白"告警阈值（4 小时）。
+ * **这是经验值，不是契约**：上传侧只导尾部 2MB，覆盖多少小时取决于事件密度；
+ * 4h 只能抓住"明显只导了后半天"的情形，抓不住"中段整段缺失"（要彻底解决得靠上传侧补 manifest/心跳基准）。
+ */
+export const EARLY_SEGMENT_THRESHOLD_MS = 4 * 3600_000;
 
 export interface ShardStats {
   filePath: string;
@@ -133,18 +140,26 @@ export function readShard(filePath: string, opts: ReadShardOptions = {}): Promis
       stats.lastTs = parsed.ts;
 
       if (stats.header) {
-        // 日期归属：拿**契约规定的分桶时区（Asia/Shanghai）**的本地日比 header.date，
-        // 不能拿 ts 的 UTC 日期前缀比（那会把上海 00:00–08:00 的合法事件全判成"日期不一致"）。
-        // 另给 ±2h 跨夜容差（边界上的事件允许落在相邻日）。
-        const localDate = effectiveLocalDate(parsed);
-        if (localDate !== null && localDate !== stats.header.date) {
-          const eventMs = Date.parse(parsed.ts);
-          const dayMs = Date.parse(`${stats.header.date}T00:00:00+08:00`);
-          const driftMs = eventMs - dayMs;
-          const withinTolerance = Number.isFinite(driftMs) && (driftMs < 0 ? driftMs >= -2 * 3600_000 : driftMs <= 26 * 3600_000);
-          if (!withinTolerance) {
-            dateMismatch.n++;
-            if (dateMismatch.sample === '') dateMismatch.sample = `${parsed.ts}（localDate=${localDate}）`;
+        // 日期归属有两层判据，缺一层就会变成"死判据"（第二轮 review 的教训）：
+        // (1) **行内自洽**：上传侧盖的 localDate 必须与 ts 按契约时区推算的结果一致
+        //     —— 只信 localDate 的话，上传侧把桶日期盖在每行上时这条校验永远不会触发；
+        // (2) **与分片日期比对**：优先用 localDate（对外的权威值），缺失才用 ts 推算，±2h 跨夜容差。
+        const tsDate = localDateOf(parsed.ts);
+        const declared = typeof parsed.localDate === 'string' && DATE_RE.test(parsed.localDate) ? parsed.localDate : null;
+        if (declared && tsDate && declared !== tsDate) {
+          dateMismatch.n++;
+          if (dateMismatch.sample === '') dateMismatch.sample = `ts=${parsed.ts}（推算 ${tsDate}）与 localDate=${declared} 不符`;
+        } else {
+          const effective = declared ?? tsDate;
+          if (effective !== null && effective !== stats.header.date) {
+            const eventMs = Date.parse(parsed.ts);
+            const dayMs = Date.parse(`${stats.header.date}T00:00:00+08:00`);
+            const driftMs = eventMs - dayMs;
+            const withinTolerance = Number.isFinite(driftMs) && (driftMs < 0 ? driftMs >= -2 * 3600_000 : driftMs <= 26 * 3600_000);
+            if (!withinTolerance) {
+              dateMismatch.n++;
+              if (dateMismatch.sample === '') dateMismatch.sample = `ts=${parsed.ts}（归属 ${effective}）`;
+            }
           }
         }
       }
@@ -177,9 +192,9 @@ export function readShard(filePath: string, opts: ReadShardOptions = {}): Promis
       if (header && header.final && stats.firstTs) {
         const dayMs = Date.parse(`${header.date}T00:00:00+08:00`);
         const firstMs = Date.parse(stats.firstTs);
-        if (Number.isFinite(dayMs) && Number.isFinite(firstMs) && firstMs - dayMs > 4 * 3600_000) {
+        if (Number.isFinite(dayMs) && Number.isFinite(firstMs) && firstMs - dayMs > EARLY_SEGMENT_THRESHOLD_MS) {
           stats.warnings.push(
-            `已封存分片（final=true）的首条事件晚于当天 04:00（${stats.firstTs}）—— 疑似只含当天后段（上游尾部窗口截断？），请与上传侧确认`,
+            `已封存分片（final=true）的首条事件在 ${stats.firstTs}，晚于当天 04:00 —— 当天前段可能没有导出（阈值 4h 是经验值，不是契约；>4h 的空白仍可能漏检）`,
           );
         }
       }

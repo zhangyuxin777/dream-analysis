@@ -20,7 +20,8 @@ import { createLogger, ILogger } from '../common/logger';
 import { formatBytes, formatCount, formatDurationMs } from '../common/format';
 import { OssutilStore } from '../oss/ossutilStore';
 import { ObjectStore } from '../oss/store';
-import { runSync, statePathOf } from '../sync/puller';
+import { runSync, lockPathOf, statePathOf } from '../sync/puller';
+import { isProcessAlive, readLock } from '../sync/lock';
 import { createScheduler } from '../sync/scheduler';
 import { loadState, listLocalShards } from '../sync/state';
 import { readShard } from '../ndjson/shard';
@@ -179,6 +180,16 @@ export async function cmdStatus(config: AppConfig): Promise<number> {
   if (suspects.length > 0) {
     console.log(`失败退避中的分片: ${suspects.length} 个`);
     for (const [k, s] of suspects.slice(0, 5)) console.log(`  ⏸ ${k}（已失败 ${s.count} 次，最后失败于 ${s.lastErrorAt}）`);
+  }
+
+  // 锁是"此刻有没有同步在跑"的唯一准确来源（被拒轮次不写状态文件 —— 写了会和持有者互相覆盖）
+  const holder = readLock(lockPathOf(config));
+  if (holder) {
+    const heldMs = Date.now() - Date.parse(holder.acquiredAt);
+    console.log(`当前有同步在进行: pid=${holder.pid}@${holder.host} 自 ${holder.acquiredAt}（已 ${formatDurationMs(heldMs)}）`);
+    if (!isProcessAlive(holder.pid) && holder.host === os.hostname()) {
+      console.warn('⚠️  该持有进程已不存在（残留锁）—— 下一次同步会自动接管');
+    }
   }
   return 0;
 }

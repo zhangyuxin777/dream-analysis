@@ -229,7 +229,36 @@ test('口径变更在**跨轮**时被识别出来（先拉 v1，再拉到 v2）'
   const second = await runSync({ store, config: env.config, logger: env.logger, now: env.now });
   assert.equal(second.whitelistChanges.length, 1);
   assert.match(second.whitelistChanges[0], /v1 → v2/);
+  assert.match(second.whitelistChanges[0], /前一天/, '跨天变更要以"前一天"为基准');
   assert.equal(loadState(statePathOf(env.config)).state.lastRun.whitelistChanges.length, 1, '口径变更必须进 lastRun（status/告警能看到）');
+});
+
+test('同一分片被重算且口径变了 → 也要报（这是最直接的变更信号）', async () => {
+  const env = makeEnv();
+  const day = 'snapshot/boye888/2026-10-02.jsonl.gz';
+  const store = new FakeStore({ [day]: shardBuffer('boye888', '2026-10-02', okEvents, { whitelistVersion: 'v1' }) });
+  await runSync({ store, config: env.config, logger: env.logger, now: env.now });
+
+  store.contents[day] = shardBuffer('boye888', '2026-10-02', okEvents, { whitelistVersion: 'v2' });
+  store.metas = [store.metaOf(day, 'E-CHANGED', 5)];
+
+  const second = await runSync({ store, config: env.config, logger: env.logger, now: env.now });
+  assert.equal(second.whitelistChanges.length, 1);
+  assert.match(second.whitelistChanges[0], /同一分片/);
+});
+
+test('回填一个更早的日期**不该**报假口径变更（基准必须是"同分片/前一天"，不能是"最新的另一份"）', async () => {
+  const env = makeEnv();
+  const recent = 'snapshot/boye888/2026-10-01.jsonl.gz';
+  const backfill = 'snapshot/boye888/2026-09-20.jsonl.gz';
+  const store = new FakeStore({ [recent]: shardBuffer('boye888', '2026-10-01', okEvents, { whitelistVersion: 'v2' }) });
+  await runSync({ store, config: env.config, logger: env.logger, now: env.now });
+
+  store.contents[backfill] = shardBuffer('boye888', '2026-09-20', okEvents, { whitelistVersion: 'v1' });
+  store.metas = [store.metaOf(recent, 'E1', 5), store.metaOf(backfill, 'E2', 5)];
+
+  const second = await runSync({ store, config: env.config, logger: env.logger, now: env.now });
+  assert.deepEqual(second.whitelistChanges, [], '回填旧日期不该凭空报出"口径变更"');
 });
 
 test('契约外对象被忽略（不下载、计入 ignored）', async () => {

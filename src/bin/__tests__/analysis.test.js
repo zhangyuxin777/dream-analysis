@@ -246,6 +246,23 @@ test('cmdSync：正常 → 0；有失败 → 1；锁被别人持有 → 1 且不
   releaseLock(lockPath, 'other');
 });
 
+test('cmdStatus：有同步在跑时明确报出来（锁是"此刻有没有同步"的唯一准确来源）', async () => {
+  const env = makeEnv();
+  const lockPath = path.join(env.config.runtime.stateDir, 'sync.lock');
+  acquireLock(lockPath, { now: new Date(), staleMs: 30 * 60_000, token: 'running' });
+  const running = await capture(() => cli.cmdStatus(env.config));
+  assert.equal(running.code, 0);
+  assert.match(running.out, /当前有同步在进行/);
+  releaseLock(lockPath, 'running');
+
+  // 残留锁（持有者进程已死）要提示"下一次会自动接管"，而不是让人以为卡住了
+  fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+  fs.writeFileSync(lockPath, JSON.stringify({ pid: 999999, token: 'dead', acquiredAt: new Date().toISOString(), host: os.hostname() }));
+  const stale = await capture(() => cli.cmdStatus(env.config));
+  assert.match(stale.out + stale.err, /残留锁/);
+  fs.rmSync(lockPath, { force: true });
+});
+
 test('applyNice：nice=0 时什么都不做；非法值时只记 warn 不抛', () => {
   const env = makeEnv();
   const lines = [];

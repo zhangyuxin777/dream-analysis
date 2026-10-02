@@ -7,12 +7,15 @@
  * 状态文件"后写覆盖先写"还会让水位线说谎（文件是旧版、状态说已同步）。
  * 调度器的单并发闸门只在**进程内**有效，挡不住这种情况。
  *
- * 取舍：
- * - **按年龄判过期**（默认 30 分钟）：不查 pid（跨平台不可靠，且 holder 与 we 同机同用户）。
- *   硬杀进程留下的锁最多挡 30 分钟 —— 对 60 分钟一轮的同步来说不会卡死。
- * - **token 归属**：释放时只在 token 匹配时删除，避免"过期接管者"被原持有者误删。
+ * 三条硬要求（第二轮的 review 教训）：
+ * 1. **必须原子独占创建**（`openSync(path,'wx')`）—— 先 `existsSync` 再写有 TOCTOU 窗口，
+ *    两个进程同一毫秒进来会各写各的，锁形同不存在。
+ * 2. **同机持有者已死 ⇒ 立刻可接管**（`process.kill(pid,0)`）—— 否则 `pm2 restart` / Ctrl+C 打断同步后，
+ *    残留锁会把接下来的同步挡满一个 stale 周期（60 分钟间隔的同步等于停一小时）。
+ * 3. **按年龄过期只作为异机/无法判活时的兜底**；token 归属防止"过期接管者"被原持有者误删。
  */
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 
 export interface LockHolder {
@@ -24,46 +27,86 @@ export interface LockHolder {
 
 export type AcquireResult = { ok: true; holder: LockHolder } | { ok: false; holder: LockHolder | null };
 
-function readHolder(filePath: string): LockHolder | null {
+/** 读锁文件（status 展示也用；损坏/不存在返回 null） */
+export function readLock(filePath: string): LockHolder | null {
   try {
     const raw = JSON.parse(fs.readFileSync(filePath, 'utf8')) as Partial<LockHolder>;
     if (typeof raw.token !== 'string' || typeof raw.acquiredAt !== 'string') return null;
     return { pid: Number(raw.pid ?? 0), token: raw.token, acquiredAt: raw.acquiredAt, host: String(raw.host ?? '') };
   } catch {
-    return null; // 损坏的锁等同于过期锁（否则会永久挡路）
+    return null;
   }
 }
 
-/** 尝试获取锁；已被占用（且未过期）时返回 ok:false + 持有者信息 */
+/** 进程是否还活着（同机判定；EPERM = 存在但没权限，仍算活着） */
+export function isProcessAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+function isFresh(existing: LockHolder, opts: { now: Date; staleMs: number; host: string }): boolean {
+  const sameHost = existing.host !== '' && existing.host === opts.host;
+  if (sameHost) {
+    // 同机：**以"持有进程是否还活着"为准**。
+    // 活着 ⇒ 绝不抢（哪怕年龄超过 stale 时长：慢同步/冷启动都可能跑很久，抢了就是"两个同步同时跑"）；
+    // 死了 ⇒ 立刻可接管（pm2 restart / Ctrl+C 打断同步后，不该被残留锁挡满一个周期）。
+    return isProcessAlive(existing.pid);
+  }
+  // 异机或无从判活：只能按年龄兜底
+  const heldMs = opts.now.getTime() - Date.parse(existing.acquiredAt);
+  if (!Number.isFinite(heldMs) || heldMs < 0) return false; // 时间不可信 ⇒ 当过期处理
+  return heldMs < opts.staleMs;
+}
+
+/** 尝试获取锁；已被**活着的**持有者占用时返回 ok:false + 持有者信息 */
 export function acquireLock(
   filePath: string,
   opts: { now: Date; staleMs: number; token: string; host?: string; pid?: number },
 ): AcquireResult {
+  const host = opts.host ?? os.hostname();
   const holder: LockHolder = {
     pid: opts.pid ?? process.pid,
     token: opts.token,
     acquiredAt: opts.now.toISOString(),
-    host: opts.host ?? '',
+    host,
   };
-
-  if (fs.existsSync(filePath)) {
-    const existing = readHolder(filePath);
-    if (existing) {
-      const heldMs = opts.now.getTime() - Date.parse(existing.acquiredAt);
-      const fresh = Number.isFinite(heldMs) && heldMs >= 0 && heldMs < opts.staleMs;
-      if (fresh) return { ok: false, holder: existing };
-    }
-    // 过期或损坏 → 接管（下面直接覆盖写）
-  }
-
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  fs.writeFileSync(filePath, JSON.stringify(holder, null, 2) + '\n', 'utf8');
-  return { ok: true, holder };
+
+  // 最多两轮：第一轮撞到"已存在"，判断为过期/持有者已死就清掉再抢一次
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const fd = fs.openSync(filePath, 'wx'); // ★ 原子独占创建（TOCTOU 就死在这里）
+      try {
+        fs.writeFileSync(fd, JSON.stringify(holder, null, 2) + '\n', 'utf8');
+      } finally {
+        fs.closeSync(fd);
+      }
+      return { ok: true, holder };
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+      const existing = readLock(filePath);
+      if (existing && isFresh(existing, { now: opts.now, staleMs: opts.staleMs, host })) {
+        return { ok: false, holder: existing };
+      }
+      // 过期 / 损坏 / 同机持有者已死 ⇒ 接管
+      try {
+        fs.rmSync(filePath, { force: true });
+      } catch {
+        // 删不掉就让下一轮去处理（最坏情况是返回 ok:false）
+      }
+    }
+  }
+  return { ok: false, holder: readLock(filePath) };
 }
 
 /** 释放锁：只有 token 匹配（即仍是我们自己持有）才删除 */
 export function releaseLock(filePath: string, token: string): void {
-  const existing = readHolder(filePath);
+  const existing = readLock(filePath);
   if (existing && existing.token !== token) return;
   try {
     fs.rmSync(filePath, { force: true });

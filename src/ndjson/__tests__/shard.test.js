@@ -194,14 +194,15 @@ test('事件真的落在别的日子 → 必须报"日期不一致"（容差不�
   assert.ok(stats.warnings.some((w) => w.includes('日期与 header.date 不一致')), stats.warnings.join('|'));
 });
 
-test('已封存分片却从当天下午才开始 → 报"疑似只含后段"（唯一独立于上传侧自报的完整性信号）', async () => {
+test('已封存分片却从当天下午才开始 → 报"前段可能没导出"（唯一独立于上传侧自报的完整性信号）', async () => {
   const file = writeShard('partial.jsonl.gz', [
     header({ count: 2, date: '2026-10-02', final: true }),
     ev('2026-10-02T06:00:00.000Z', 'A'), // 上海 14:00
     ev('2026-10-02T07:00:00.000Z', 'B'),
   ]);
   const stats = await readShard(file);
-  assert.ok(stats.warnings.some((w) => w.includes('疑似只含当天后段')), stats.warnings.join('|'));
+  assert.ok(stats.warnings.some((w) => w.includes('当天前段可能没有导出')), stats.warnings.join('|'));
+  assert.ok(stats.warnings.some((w) => w.includes('经验值')), '必须说明阈值是经验值，不能假装是契约判据');
 });
 
 test('已封存分片从当天凌晨就开始 → 不该误报"缺早段"', async () => {
@@ -211,5 +212,16 @@ test('已封存分片从当天凌晨就开始 → 不该误报"缺早段"', asyn
     ev('2026-10-02T15:50:00.000Z', 'B'), // 上海 23:50
   ]);
   const stats = await readShard(file);
-  assert.equal(stats.warnings.filter((w) => w.includes('疑似只含当天后段')).length, 0);
+  assert.equal(stats.warnings.filter((w) => w.includes('当天前段可能没有导出')).length, 0);
+});
+
+test('行内不自洽也必须报（只信 localDate 会把这条判据变成永不复活的死代码）', async () => {
+  const file = writeShard('self-inconsistent.jsonl.gz', [
+    header({ count: 1, date: '2026-10-02' }),
+    // ts 是 10-05，上传侧却把桶日期 10-02 盖在 localDate 上 ⇒ 两者矛盾，必须报
+    ev('2026-10-05T03:00:00.000Z', 'A', 'ETH', { localDate: '2026-10-02' }),
+  ]);
+  const stats = await readShard(file);
+  assert.ok(stats.warnings.some((w) => w.includes('日期与 header.date 不一致')), stats.warnings.join('|'));
+  assert.ok(stats.warnings.some((w) => w.includes('不符')), '要指出是 ts 与 localDate 不符');
 });
