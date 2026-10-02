@@ -1,0 +1,19 @@
+{
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist"],
+  "compilerOptions": {
+    /* 与主仓 dream 对齐的口径（同一套开发体验，避免两边行为不一致） */
+    "incremental": true,
+    "tsBuildInfoFile": "./dist/.tsbuildinfo",
+    "target": "es6",
+    "module": "commonjs",
+    "lib": ["ES2021"],
+    "sourceMap": true,
+    "outDir": "./dist",
+    "rootDir": "./src",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true
+  }
+}

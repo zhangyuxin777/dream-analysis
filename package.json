@@ -1,0 +1,26 @@
+{
+  "name": "dream-analysis",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DREAM 运行数据分析服务：从 OSS 拉取 ndjson 天分片 → 确定性分析器 → 机器人对话触发",
+  "main": "dist/bin/analysis.js",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/bin/analysis.js",
+    "dev": "tsc && node dist/bin/analysis.js",
+    "sync": "node dist/bin/analysis.js sync",
+    "status": "node dist/bin/analysis.js status",
+    "doctor": "node dist/bin/analysis.js doctor",
+    "test": "tsc && node scripts/run-tests.js",
+    "test:only": "node scripts/run-tests.js",
+    "test:coverage": "tsc && node scripts/run-tests.js --coverage"
+  },
+  "license": "ISC",
+  "devDependencies": {
+    "@types/node": "^22.20.1",
+    "typescript": "5.9.3"
+  }
+}

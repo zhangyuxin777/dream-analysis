@@ -1,0 +1,203 @@
+/**
+ * 天分片读取（`.jsonl.gz`）：流式解压 → 逐行校验 → 统计。
+ *
+ * 设计取舍：
+ * - **流式**（`createReadStream` + `createGunzip`）：单天分片可能十几 MB，绝不整体读进内存。
+ * - **不做随机访问**：gz 不可按字节切片（`DESIGN.md` §3.2 第 3 条），分析器要按天整体过一遍。
+ * - **校验只降级为 warning 的一部分**：行数不符/时间越界进 `warnings`（仍入库，报告里标注），
+ *   而"解压失败 / 首行不是 header / 文件不存在"是 `errors`（不入库，下轮重试）。
+ *   为什么这样分：前者是"数据可疑但仍可用"，后者是"根本读不出来"，处置动作完全不同。
+ */
+import * as fs from 'fs';
+import * as zlib from 'zlib';
+import { DayShardHeader, EventRecord, isEventRecord, isShardHeader } from './types';
+
+export interface ShardStats {
+  filePath: string;
+  /** 首行 header；缺失/非法时为 null（同时进 errors） */
+  header: DayShardHeader | null;
+  /** 有效事件行数（不含 header） */
+  dataLines: number;
+  /** JSON 解析失败 / 缺必填字段 / ts 非法 的行数 */
+  badLines: number;
+  /** 空行数（末尾空行属正常，单独计数便于区分"脏"与"正常"） */
+  blankLines: number;
+  firstTs: string | null;
+  lastTs: string | null;
+  eventCounts: Record<string, number>;
+  symbolCounts: Record<string, number>;
+  errors: string[];
+  warnings: string[];
+  /** errors 为空即 true（warnings 不影响） */
+  ok: boolean;
+}
+
+export interface ReadShardOptions {
+  /** `header.count` 是否把 header 行算在内（上传侧口径，见 env.json.md） */
+  countIncludesHeader?: boolean;
+  /** 逐事件回调（同步；M2 的分析器在这里聚合） */
+  onEvent?: (event: EventRecord, lineNo: number) => void;
+}
+
+function emptyStats(filePath: string): ShardStats {
+  return {
+    filePath,
+    header: null,
+    dataLines: 0,
+    badLines: 0,
+    blankLines: 0,
+    firstTs: null,
+    lastTs: null,
+    eventCounts: {},
+    symbolCounts: {},
+    errors: [],
+    warnings: [],
+    ok: false,
+  };
+}
+
+/** 读取并校验一个天分片；**不抛异常**（失败通过 errors 表达，调用方决定重试/跳过） */
+export function readShard(filePath: string, opts: ReadShardOptions = {}): Promise<ShardStats> {
+  const stats = emptyStats(filePath);
+  const countIncludesHeader = opts.countIncludesHeader ?? false;
+
+  if (!fs.existsSync(filePath)) {
+    stats.errors.push('文件不存在');
+    return Promise.resolve(stats);
+  }
+
+  return new Promise<ShardStats>((resolve) => {
+    let pending = '';
+    let lineNo = 0;
+    let sawHeader = false;
+    let headerLineCounted = false;
+    const dateMismatch = { n: 0, sample: '' };
+    let settled = false;
+
+    const finish = (): void => {
+      if (settled) return;
+      settled = true;
+      finalize();
+      resolve(stats);
+    };
+
+    const fail = (msg: string): void => {
+      if (settled) return;
+      settled = true;
+      stats.errors.push(msg);
+      finalize();
+      resolve(stats);
+    };
+
+    const handleLine = (raw: string): void => {
+      const line = raw.replace(/\r$/, '');
+      if (line.trim() === '') {
+        stats.blankLines++;
+        return;
+      }
+      lineNo++;
+
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(line);
+      } catch {
+        stats.badLines++;
+        if (stats.warnings.length < 20) stats.warnings.push(`第 ${lineNo} 行不是合法 JSON`);
+        return;
+      }
+
+      if (!sawHeader) {
+        if (!isShardHeader(parsed)) {
+          fail(`首行不是合法 header（期望 {type:"meta",…}，实际 ${describeShape(parsed)}）`);
+          return;
+        }
+        sawHeader = true;
+        stats.header = parsed;
+        headerLineCounted = true;
+        return;
+      }
+
+      if (!isEventRecord(parsed)) {
+        stats.badLines++;
+        if (stats.warnings.length < 20) stats.warnings.push(`第 ${lineNo} 行不是合法事件行`);
+        return;
+      }
+
+      stats.dataLines++;
+      stats.eventCounts[parsed.event] = (stats.eventCounts[parsed.event] ?? 0) + 1;
+      const sym = parsed.symbol ?? '(none)';
+      stats.symbolCounts[sym] = (stats.symbolCounts[sym] ?? 0) + 1;
+      if (stats.firstTs === null) stats.firstTs = parsed.ts;
+      stats.lastTs = parsed.ts;
+
+      if (stats.header && parsed.ts.slice(0, 10) !== stats.header.date) {
+        dateMismatch.n++;
+        if (dateMismatch.sample === '') dateMismatch.sample = parsed.ts;
+      }
+
+      if (opts.onEvent) opts.onEvent(parsed, lineNo);
+    };
+
+    const finalize = (): void => {
+      if (!sawHeader && stats.errors.length === 0) stats.errors.push('文件为空或没有 header 行');
+
+      const header = stats.header;
+      if (header && header.count !== undefined) {
+        const expected = countIncludesHeader ? header.count - 1 : header.count;
+        if (expected !== stats.dataLines) {
+          stats.warnings.push(`行数不符：header.count=${header.count}（口径${countIncludesHeader ? '含' : '不含'} header）实际数据行=${stats.dataLines}`);
+        }
+      }
+      if (header && header.firstTs && stats.firstTs && stats.firstTs < header.firstTs) {
+        stats.warnings.push(`首条事件早于 header.firstTs（${stats.firstTs} < ${header.firstTs}）`);
+      }
+      if (header && header.lastTs && stats.lastTs && stats.lastTs > header.lastTs) {
+        stats.warnings.push(`末条事件晚于 header.lastTs（${stats.lastTs} > ${header.lastTs}）`);
+      }
+      if (dateMismatch.n > 0) {
+        stats.warnings.push(`${dateMismatch.n} 行的事件日期与 header.date 不一致（例：${dateMismatch.sample}）`);
+      }
+      if (headerLineCounted && stats.dataLines === 0 && stats.badLines === 0) {
+        stats.warnings.push('只有 header、没有数据行');
+      }
+      stats.ok = stats.errors.length === 0;
+    };
+
+    const onData = (chunk: Buffer): void => {
+      pending += chunk.toString('utf8');
+      let idx: number;
+      while ((idx = pending.indexOf('\n')) >= 0) {
+        const line = pending.slice(0, idx);
+        pending = pending.slice(idx + 1);
+        handleLine(line);
+        if (settled) return;
+      }
+    };
+
+    try {
+      const reader = fs.createReadStream(filePath);
+      const gunzip = zlib.createGunzip();
+      reader.on('error', (err: Error) => fail(`读取失败：${err.message}`));
+      gunzip.on('error', (err: Error) => fail(`gzip 解压失败：${err.message}`));
+      gunzip.on('data', (chunk: Buffer) => onData(chunk));
+      gunzip.on('end', () => {
+        if (settled) return;
+        if (pending.trim() !== '') handleLine(pending);
+        finish();
+      });
+      reader.pipe(gunzip);
+    } catch (err) {
+      fail(`打开文件失败：${err instanceof Error ? err.message : String(err)}`);
+    }
+  });
+}
+
+function describeShape(v: unknown): string {
+  if (v === null) return 'null';
+  if (Array.isArray(v)) return 'array';
+  if (typeof v === 'object') {
+    const keys = Object.keys(v as Record<string, unknown>).slice(0, 5);
+    return `object{${keys.join(',')}}`;
+  }
+  return typeof v;
+}
