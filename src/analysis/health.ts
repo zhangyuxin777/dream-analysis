@@ -13,6 +13,15 @@ import { Analysis, AnalysisContext, AnalysisResult, MAX_WINDOW_HOURS, Section, n
 import { formatShanghai, windowHours } from '../common/time';
 
 const ERROR_EVENT_RE = /(_ERROR|_FAILED|UNRECOVERED|_ALERT)$/;
+/**
+ * 配置回显类事件（每次启动各打一遍：`WORKER_CONFIG_*` / `WORKER_ENV_*`）。
+ *
+ * **只在展示层折叠**，原始行一行不少地留在分片里 —— 参数溯源、崩溃环排查都要靠它们。
+ * 为什么不在导出侧做去重：那是把一个**可逆、可解释的展示问题**，变成**不可逆、要写契约、要维护状态的存储问题**
+ * （"缺失 = 未变"这个语义对条件发射类事件还不成立）。层次错了，再省也只有 6.5% 的行数（gzip 后约 0.3KB/天）。
+ * 这条是上传侧给的结论，我认：降噪属于"读的时候怎么呈现"。
+ */
+export const ECHO_EVENT_RE = /^WORKER_(CONFIG|ENV)_/;
 /** 心跳间隔超过这个值 ⇒ 疑似停摆（上传侧每小时一次观测，2 小时足够宽松） */
 export const HEARTBEAT_GAP_ALERT_MS = 2 * 3_600_000;
 
@@ -167,10 +176,24 @@ export function healthAnalysis(): Analysis {
         });
       }
 
+      // Top-N 只排**业务事件**；配置回显类折叠成一行（展示层修复，理由见 ECHO_EVENT_RE 的注释）
+      const allEvents = [...totals.eventCounts.entries()];
+      const echoEntries = allEvents.filter(([name]) => ECHO_EVENT_RE.test(name));
+      const echoTotal = echoEntries.reduce((sum, [, n]) => sum + n, 0);
+      const echoFamilies = echoEntries.length;
+      const topBusiness = allEvents
+        .filter(([name]) => !ECHO_EVENT_RE.test(name))
+        .sort(byCountThenName)
+        .slice(0, 15);
+
       sections.push({
-        heading: '事件 Top 15',
+        heading: '事件 Top 15（配置回显已折叠）',
         headers: ['事件', '次数'],
-        rows: [...totals.eventCounts.entries()].sort(byCountThenName).slice(0, 15).map(([name, n]) => [name, String(n)]),
+        note: '配置回显类（WORKER_CONFIG_*/WORKER_ENV_*）只在**展示层**折叠成一行；原始行仍在分片里，参数溯源与崩溃环排查用它。',
+        rows: [
+          ...topBusiness.map(([name, n]) => [name, String(n)]),
+          ...(echoTotal > 0 ? [[`（配置回显 ${echoFamilies} 类共 ${echoTotal} 条已折叠）`, String(echoTotal)]] : []),
+        ],
       });
 
       if (totals.heartbeats.size > 0) {
@@ -192,7 +215,6 @@ export function healthAnalysis(): Analysis {
 
       const symbolRows = [...totals.symbolCounts.entries()].sort(byCountThenName).map(([sym, n]) => [sym, String(n)]);
       if (symbolRows.length > 0) sections.push({ heading: '按 symbol', headers: ['symbol', '事件数'], rows: symbolRows });
-
       return {
         title: `健康检查 · ${ctx.window.label}`,
         summary:

@@ -131,6 +131,41 @@ test('没有 ACCOUNT_OBSERVED 但有其它事件 ⇒ 提示"无法用心跳判�
   assert.match(result.warnings.join('\n'), /没有 ACCOUNT_OBSERVED/);
 });
 
+test('配置回显只在展示层折叠：Top-N 让给业务事件，回显合并成一行（原始行不动）', async () => {
+  const events = [
+    ev('2026-10-01T01:00:00.000Z', 'ORDER_FILLED'),
+    ev('2026-10-01T02:00:00.000Z', 'ORDER_CANCELED'),
+    ...Array.from({ length: 8 }, (_, i) => ev(`2026-10-01T0${i + 3}:00:00.000Z`, 'WORKER_CONFIG_DEVIATION')),
+    ev('2026-10-01T11:00:00.000Z', 'WORKER_ENV_PRODUCTION'),
+  ];
+  const result = await run(events);
+  const top = result.sections.find((s) => s.heading.startsWith('事件 Top'));
+  const names = top.rows.map((r) => r[0]);
+
+  assert.ok(names.includes('ORDER_FILLED'), '业务事件必须在：' + JSON.stringify(top.rows));
+  assert.ok(!names.includes('WORKER_CONFIG_DEVIATION'), '回显类不该单独占 Top-N 名额');
+  assert.ok(!names.includes('WORKER_ENV_PRODUCTION'), 'WORKER_ENV_* 同样折叠');
+
+  const folded = top.rows.find((r) => r[0].includes('配置回显'));
+  assert.ok(folded, '必须有折叠汇总行：' + JSON.stringify(top.rows));
+  assert.equal(folded[1], '9', '8 条 WORKER_CONFIG_* + 1 条 WORKER_ENV_*');
+  assert.match(folded[0], /2 类共 9 条/);
+  assert.match(top.note, /原始行仍在分片里/, '必须说明只是展示折叠，数据一行没少');
+
+  // 折叠不影响任何计数：总事件数 / 异常数 / symbol 分布都照旧
+  const overview = Object.fromEntries(result.sections.find((s) => s.heading === '概览').rows.map((r) => [r[0], r[1]]));
+  assert.equal(overview['分片 / 事件'], '1 / 11');
+});
+
+test('全是回显事件时，折叠行也要能看（不能让 Top-N 空着让人以为没数据）', async () => {
+  const events = Array.from({ length: 5 }, (_, i) => ev(`2026-10-01T0${i + 1}:00:00.000Z`, 'WORKER_CONFIG_DEVIATION'));
+  const result = await run(events);
+  const top = result.sections.find((s) => s.heading.startsWith('事件 Top'));
+  assert.equal(top.rows.length, 1);
+  assert.match(top.rows[0][0], /配置回显/);
+  assert.equal(top.rows[0][1], '5');
+});
+
 test('provisional 透传（含未封存分片时结果必须标暂定）', async () => {
   const result = await run([ev('2026-10-01T01:00:00.000Z', 'SELL_FILLED')], { provisional: true });
   assert.equal(result.provisional, true);
