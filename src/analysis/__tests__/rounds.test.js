@@ -144,10 +144,19 @@ test('未完成轮也要能看出"卡了多久"（只看已结束的轮会把"�
   ];
   const result = await run(events, {}, { window: '2026-10-01' });
   const aging = result.sections.find((s) => s.heading.startsWith('未完成轮'));
-  // 窗口 2026-10-01（上海日）= [09-30T16:00Z, 10-01T16:00Z)；该轮首现 10-01T01:00Z ⇒ 已运行 15h
+  // 窗口 2026-10-01（上海日）= [09-30T16:00Z, 10-01T16:00Z)；它已结束（NOW=10-02T12:00Z）⇒ 按窗口结束算
   assert.deepEqual(aging.rows[0], ['ETHFDUSD', 'R001', '15.0']);
   assert.deepEqual(aging.rows[1].slice(0, 2), ['BTCFDUSD', 'R002']);
-  assert.match(aging.note, /已运行 = 窗口结束时刻/);
+  assert.match(aging.note, /已运行 = 窗口结束 −/);
+});
+
+test('窗口还没结束时，"已运行"按**此刻**算（不能把还没发生的时间算进去）', async () => {
+  const events = [ev('2026-10-02T01:00:00.000Z', 'NEW_ROUND', 'ETHFDUSD', {}, 'R001')];
+  // 窗口 = 2026-10-02（结束于 10-02T16:00Z，晚于 NOW=12:00Z）⇒ 参考时刻必须是 NOW
+  const result = await run(events, {}, { window: '2026-10-02' });
+  const aging = result.sections.find((s) => s.heading.startsWith('未完成轮'));
+  assert.deepEqual(aging.rows[0], ['ETHFDUSD', 'R001', '11.0'], '按窗口结束算会得到 15.0h —— 那是未来时间');
+  assert.match(aging.note, /按"此刻"算/);
 });
 
 test('分片读不出来 / 带数据告警时，轮数结论必须打折说明', async () => {

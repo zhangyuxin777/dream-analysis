@@ -129,6 +129,31 @@ test('分片存在但读不出来：进 failedShards、不算"已覆盖"，那�
   assert.deepEqual(stats.missingDays, ['2026-10-02'], '读不出来的那天也要算缺数据');
 });
 
+test('分片级告警去重：同步时与本次读取算出的同一条告警只报一次', async () => {
+  const env = makeEnv();
+  const date = '2026-10-02';
+  const file = path.join(env.dataDir, 'boye888', `${date}.jsonl.gz`);
+  // 造一个"header.count 说谎"的分片（行数不符），让读取时必然产生一条告警
+  const header = JSON.stringify({ type: 'meta', schema: 2, instance: 'boye888', date, final: false, count: 9 });
+  const one = { ts: '2026-10-02T01:00:00.000Z', event: 'A', symbol: 'ETHFDUSD', localDate: date, seq: 1, data: {} };
+  fs.writeFileSync(file, zlib.gzipSync(Buffer.from([header, JSON.stringify(one)].join('\n') + '\n', 'utf8')));
+
+  const { readShard } = require('../../../dist/ndjson/shard');
+  const fresh = await readShard(file);
+  assert.ok(fresh.warnings.some((w) => w.includes('行数不符')), fresh.warnings.join('|'));
+  // 模拟"拉取时算过同一条"：把真实告警文本写进水位线
+  env.state.objects[`${PREFIX}boye888/${date}.jsonl.gz`] = {
+    etag: 'E9', size: 1, dataLines: 1, final: false, pulledAt: 'x', warnings: fresh.warnings,
+  };
+
+  const src = new LocalEventSource({ dataDir: env.dataDir, prefix: PREFIX, state: env.state });
+  const stats = await src.scan({ window: parseWindow(date, NOW) }, () => undefined);
+  assert.equal(stats.shardWarnings.length, 1);
+  const warnings = stats.shardWarnings[0].warnings;
+  assert.equal(new Set(warnings).size, warnings.length, '去重失效：同一条告警会被打两遍 → ' + warnings.join('|'));
+  assert.equal(warnings.filter((w) => w.includes('行数不符')).length, 1);
+});
+
 test('分片级告警（同步时校验出来的行数不符等）必须带进分析结果', async () => {
   const env = makeEnv(); // 10-02 的水位线条目里带着 warnings: ['行数不符']
   const src = new LocalEventSource({ dataDir: env.dataDir, prefix: PREFIX, state: env.state });

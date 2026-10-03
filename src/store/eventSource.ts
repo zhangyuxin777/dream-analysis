@@ -101,8 +101,10 @@ export class LocalEventSource implements EventSourceLike {
       coveredDays.add(shard.date);
       if (!shard.final) stats.provisional = true;
 
-      // 分片级告警：同步时校验出来的（行数不符/缺前段/日期不一致）+ 本次读取发现的
-      const warnings = [...(shard.warnings ?? []), ...result.warnings];
+      // 分片级告警：同步时校验出来的（行数不符/缺前段/日期不一致）+ 本次读取发现的。
+      // **必须去重**：同一条告警往往两边都有（拉取时算过、读取时又算一遍），
+      // 不去重就会在报告里连打两遍（实测踩到：同一条"缺前段"警告出现两次，读起来像两个问题）
+      const warnings = [...new Set([...(shard.warnings ?? []), ...result.warnings])];
       if (warnings.length > 0) stats.shardWarnings.push({ key: shard.key, warnings });
     }
 

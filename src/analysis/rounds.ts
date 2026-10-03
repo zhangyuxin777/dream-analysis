@@ -65,6 +65,8 @@ export function roundsAnalysis(): Analysis {
       const worst: WorstRound[] = [];
       /** roundId → 该轮在窗口内第一次出现的时间（用于算"还在开的轮已经跑了多久"） */
       const roundFirst = new Map<string, { symbol: string; firstMs: number }>();
+      /** 算"已运行时长"的参考时刻：窗口还没结束时用"此刻"，避免把未来的时间算进去 */
+      const referenceMs = Math.min(ctx.window.toMs, ctx.now.getTime());
       const topN = Math.max(1, Math.min(50, Number(ctx.params.top ?? '5') || 5));
       let events = 0;
 
@@ -167,7 +169,9 @@ export function roundsAnalysis(): Analysis {
 
         for (const id of unfinishedIds) {
           const first = roundFirst.get(id);
-          if (first) unfinishedAging.push({ symbol, roundId: id, ageHours: (ctx.window.toMs - first.firstMs) / 3_600_000 });
+          // ⚠️ 参考时刻必须取 min(窗口结束, 此刻)：今天的窗口结束在**未来**，
+          // 直接减窗口结束会报出一个还没发生过的时长（实测踩到：刚开 1 小时的轮显示"已运行 15.4h"）
+          if (first) unfinishedAging.push({ symbol, roundId: id, ageHours: (referenceMs - first.firstMs) / 3_600_000 });
         }
 
         totalNew += s.newRounds;
@@ -221,11 +225,12 @@ export function roundsAnalysis(): Analysis {
       // 正在开的轮也要能看出"卡了多久" —— 只看已结束的轮会把"哪一轮卡住了"答反（M2 review 的 Warning）
       const agingSorted = [...unfinishedAging].sort((a, b) => b.ageHours - a.ageHours).slice(0, topN);
       if (agingSorted.length > 0) {
+        const referenceLabel = ctx.window.toMs > ctx.now.getTime() ? '此刻' : '窗口结束';
         sections.push({
-          heading: `未完成轮 Top ${agingSorted.length}（窗口内已运行时长，越大越像卡住）`,
+          heading: `未完成轮 Top ${agingSorted.length}（已运行时长，越大越像卡住）`,
           headers: ['币种', '轮次', '已运行(h)'],
           rows: agingSorted.map((a) => [a.symbol, a.roundId, a.ageHours.toFixed(1)]),
-          note: '已运行 = 窗口结束时刻 − 该轮在窗口内的首条事件；窗口结束不等于"卖出"，所以它衡量的是"还在开多久"。',
+          note: `已运行 = ${referenceLabel} − 该轮在窗口内的首条事件（窗口还没结束时按"此刻"算，不把未来时间算进去）；窗口结束不等于"卖出"，所以它衡量的是"还在开多久"。`,
         });
       }
 
