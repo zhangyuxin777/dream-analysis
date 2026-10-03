@@ -193,6 +193,21 @@ test('★真数据实测：roundId 只在 (实例,币种) 内唯一 —— 跨�
   assert.notEqual(eth[2], btc[2], '只按 roundId 建键时，后出现的轮会套用别人的首现时刻（两条时长会相同）');
 });
 
+test('★第三轮 P5 的 Critical：不带 -RCV 的"整串认不出"的完成事件，**不许**认领同计数器的另一轮', async () => {
+  const events = [
+    ev('2026-10-01T01:00:00.000Z', 'NEW_ROUND', 'ETHFDUSD', {}, 'R001-010000'),
+    // 空仓重启后开的另一轮，完成事件是它的（它自己的 NEW_ROUND 不在窗口里 / 或就是没采到）
+    ev('2026-10-01T05:00:00.000Z', 'ROUND_COMPLETED', 'ETHFDUSD', { profit: 1, durationHours: 1 }, 'R001-050000'),
+  ];
+  const result = await run(events);
+  const row = rowOf(result, 'ETHFDUSD');
+  assert.equal(row[2], '1', '完成数照记（但配不上开轮记录）');
+  assert.equal(row[3], '1', '未完成必须仍是 1：报告 note 的定义是"开了新轮但没看到 ROUND_COMPLETED"；'
+    + '宽松认领会把它报成已完成（静默假阴性，正是这张表最该避免的错）');
+  const aging = result.sections.find((s) => s.heading.startsWith('未完成轮'));
+  assert.match(aging.rows[0][1], /R001-010000/, 'aging 里显示的必须是**那条真没配上完成**的记录，而不是完成事件的名字');
+});
+
 test('★主仓实证：空仓重启会复用计数器（R001 再来一次）—— 两轮绝不能被并成一轮', async () => {
   const events = [
     ev('2026-10-01T01:00:00.000Z', 'NEW_ROUND', 'ETHFDUSD', {}, 'R001-010000'),

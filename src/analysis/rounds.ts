@@ -142,13 +142,16 @@ export function roundsAnalysis(): Analysis {
           const ledgerKey = roundId === '' ? '' : roundLedgerKey(e.instance, symbol, roundId);
           if (ledgerKey !== '') {
             const list = ledgerOf(s, ledgerKey);
-            const last = list[list.length - 1];
             if (e.event === 'NEW_ROUND') {
               // 同一轮的重复 NEW_ROUND（同字符串）不新开记录；换了字符串就是另一轮（计数器复用/改名后重发）
+              const last = list[list.length - 1];
               if (!last || last.displayId !== roundId) list.push({ displayId: roundId, firstMs: ms, completed: false });
-            } else if (last && !last.completed) {
-              // 非开轮事件带新名字 ⇒ 只是这一轮改名了（如恢复后的 -RCV），跟着更新显示名
-              last.displayId = roundId;
+            } else if (e.event !== 'ROUND_COMPLETED') {
+              // ⚠️ 只让**非完成**事件更新显示名（如恢复后的 ROUND_FIRST_FILL 带 -RCV）。
+              // 如果完成事件也在这里改写 displayId，下面"精确匹配"就必然命中 ⇒ `-RCV` 门槛变成死代码，
+              // **任何**整串认不出的完成事件都会认领同计数器的另一轮（第三轮 P5 的 Critical，已修）
+              const last = list[list.length - 1];
+              if (last && !last.completed) last.displayId = roundId;
             }
           }
           switch (e.event) {
