@@ -166,6 +166,22 @@ test('全是回显事件时，折叠行也要能看（不能让 Top-N 空着让�
   assert.equal(top.rows[0][1], '5');
 });
 
+test('ECHO_EVENT_RE：只吞"配置回显"，不许吞掉运维要看的事件', () => {
+  const { ECHO_EVENT_RE } = require('../../../dist/analysis/health');
+  for (const name of ['WORKER_CONFIG_DEVIATION', 'WORKER_CONFIG_BUDGET_TIERS', 'WORKER_ENV_PRODUCTION', 'WORKER_ENV_TESTNET']) {
+    assert.equal(ECHO_EVENT_RE.test(name), true, `${name} 应被折叠`);
+  }
+  for (const name of ['WORKER_WS_STALE_RECONNECT', 'STARTUP_RECOVERY_DONE', 'UDS_CONN_CLOSED', 'ORDER_FILLED', 'ROUND_COMPLETED']) {
+    assert.equal(ECHO_EVENT_RE.test(name), false, `${name} 是运维/业务事件，**不该**被折叠`);
+  }
+});
+
+test('0 事件窗口：不推一个只有表头的空表（summary 已经说明了）', async () => {
+  const result = await run([]);
+  assert.equal(result.sections.find((s) => s.heading.startsWith('事件 Top')), undefined);
+  assert.match(result.summary, /窗口内没有事件/);
+});
+
 test('provisional 透传（含未封存分片时结果必须标暂定）', async () => {
   const result = await run([ev('2026-10-01T01:00:00.000Z', 'SELL_FILLED')], { provisional: true });
   assert.equal(result.provisional, true);

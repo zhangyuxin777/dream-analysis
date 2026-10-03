@@ -170,8 +170,11 @@ export function roundsAnalysis(): Analysis {
         for (const id of unfinishedIds) {
           const first = roundFirst.get(id);
           // ⚠️ 参考时刻必须取 min(窗口结束, 此刻)：今天的窗口结束在**未来**，
-          // 直接减窗口结束会报出一个还没发生过的时长（实测踩到：刚开 1 小时的轮显示"已运行 15.4h"）
-          if (first) unfinishedAging.push({ symbol, roundId: id, ageHours: (referenceMs - first.firstMs) / 3_600_000 });
+          // 直接减窗口结束会报出一个还没发生过的时长（实测踩到：刚开 1 小时的轮显示"已运行 15.4h"）。
+          // 再夹一层 0：注入时钟早于窗口时，负数时长比"0"更让人困惑
+          if (first) {
+            unfinishedAging.push({ symbol, roundId: id, ageHours: Math.max(0, referenceMs - first.firstMs) / 3_600_000 });
+          }
         }
 
         totalNew += s.newRounds;

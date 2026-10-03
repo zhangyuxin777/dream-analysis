@@ -186,15 +186,18 @@ export function healthAnalysis(): Analysis {
         .sort(byCountThenName)
         .slice(0, 15);
 
-      sections.push({
-        heading: '事件 Top 15（配置回显已折叠）',
-        headers: ['事件', '次数'],
-        note: '配置回显类（WORKER_CONFIG_*/WORKER_ENV_*）只在**展示层**折叠成一行；原始行仍在分片里，参数溯源与崩溃环排查用它。',
-        rows: [
-          ...topBusiness.map(([name, n]) => [name, String(n)]),
-          ...(echoTotal > 0 ? [[`（配置回显 ${echoFamilies} 类共 ${echoTotal} 条已折叠）`, String(echoTotal)]] : []),
-        ],
-      });
+      // 0 事件时不要推一个只有表头的空表（"窗口内没有事件"已经在 summary 里说了）
+      if (topBusiness.length > 0 || echoTotal > 0) {
+        sections.push({
+          heading: '事件 Top 15（配置回显已折叠）',
+          headers: ['事件', '次数'],
+          note: '配置回显类（WORKER_CONFIG_*/WORKER_ENV_*）只在**展示层**折叠成一行；原始行仍在分片里，参数溯源与崩溃环排查用它。',
+          rows: [
+            ...topBusiness.map(([name, n]) => [name, String(n)]),
+            ...(echoTotal > 0 ? [[`（配置回显 ${echoFamilies} 类共 ${echoTotal} 条已折叠）`, String(echoTotal)]] : []),
+          ],
+        });
+      }
 
       if (totals.heartbeats.size > 0) {
         sections.push({
