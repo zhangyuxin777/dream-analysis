@@ -193,6 +193,47 @@ test('★真数据实测：roundId 只在 (实例,币种) 内唯一 —— 跨�
   assert.notEqual(eth[2], btc[2], '只按 roundId 建键时，后出现的轮会套用别人的首现时刻（两条时长会相同）');
 });
 
+test('★主仓实证：空仓重启会复用计数器（R001 再来一次）—— 两轮绝不能被并成一轮', async () => {
+  const events = [
+    ev('2026-10-01T01:00:00.000Z', 'NEW_ROUND', 'ETHFDUSD', {}, 'R001-010000'),
+    ev('2026-10-01T02:00:00.000Z', 'ROUND_COMPLETED', 'ETHFDUSD', { profit: 1, durationHours: 1 }, 'R001-010000'),
+    // 空仓重启：主仓 spot-worker.ts L735-757 `if (!state.isInGaming)` 直接 return（round 不恢复）
+    // ⇒ 下一次开轮又是 R001（换个时间戳）
+    ev('2026-10-01T05:00:00.000Z', 'NEW_ROUND', 'ETHFDUSD', {}, 'R001-050000'),
+  ];
+  const result = await run(events, {}, { window: '2026-10-01' });
+  const row = rowOf(result, 'ETHFDUSD');
+  assert.equal(row[1], '2', '新轮 2（同一计数器下两轮）');
+  assert.equal(row[2], '1', '完成 1（精确匹配到第一轮）');
+  assert.equal(row[3], '1', '未完成 1 —— 第二轮真在开。把身份降级成计数器会并成一轮、报成 0（静默假阴性）');
+
+  const aging = result.sections.find((s) => s.heading.startsWith('未完成轮'));
+  assert.equal(aging.rows.length, 1);
+  assert.match(aging.rows[0][1], /R001-050000/, '显示的必须是**真在开**那一轮的名字');
+  assert.equal(aging.rows[0][2], '11.0', '该轮首现 05:00Z，窗口结束 10-01T16:00Z（已过 ⇒ 按窗口结束算）⇒ 11h');
+});
+
+test('改名兜底：只有完成事件带 -RCV、中间没有别的非开轮事件时，也要认领那一轮', async () => {
+  const events = [
+    ev('2026-10-01T01:00:00.000Z', 'NEW_ROUND', 'ETHFDUSD', {}, 'R010-010000'),
+    ev('2026-10-01T06:00:00.000Z', 'ROUND_COMPLETED', 'ETHFDUSD', { profit: 2, durationHours: 5 }, 'R010-061230-RCV'),
+  ];
+  const result = await run(events);
+  const row = rowOf(result, 'ETHFDUSD');
+  assert.equal(row[2], '1', '完成 1（靠 -RCV 兜底认领）');
+  assert.equal(row[3], '0', '未完成 0 —— 不带 -RCV 的"整串匹配不上"就不许认领，否则计数器复用会被误判');
+});
+
+test('counterOfRoundId / isRecoveredRoundId：改名标记与计数器的解析', () => {
+  const { counterOfRoundId, isRecoveredRoundId } = require('../../../dist/analysis/rounds');
+  assert.equal(counterOfRoundId('R596-190959'), 'R596');
+  assert.equal(counterOfRoundId('R596-191307-RCV'), 'R596');
+  assert.equal(counterOfRoundId('R000-ERR-RCV'), 'R000');
+  assert.equal(isRecoveredRoundId('R596-191307-RCV'), true);
+  assert.equal(isRecoveredRoundId('R596-190959'), false);
+  assert.equal(isRecoveredRoundId('R001'), false);
+});
+
 test('分片读不出来 / 带数据告警时，轮数结论必须打折说明', async () => {
   const result = await run(SCENARIO, {
     failedShards: [{ key: 'snapshot/a/2026-09-30.jsonl.gz', errors: ['文件不存在'] }],

@@ -29,8 +29,10 @@ interface SymbolStats {
   crashEntered: number;
   sellProfitCents: number;
   roundProfitCents: number;
-  completedRoundIds: Set<string>;
-  newRoundIds: Set<string>;
+  /** 轮次账本：键 = 实例+币种+计数器，值 = 该计数器下按时间排列的出现记录（可能多轮，计数器会复用/回绕） */
+  ledger: Map<string, RoundOccurrence[]>;
+  /** 没配上开轮记录的完成事件数（窗口前开的轮在本窗口完成 / 没有 roundId） */
+  unmatchedCompletions: number;
 }
 
 interface WorstRound {
@@ -42,27 +44,53 @@ interface WorstRound {
 }
 
 /**
- * 轮次身份键 = **实例 + 币种 + 计数器**（不是整个 roundId 字符串）。
+ * 轮次身份：**以完整 roundId 字符串为主键**，只对一种情况放宽 —— 带仓重启的改名。
  *
- * 两条都是隔夜真分片里**实测到**的（不是推演）：
- * ① `roundId` 只在 (实例, 币种) 内唯一 —— 计数器各币种独立从 1 起（真数据：BTC=168…、XRP=595…、ETH=001…），
- *    所以同一实例里两个币种、或两个实例的同名币种，完全可能撞上同一个字符串；
- *    只按 roundId 建键会让后出现的轮套用别人的首现时刻 ⇒ "已运行时长"错、Top-N 被顶掉。
- * ② 带仓重启会给同一轮**换后缀**：真分片里 counter=596 的轮，`NEW_ROUND` 是 `R596-190959`，
- *    而同轮的 `ROUND_FIRST_FILL` 已经是 `R596-191307-RCV`（counter 不变、时间后缀变了）。
- *    按整串比 ⇒ 该轮永远配不上 `ROUND_COMPLETED`，未完成列永久 +1 且凭空多一行 aging。
- * 计数器在 (实例, 币种) 内随轮递增，所以"计数器"是这一层里稳定的身份。
+ * 主仓 `dream_develop/src/grid/spot-worker.ts` 实证（2026-10-03 只读核对）：
+ * - `L113 private round: number = 0;` —— 计数器是**进程内成员变量**；
+ * - `L1140 this.round = (this.round + 1) % 3844;` —— 递增且 **3844 取模**（会回绕）；
+ * - `L735-757` 启动恢复：`if (!state.isInGaming)` 直接 early-return（`round: 0`），
+ *   即**空仓/无持仓启动时计数器不恢复** ⇒ 下一次开轮必然又是 `R001-<新时间戳>`；
+ * - `L763 this.roundId = `R${pad(state.round,3)}-${ts}-RCV`` —— 恢复改名**只加 `-RCV` 后缀并换时间戳**。
+ *
+ * 结论（两次 P5 换来的教训）：
+ * ① **不能**把身份降级成计数器 —— 计数器会复用（空仓重启）也会回绕（取模 3844），
+ *    合并两轮会把"真在开的轮"报成已完成 ⇒ 未完成数**少算**，比多算一行幽灵更难发现；
+ * ② **要**修的是改名：真分片实测 counter=596 的同一轮，`NEW_ROUND` 是 `R596-190959`，
+ *    而同轮的 `ROUND_FIRST_FILL`/`ROUND_COMPLETED` 已是 `R596-191307-RCV` —— 按整串比
+ *    会让它永远配不上完成事件（未完成列永久 +1 且凭空一行 aging）。
+ *
+ * 所以按 (实例, 币种, 计数器) 记**一串出现记录**（同一计数器下可以有多轮）：
+ * 完成事件先按完整字符串精确匹配，匹配不到且带 `-RCV` 时，才认领同计数器**最新的未完成**那轮。
  */
-export function roundKeyOf(instance: string, symbol: string, roundId: string): string {
-  const counter = roundId.split('-')[0] ?? roundId;
-  return `${instance}\u0000${symbol}\u0000${counter}`;
+export interface RoundOccurrence {
+  /** 最近一次见到的完整 id（恢复改名后报告里显示现状） */
+  displayId: string;
+  /** 这一轮首次出现的时间（与 displayId 同属一条记录，不会和张冠李戴的时长拼在一起） */
+  firstMs: number;
+  completed: boolean;
+}
+
+/** 计数器：`R596-190959` / `R596-191307-RCV` → `R596` */
+export function counterOfRoundId(roundId: string): string {
+  return roundId.split('-')[0] ?? roundId;
+}
+
+/** 轮次账本键 = 实例 + 币种 + 计数器（计数器只在同一 (实例,币种) 内计数） */
+export function roundLedgerKey(instance: string, symbol: string, roundId: string): string {
+  return `${instance}\u0000${symbol}\u0000${counterOfRoundId(roundId)}`;
+}
+
+/** 带仓重启的改名标记（主仓 spot-worker.ts:763） */
+export function isRecoveredRoundId(roundId: string): boolean {
+  return roundId.endsWith('-RCV');
 }
 
 function newStat(): SymbolStats {
   return {
     newRounds: 0, completedRounds: 0, buyFills: 0, sellFills: 0, orderFills: 0, crashEntered: 0,
     sellProfitCents: 0, roundProfitCents: 0,
-    completedRoundIds: new Set(), newRoundIds: new Set(),
+    ledger: new Map(), unmatchedCompletions: 0,
   };
 }
 
@@ -80,8 +108,15 @@ export function roundsAnalysis(): Analysis {
     async run(ctx: AnalysisContext): Promise<AnalysisResult> {
       const bySymbol = new Map<string, SymbolStats>();
       const worst: WorstRound[] = [];
-      /** 轮次身份键 → 该轮在窗口内第一次出现的时间 + 最近一次见到的完整 id（恢复改名后显示更贴近现状） */
-      const roundFirst = new Map<string, { symbol: string; displayId: string; firstMs: number }>();
+      /** 轮次账本（按币种分桶，键含实例与计数器） */
+      const ledgerOf = (s: SymbolStats, key: string): RoundOccurrence[] => {
+        let list = s.ledger.get(key);
+        if (!list) {
+          list = [];
+          s.ledger.set(key, list);
+        }
+        return list;
+      };
       /** 算"已运行时长"的参考时刻：窗口还没结束时用"此刻"，避免把未来的时间算进去 */
       const referenceMs = Math.min(ctx.window.toMs, ctx.now.getTime());
       const topN = Math.max(1, Math.min(50, Number(ctx.params.top ?? '5') || 5));
@@ -104,16 +139,21 @@ export function roundsAnalysis(): Analysis {
           const s = statOf(symbol);
           const roundId = e.roundId ?? strOf(e.data, 'roundId') ?? '';
           const ms = Date.parse(e.ts);
-          const roundKey = roundId === '' ? '' : roundKeyOf(e.instance, symbol, roundId);
-          if (roundKey !== '') {
-            const prev = roundFirst.get(roundKey);
-            if (!prev) roundFirst.set(roundKey, { symbol, displayId: roundId, firstMs: ms });
-            else prev.displayId = roundId; // 保留最近一次见到的完整 id
+          const ledgerKey = roundId === '' ? '' : roundLedgerKey(e.instance, symbol, roundId);
+          if (ledgerKey !== '') {
+            const list = ledgerOf(s, ledgerKey);
+            const last = list[list.length - 1];
+            if (e.event === 'NEW_ROUND') {
+              // 同一轮的重复 NEW_ROUND（同字符串）不新开记录；换了字符串就是另一轮（计数器复用/改名后重发）
+              if (!last || last.displayId !== roundId) list.push({ displayId: roundId, firstMs: ms, completed: false });
+            } else if (last && !last.completed) {
+              // 非开轮事件带新名字 ⇒ 只是这一轮改名了（如恢复后的 -RCV），跟着更新显示名
+              last.displayId = roundId;
+            }
           }
           switch (e.event) {
             case 'NEW_ROUND':
               s.newRounds++;
-              if (roundKey) s.newRoundIds.add(roundKey);
               break;
             case 'ROUND_FIRST_FILL':
               break; // 首单成交对"轮数/利润"没有独立贡献（BUY_FILLED 已计），只在需要时再加
@@ -134,7 +174,27 @@ export function roundsAnalysis(): Analysis {
               break;
             case 'ROUND_COMPLETED': {
               s.completedRounds++;
-              if (roundKey) s.completedRoundIds.add(roundKey);
+              if (ledgerKey !== '') {
+                const list = ledgerOf(s, ledgerKey);
+                // ① 精确匹配：同一计数器下最近一条**未完成**且字符串相同的记录
+                const exact = [...list].reverse().find((o) => !o.completed && o.displayId === roundId);
+                if (exact) {
+                  exact.completed = true;
+                } else if (isRecoveredRoundId(roundId)) {
+                  // ② 改名兜底：只认 `-RCV`（主仓 L763）。计数器会被复用/回绕，所以绝不无条件放宽
+                  const open = [...list].reverse().find((o) => !o.completed);
+                  if (open) {
+                    open.completed = true;
+                    open.displayId = roundId;
+                  } else {
+                    s.unmatchedCompletions++;
+                  }
+                } else {
+                  s.unmatchedCompletions++; // 完成事件没有对应的开轮记录（窗口前开的轮在本窗口完成）
+                }
+              } else {
+                s.unmatchedCompletions++;
+              }
               const profit = numOf(e.data, 'profit');
               if (profit !== null) s.roundProfitCents += cents(profit);
               const durationHours = numOf(e.data, 'durationHours');
@@ -182,21 +242,20 @@ export function roundsAnalysis(): Analysis {
       let totalRoundProfitCents = 0;
 
       for (const [symbol, s] of [...bySymbol.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
-        // 未完成轮：**带 roundId 与不带 roundId 的事件要分别算**（旧版本日志不带 roundId，跨版本窗口会混）
-        // 只走"集合分支"会漏掉"新轮带 id、完成轮不带 id"这一侧 ⇒ 未完成被少算（M2 review 的 Warning）
-        const idlessNew = Math.max(0, s.newRounds - s.newRoundIds.size);
-        const idlessCompleted = Math.max(0, s.completedRounds - s.completedRoundIds.size);
-        const unfinishedIds = [...s.newRoundIds].filter((id) => !s.completedRoundIds.has(id));
-        const unfinished = unfinishedIds.length + Math.max(0, idlessNew - idlessCompleted);
+        // 未完成轮 = 账本里"开过但没配上完成事件"的出现记录。
+        // NEW_ROUND 不带 roundId 的（旧版本日志）走计数差兜底：带 id 的新轮 = 账本记录数，
+        // 没配上开轮记录的完成事件 = 无 id 完成的 + 窗口前开、本窗口完成的。
+        const occurrences = [...s.ledger.values()].flat();
+        const openOccurrences = occurrences.filter((o) => !o.completed);
+        const idlessNew = Math.max(0, s.newRounds - occurrences.length);
+        const idlessCompleted = s.unmatchedCompletions;
+        const unfinished = openOccurrences.length + Math.max(0, idlessNew - idlessCompleted);
 
-        for (const key of unfinishedIds) {
-          const first = roundFirst.get(key);
+        for (const occ of openOccurrences) {
           // ⚠️ 参考时刻必须取 min(窗口结束, 此刻)：今天的窗口结束在**未来**，
           // 直接减窗口结束会报出一个还没发生过的时长（实测踩到：刚开 1 小时的轮显示"已运行 15.4h"）。
           // 再夹一层 0：注入时钟早于窗口时，负数时长比"0"更让人困惑
-          if (first) {
-            unfinishedAging.push({ symbol, roundId: first.displayId, ageHours: Math.max(0, referenceMs - first.firstMs) / 3_600_000 });
-          }
+          unfinishedAging.push({ symbol, roundId: occ.displayId, ageHours: Math.max(0, referenceMs - occ.firstMs) / 3_600_000 });
         }
 
         totalNew += s.newRounds;
