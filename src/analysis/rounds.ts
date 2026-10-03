@@ -33,6 +33,8 @@ interface SymbolStats {
   ledger: Map<string, RoundOccurrence[]>;
   /** 没配上开轮记录的完成事件数（窗口前开的轮在本窗口完成 / 没有 roundId） */
   unmatchedCompletions: number;
+  /** 其中来自 `R000-ERR-RCV` 这类**恢复错误态 id** 的条数（归因不可靠，要单独报出来） */
+  errorIdCompletions: number;
 }
 
 interface WorstRound {
@@ -81,16 +83,25 @@ export function roundLedgerKey(instance: string, symbol: string, roundId: string
   return `${instance}\u0000${symbol}\u0000${counterOfRoundId(roundId)}`;
 }
 
-/** 带仓重启的改名标记（主仓 spot-worker.ts:763） */
+/**
+ * 恢复抛异常时主仓会落地一个**常量** id `R000-ERR-RCV`（spot-worker.ts:723）：
+ * 它带 `-RCV` 但**不是改名** —— 计数器信息已经丢了（解析出来是假的 `R000`），
+ * 所以既不能拿它当改名证据去认领记录，也不能让计数器为 `R000` 的真轮被它抢走。
+ */
+export function isErrorRoundId(roundId: string): boolean {
+  return roundId.includes('-ERR-');
+}
+
+/** 带仓重启的改名标记（主仓 spot-worker.ts:763；错误态 id 除外） */
 export function isRecoveredRoundId(roundId: string): boolean {
-  return roundId.endsWith('-RCV');
+  return roundId.endsWith('-RCV') && !isErrorRoundId(roundId);
 }
 
 function newStat(): SymbolStats {
   return {
     newRounds: 0, completedRounds: 0, buyFills: 0, sellFills: 0, orderFills: 0, crashEntered: 0,
     sellProfitCents: 0, roundProfitCents: 0,
-    ledger: new Map(), unmatchedCompletions: 0,
+    ledger: new Map(), unmatchedCompletions: 0, errorIdCompletions: 0,
   };
 }
 
@@ -194,6 +205,7 @@ export function roundsAnalysis(): Analysis {
                   }
                 } else {
                   s.unmatchedCompletions++; // 完成事件没有对应的开轮记录（窗口前开的轮在本窗口完成）
+                  if (isErrorRoundId(roundId)) s.errorIdCompletions++;
                 }
               } else {
                 s.unmatchedCompletions++;
@@ -235,6 +247,15 @@ export function roundsAnalysis(): Analysis {
         );
       }
       if (events === 0) warnings.push('窗口内没有任何轮次/成交类事件');
+
+      // 恢复错误态 id 单独报：这类完成事件归因不可靠，必须让人看见"未完成列可能多算"
+      const errorIdCompletions = [...bySymbol.values()].reduce((n, s) => n + s.errorIdCompletions, 0);
+      if (errorIdCompletions > 0) {
+        warnings.push(
+          `有 ${errorIdCompletions} 条完成事件的轮次 id 是**恢复错误态**（R000-ERR-RCV）—— 主仓在启动恢复抛异常时会把轮次 id 落成这个常量，` +
+            '计数器信息已丢失、无法与开轮记录配对 ⇒ "未完成"列可能多算，这些轮也不参与"最长卡轮"',
+        );
+      }
 
       const rows: string[][] = [];
       const unfinishedAging: Array<{ symbol: string; roundId: string; ageHours: number }> = [];

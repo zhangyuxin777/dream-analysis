@@ -249,6 +249,29 @@ test('counterOfRoundId / isRecoveredRoundId：改名标记与计数器的解析'
   assert.equal(isRecoveredRoundId('R001'), false);
 });
 
+test('恢复错误态 id（R000-ERR-RCV）带 -RCV 但不是改名：不许认领，且要报出来', async () => {
+  const events = [
+    ev('2026-10-01T01:00:00.000Z', 'NEW_ROUND', 'ETHFDUSD', {}, 'R596-190959'),
+    ev('2026-10-01T02:00:00.000Z', 'ROUND_COMPLETED', 'ETHFDUSD', { profit: 1, durationHours: 1 }, 'R000-ERR-RCV'),
+  ];
+  const result = await run(events);
+  const row = rowOf(result, 'ETHFDUSD');
+  assert.equal(row[2], '1', '完成数照记（它是条完成事件）');
+  assert.equal(row[3], '1', '不许认领：错误态 id 的计数器信息已丢，归因不可靠');
+  const warning = result.warnings.join('\n');
+  assert.match(warning, /恢复错误态/);
+  assert.match(warning, /计数器信息已丢失/);
+});
+
+test('isRecoveredRoundId / isErrorRoundId：错误态 id 不算改名', () => {
+  const { isRecoveredRoundId, isErrorRoundId } = require('../../../dist/analysis/rounds');
+  assert.equal(isRecoveredRoundId('R596-191307-RCV'), true, '带仓重启的改名');
+  assert.equal(isRecoveredRoundId('R000-ERR-RCV'), false, '恢复抛异常落的常量 id，不是改名');
+  assert.equal(isRecoveredRoundId('R596-190959'), false);
+  assert.equal(isErrorRoundId('R000-ERR-RCV'), true);
+  assert.equal(isErrorRoundId('R596-191307-RCV'), false);
+});
+
 test('分片读不出来 / 带数据告警时，轮数结论必须打折说明', async () => {
   const result = await run(SCENARIO, {
     failedShards: [{ key: 'snapshot/a/2026-09-30.jsonl.gz', errors: ['文件不存在'] }],
