@@ -185,6 +185,13 @@ export function healthAnalysis(): Analysis {
         .filter(([name]) => !ECHO_EVENT_RE.test(name))
         .sort(byCountThenName)
         .slice(0, 15);
+      // 折叠行里要**列出成员名**：否则"深跌保护被关掉（WORKER_CONFIG_CRASH_DISABLED）"这类
+      // 真状态变更会被一句"N 类共 M 条"彻底抹掉（review 指出的可观察风险）
+      const echoMembers = echoEntries
+        .sort(byCountThenName)
+        .slice(0, 4)
+        .map(([name, n]) => `${name.replace(/^WORKER_/, '')} ${n}`)
+        .join(' / ');
 
       // 0 事件时不要推一个只有表头的空表（"窗口内没有事件"已经在 summary 里说了）
       if (topBusiness.length > 0 || echoTotal > 0) {
@@ -194,7 +201,9 @@ export function healthAnalysis(): Analysis {
           note: '配置回显类（WORKER_CONFIG_*/WORKER_ENV_*）只在**展示层**折叠成一行；原始行仍在分片里，参数溯源与崩溃环排查用它。',
           rows: [
             ...topBusiness.map(([name, n]) => [name, String(n)]),
-            ...(echoTotal > 0 ? [[`（配置回显 ${echoFamilies} 类共 ${echoTotal} 条已折叠）`, String(echoTotal)]] : []),
+            ...(echoTotal > 0
+              ? [[`（配置回显 ${echoFamilies} 类共 ${echoTotal} 条已折叠：${echoMembers}${echoFamilies > 4 ? ' …' : ''}）`, String(echoTotal)]]
+              : []),
           ],
         });
       }

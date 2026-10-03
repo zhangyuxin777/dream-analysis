@@ -41,6 +41,23 @@ interface WorstRound {
   crash: boolean;
 }
 
+/**
+ * 轮次身份键 = **实例 + 币种 + 计数器**（不是整个 roundId 字符串）。
+ *
+ * 两条都是隔夜真分片里**实测到**的（不是推演）：
+ * ① `roundId` 只在 (实例, 币种) 内唯一 —— 计数器各币种独立从 1 起（真数据：BTC=168…、XRP=595…、ETH=001…），
+ *    所以同一实例里两个币种、或两个实例的同名币种，完全可能撞上同一个字符串；
+ *    只按 roundId 建键会让后出现的轮套用别人的首现时刻 ⇒ "已运行时长"错、Top-N 被顶掉。
+ * ② 带仓重启会给同一轮**换后缀**：真分片里 counter=596 的轮，`NEW_ROUND` 是 `R596-190959`，
+ *    而同轮的 `ROUND_FIRST_FILL` 已经是 `R596-191307-RCV`（counter 不变、时间后缀变了）。
+ *    按整串比 ⇒ 该轮永远配不上 `ROUND_COMPLETED`，未完成列永久 +1 且凭空多一行 aging。
+ * 计数器在 (实例, 币种) 内随轮递增，所以"计数器"是这一层里稳定的身份。
+ */
+export function roundKeyOf(instance: string, symbol: string, roundId: string): string {
+  const counter = roundId.split('-')[0] ?? roundId;
+  return `${instance}\u0000${symbol}\u0000${counter}`;
+}
+
 function newStat(): SymbolStats {
   return {
     newRounds: 0, completedRounds: 0, buyFills: 0, sellFills: 0, orderFills: 0, crashEntered: 0,
@@ -63,8 +80,8 @@ export function roundsAnalysis(): Analysis {
     async run(ctx: AnalysisContext): Promise<AnalysisResult> {
       const bySymbol = new Map<string, SymbolStats>();
       const worst: WorstRound[] = [];
-      /** roundId → 该轮在窗口内第一次出现的时间（用于算"还在开的轮已经跑了多久"） */
-      const roundFirst = new Map<string, { symbol: string; firstMs: number }>();
+      /** 轮次身份键 → 该轮在窗口内第一次出现的时间 + 最近一次见到的完整 id（恢复改名后显示更贴近现状） */
+      const roundFirst = new Map<string, { symbol: string; displayId: string; firstMs: number }>();
       /** 算"已运行时长"的参考时刻：窗口还没结束时用"此刻"，避免把未来的时间算进去 */
       const referenceMs = Math.min(ctx.window.toMs, ctx.now.getTime());
       const topN = Math.max(1, Math.min(50, Number(ctx.params.top ?? '5') || 5));
@@ -87,11 +104,16 @@ export function roundsAnalysis(): Analysis {
           const s = statOf(symbol);
           const roundId = e.roundId ?? strOf(e.data, 'roundId') ?? '';
           const ms = Date.parse(e.ts);
-          if (roundId !== '' && !roundFirst.has(roundId)) roundFirst.set(roundId, { symbol, firstMs: ms });
+          const roundKey = roundId === '' ? '' : roundKeyOf(e.instance, symbol, roundId);
+          if (roundKey !== '') {
+            const prev = roundFirst.get(roundKey);
+            if (!prev) roundFirst.set(roundKey, { symbol, displayId: roundId, firstMs: ms });
+            else prev.displayId = roundId; // 保留最近一次见到的完整 id
+          }
           switch (e.event) {
             case 'NEW_ROUND':
               s.newRounds++;
-              if (roundId) s.newRoundIds.add(roundId);
+              if (roundKey) s.newRoundIds.add(roundKey);
               break;
             case 'ROUND_FIRST_FILL':
               break; // 首单成交对"轮数/利润"没有独立贡献（BUY_FILLED 已计），只在需要时再加
@@ -112,7 +134,7 @@ export function roundsAnalysis(): Analysis {
               break;
             case 'ROUND_COMPLETED': {
               s.completedRounds++;
-              if (roundId) s.completedRoundIds.add(roundId);
+              if (roundKey) s.completedRoundIds.add(roundKey);
               const profit = numOf(e.data, 'profit');
               if (profit !== null) s.roundProfitCents += cents(profit);
               const durationHours = numOf(e.data, 'durationHours');
@@ -167,13 +189,13 @@ export function roundsAnalysis(): Analysis {
         const unfinishedIds = [...s.newRoundIds].filter((id) => !s.completedRoundIds.has(id));
         const unfinished = unfinishedIds.length + Math.max(0, idlessNew - idlessCompleted);
 
-        for (const id of unfinishedIds) {
-          const first = roundFirst.get(id);
+        for (const key of unfinishedIds) {
+          const first = roundFirst.get(key);
           // ⚠️ 参考时刻必须取 min(窗口结束, 此刻)：今天的窗口结束在**未来**，
           // 直接减窗口结束会报出一个还没发生过的时长（实测踩到：刚开 1 小时的轮显示"已运行 15.4h"）。
           // 再夹一层 0：注入时钟早于窗口时，负数时长比"0"更让人困惑
           if (first) {
-            unfinishedAging.push({ symbol, roundId: id, ageHours: Math.max(0, referenceMs - first.firstMs) / 3_600_000 });
+            unfinishedAging.push({ symbol, roundId: first.displayId, ageHours: Math.max(0, referenceMs - first.firstMs) / 3_600_000 });
           }
         }
 

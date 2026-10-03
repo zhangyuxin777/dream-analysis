@@ -159,6 +159,40 @@ test('窗口还没结束时，"已运行"按**此刻**算（不能把还没发�
   assert.match(aging.note, /按"此刻"算/);
 });
 
+test('★真数据实测：带仓重启会给同一轮换后缀（R596-190959 → R596-191307-RCV），不能被算成"永远未完成"', async () => {
+  const events = [
+    ev('2026-10-01T01:00:00.000Z', 'NEW_ROUND', 'XRPFDUSD', {}, 'R596-190959'),
+    ev('2026-10-01T01:13:07.000Z', 'ROUND_FIRST_FILL', 'XRPFDUSD', {}, 'R596-191307-RCV'), // 同 counter，后缀变了
+    ev('2026-10-01T02:00:00.000Z', 'ROUND_COMPLETED', 'XRPFDUSD', { profit: 1, durationHours: 1 }, 'R596-191307-RCV'),
+    ev('2026-10-01T03:00:00.000Z', 'NEW_ROUND', 'XRPFDUSD', {}, 'R597-030000'), // 真在开着的轮
+  ];
+  const result = await run(events);
+  const row = rowOf(result, 'XRPFDUSD');
+  assert.equal(row[1], '2', '新轮 2');
+  assert.equal(row[2], '1', '完成 1（按 counter 认出来了，不能被改名骗过）');
+  assert.equal(row[3], '1', '未完成 1 —— 只有 R597 真在开；按整串比会算成 2');
+
+  const aging = result.sections.find((s) => s.heading.startsWith('未完成轮'));
+  assert.equal(aging.rows.length, 1, '被骗过的话这里会凭空多一行已经结束的轮');
+  assert.match(aging.rows[0][1], /R597/);
+});
+
+test('★真数据实测：roundId 只在 (实例,币种) 内唯一 —— 跨币种撞名不能互相污染', async () => {
+  const hour = 3_600_000;
+  const t0 = Date.parse('2026-10-01T00:00:00.000Z');
+  // 同一实例两个币种的计数器都从 1 起 ⇒ 字符串完全同名（真数据里 BTC=168…/XRP=595…/ETH=001…，各自独立计数）
+  const events = [
+    { ...ev(new Date(t0).toISOString(), 'NEW_ROUND', 'ETHFDUSD', {}, 'R001-000000'), instance: 'a' },
+    { ...ev(new Date(t0 + 8 * hour).toISOString(), 'NEW_ROUND', 'BTCFDUSD', {}, 'R001-000000'), instance: 'a' },
+  ];
+  const result = await run(events, {}, { window: '2026-10-01' });
+  const aging = result.sections.find((s) => s.heading.startsWith('未完成轮'));
+  const eth = aging.rows.find((r) => r[0] === 'ETHFDUSD');
+  const btc = aging.rows.find((r) => r[0] === 'BTCFDUSD');
+  assert.ok(eth && btc, '两个币种各一行：' + JSON.stringify(aging.rows));
+  assert.notEqual(eth[2], btc[2], '只按 roundId 建键时，后出现的轮会套用别人的首现时刻（两条时长会相同）');
+});
+
 test('分片读不出来 / 带数据告警时，轮数结论必须打折说明', async () => {
   const result = await run(SCENARIO, {
     failedShards: [{ key: 'snapshot/a/2026-09-30.jsonl.gz', errors: ['文件不存在'] }],

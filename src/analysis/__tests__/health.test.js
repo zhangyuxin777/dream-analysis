@@ -150,6 +150,8 @@ test('配置回显只在展示层折叠：Top-N 让给业务事件，回显合�
   assert.ok(folded, '必须有折叠汇总行：' + JSON.stringify(top.rows));
   assert.equal(folded[1], '9', '8 条 WORKER_CONFIG_* + 1 条 WORKER_ENV_*');
   assert.match(folded[0], /2 类共 9 条/);
+  assert.match(folded[0], /CONFIG_DEVIATION 8/, '折叠行要列出成员名，"深跌保护被关掉"这类真状态变更不能被一句"N 类共 M 条"抹掉');
+  assert.match(folded[0], /ENV_PRODUCTION 1/);
   assert.match(top.note, /原始行仍在分片里/, '必须说明只是展示折叠，数据一行没少');
 
   // 折叠不影响任何计数：总事件数 / 异常数 / symbol 分布都照旧
