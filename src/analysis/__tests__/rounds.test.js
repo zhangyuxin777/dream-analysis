@@ -148,9 +148,9 @@ test('未完成轮也要能看出"卡了多久"（只看已结束的轮会把"�
   assert.deepEqual(aging.rows[0].slice(0, 3), ['ETHFDUSD', 'R001', '15.0']);
   assert.equal(aging.rows[0][3], '否', '全程没有买入成交 ⇒ 未建仓');
   assert.equal(aging.rows[0][4], '-', '没有买入时间戳就不编造"末笔买入后"');
-  assert.equal(aging.rows[0][5], '窗口内最新');
+  assert.equal(aging.rows[0][5], '本窗口内未见收口');
   assert.deepEqual(aging.rows[1].slice(0, 2), ['BTCFDUSD', 'R002']);
-  assert.match(aging.note, /已运行 = 窗口结束 −/);
+  assert.match(aging.note, /否则算到窗口结束/);
 });
 
 test('窗口还没结束时，"已运行"按**此刻**算（不能把还没发生的时间算进去）', async () => {
@@ -159,7 +159,7 @@ test('窗口还没结束时，"已运行"按**此刻**算（不能把还没发�
   const result = await run(events, {}, { window: '2026-10-02' });
   const aging = result.sections.find((s) => s.heading.startsWith('未完成轮'));
   assert.deepEqual(aging.rows[0].slice(0, 3), ['ETHFDUSD', 'R001', '11.0'], '按窗口结束算会得到 15.0h —— 那是未来时间');
-  assert.match(aging.note, /按"此刻"算/);
+  assert.match(aging.note, /否则算到此刻/);
 });
 
 test('★真数据实测：带仓重启会给同一轮换后缀（R596-190959 → R596-191307-RCV），不能被算成"永远未完成"', async () => {
@@ -297,8 +297,30 @@ test('★真数据（R004 形态）：零成交、被偏离复位掐断的轮**�
   assert.ok(r004, '零成交的轮也要列出来（它是"没接到货"，不是卡单，不能藏）');
   assert.equal(r004[3], '否', '没成交 ⇒ 未建仓');
   assert.match(r004[5], /复位掐断\(PRICE_DEVIATION\)/, '要从 RESET_CANCEL_SUCCESS.reason 认出掐断，不能只说"未完成"');
+  // 存活时长必须算到**复位那一刻**（08:37 开轮 → 17:03 掐断 = 8.4h），不能算到窗口结束（那会得 15.4h，
+  // 而且窗口开得越长这个数字越虚高 —— 正是老版本把 R004 顶上第一名的那一列）
+  assert.equal(r004[2], '8.4', '掐断型轮的存活 = 到复位那一刻');
   assert.match(aging.heading, /已建仓的在前/);
   assert.match(aging.note, /空等\/被复位掐断/);
+  assert.match(aging.note, /不等于"现在还在开"/, '措辞必须留余地：窗口外的事件本窗口看不见');
+});
+
+test('★开轮不在窗口内的轮：不假装"已建仓=否"，而是计数 + 出告警', async () => {
+  const ev2 = (ts, event, symbol, data, roundId) => ({ ts, event, symbol, roundId, instance: 'a', localDate: ts.slice(0, 10), seq: 1, data });
+  const events = [
+    // 这一轮的 NEW_ROUND 在窗口之前（短窗口把它切成了两半）
+    ev2('2026-10-01T05:00:00.000Z', 'BUY_FILLED', 'ETHFDUSD', { index: 0 }, 'R009-010000'),
+    ev2('2026-10-01T06:00:00.000Z', 'SELL_FILLED', 'ETHFDUSD', { profit: 1 }, 'R009-010000'),
+    // 窗口内的正常一轮，保证有内容可看
+    ev2('2026-10-01T08:00:00.000Z', 'NEW_ROUND', 'ETHFDUSD', {}, 'R010-080000'),
+  ];
+  const result = await run(events, {}, { window: '2026-10-01' });
+  const warning = result.warnings.join('\n');
+  assert.match(warning, /2 条成交\/复位事件属于\*\*开轮不在本窗口\*\*的轮/);
+  assert.match(warning, /偏低甚至显示为否/);
+  // 不许因为这些孤儿事件改变窗口内的轮次计数
+  const row = rowOf(result, 'ETHFDUSD');
+  assert.equal(row[1], '1', '新轮只算窗口内的那一条');
 });
 
 test('★补仓时长：已结束的轮要能看出"慢在补仓还是慢在等"', async () => {

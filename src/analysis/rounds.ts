@@ -35,6 +35,8 @@ interface SymbolStats {
   unmatchedCompletions: number;
   /** 其中来自 `R000-ERR-RCV` 这类**恢复错误态 id** 的条数（归因不可靠，要单独报出来） */
   errorIdCompletions: number;
+  /** 属于"开轮不在本窗口"的轮的成交/复位事件数（这些轮看不到起点与建仓，列会偏低） */
+  orphanEvents: number;
 }
 
 interface WorstRound {
@@ -80,6 +82,12 @@ export interface RoundOccurrence {
   lastBuyMs: number | null;
   /** 复位原因（`RESET_CANCEL_SUCCESS.reason`；`SELL_FILLED` = 正常卖出，其余如 `PRICE_DEVIATION` = 掐断重开） */
   resetReason: string | null;
+  /** 复位事件的时间（掐断型轮的"存活时长"要算到这一刻，不能算到窗口结束 —— 否则窗口越长数字越大） */
+  resetMs: number | null;
+  /** 是否"窗口内最新"（窗口外有没有更新的轮，本窗口看不见，所以措辞必须留余地） */
+  newestInWindow?: boolean;
+  /** 该轮的存活时长（小时）：掐断 → 到复位那一刻；被取代 → 到下一轮开轮；否则 → 到参考时刻 */
+  aliveHours?: number;
 }
 
 /** 计数器：`R596-190959` / `R596-191307-RCV` → `R596` */
@@ -120,19 +128,23 @@ function groupByInstance(occurrences: RoundOccurrence[]): Map<string, RoundOccur
 /**
  * 未收口轮的结局 —— 全部来自观测，不猜：
  * - `复位掐断(<reason>)`：这一轮收到过 `RESET_CANCEL_SUCCESS` 且原因不是正常卖出（如 `PRICE_DEVIATION`）
- * - `窗口内最新`：它是该 (实例,币种) 在**本窗口内**最后出现的轮（窗口外的状态要看批二的 stuck 视图）
- * - `已被新轮取代`：它后面又开了一轮 ⇒ 它已经以某种方式结束了（正常卖出完成事件缺失 / 被复位掐断）
+ * - `本窗口内未见收口`：它是该 (实例,币种) 在**本窗口内**最后出现的轮。
+ *   ⚠️ 这个措辞是刻意的：**不等于"现在还在开"** —— 窗口之外的复位/完成事件本窗口看不见。
+ * - `已被新轮取代`：它后面又开了一轮 ⇒ 它已经以某种方式结束了（完成事件缺失 / 被复位掐断）
  */
-export function outcomeOf(occ: RoundOccurrence, newest: Set<RoundOccurrence>): string {
+export function outcomeOf(occ: RoundOccurrence): string {
   if (occ.resetReason !== null && occ.resetReason !== 'SELL_FILLED') return `复位掐断(${occ.resetReason})`;
-  return newest.has(occ) ? '窗口内最新' : '已被新轮取代';
+  return occ.newestInWindow ? '本窗口内未见收口' : '已被新轮取代';
 }
+
+/** 与"仓位"直接相关的事件：只有它们才需要挂到某一轮上（其余如 ATR/配置类事件不参与账本） */
+const POSITION_EVENTS = new Set(['BUY_FILLED', 'SELL_FILLED', 'ROUND_FIRST_FILL', 'RESET_CANCEL_SUCCESS']);
 
 function newStat(): SymbolStats {
   return {
     newRounds: 0, completedRounds: 0, buyFills: 0, sellFills: 0, orderFills: 0, crashEntered: 0,
     sellProfitCents: 0, roundProfitCents: 0,
-    ledger: new Map(), unmatchedCompletions: 0, errorIdCompletions: 0,
+    ledger: new Map(), unmatchedCompletions: 0, errorIdCompletions: 0, orphanEvents: 0,
   };
 }
 
@@ -194,7 +206,7 @@ export function roundsAnalysis(): Analysis {
               // 同一轮的重复 NEW_ROUND（同字符串）不新开记录；换了字符串就是另一轮（计数器复用/改名后重发）
               const last = list[list.length - 1];
               if (!last || last.displayId !== roundId) {
-                list.push({ displayId: roundId, instance: e.instance, firstMs: ms, completed: false, firstBuyMs: null, lastBuyMs: null, resetReason: null });
+                list.push({ displayId: roundId, instance: e.instance, firstMs: ms, completed: false, firstBuyMs: null, lastBuyMs: null, resetReason: null, resetMs: null });
               }
             } else if (e.event !== 'ROUND_COMPLETED') {
               // ⚠️ 只让**非完成**事件更新显示名（如恢复后的 ROUND_FIRST_FILL 带 -RCV）。
@@ -209,7 +221,12 @@ export function roundsAnalysis(): Analysis {
                   occ.lastBuyMs = ms;
                 } else if (e.event === 'RESET_CANCEL_SUCCESS') {
                   occ.resetReason = strOf(e.data, 'reason'); // SELL_FILLED = 正常卖出；PRICE_DEVIATION = 掐断重开
+                  occ.resetMs = ms;
                 }
+              } else if (POSITION_EVENTS.has(e.event)) {
+                // 这一轮的 NEW_ROUND 不在本窗口（短窗口每轮都会被切一刀）⇒ 这些成交/复位事件无处安放。
+                // 不许假装它"已建仓=否"：只计数 + 出告警，把"这两列会偏低"说清楚
+                s.orphanEvents++;
               }
             }
           }
@@ -304,6 +321,15 @@ export function roundsAnalysis(): Analysis {
       }
       if (events === 0) warnings.push('窗口内没有任何轮次/成交类事件');
 
+      // 开轮不在本窗口的轮：它们的成交挂不到账本上 ⇒ "已建仓/存活"会偏低，必须说出来
+      const orphans = [...bySymbol.values()].reduce((n, s) => n + s.orphanEvents, 0);
+      if (orphans > 0) {
+        warnings.push(
+          `有 ${orphans} 条成交/复位事件属于**开轮不在本窗口**的轮（窗口把这一轮切成了两半）` +
+            ' ⇒ 下面"已建仓/末笔买入后"对这些轮会偏低甚至显示为否；把窗口开长一点，或等批二的 stuck 视图（跨窗口）',
+        );
+      }
+
       // 恢复错误态 id 单独报：这类完成事件归因不可靠，必须让人看见"未完成列可能多算"
       const errorIdCompletions = [...bySymbol.values()].reduce((n, s) => n + s.errorIdCompletions, 0);
       if (errorIdCompletions > 0) {
@@ -336,11 +362,20 @@ export function roundsAnalysis(): Analysis {
         // 没配上开轮记录的完成事件 = 无 id 完成的 + 窗口前开、本窗口完成的。
         const occurrences = [...s.ledger.values()].flat();
         const openOccurrences = occurrences.filter((o) => !o.completed);
-        // "窗口内最新"必须按 (实例,币种) 判：同一 symbol 下不同实例的轮次时间不可比
-        const newestOccurrences = new Set<RoundOccurrence>();
+        // "窗口内最新"必须按 (实例,币种) 判：同一 symbol 下不同实例的轮次时间不可比。
+        // 同时把"存活到哪一刻"定下来：掐断 → 复位那一刻；被下一轮取代 → 下一轮开轮那一刻；
+        // 否则 → 参考时刻。**不能一律算到参考时刻** —— 那会让"掐断型轮"的时长随查询窗口无限虚高
+        // （真数据 R004：开轮 08:37、17:03 被 PRICE_DEVIATION 掐断，算到窗口结束是 15.4h，实际只活了 8.4h）。
         for (const list of groupByInstance(occurrences).values()) {
           const sorted = [...list].sort((a, b) => a.firstMs - b.firstMs);
-          if (sorted.length > 0) newestOccurrences.add(sorted[sorted.length - 1]);
+          for (let i = 0; i < sorted.length; i++) {
+            const occ = sorted[i];
+            const nextMs = i + 1 < sorted.length ? sorted[i + 1].firstMs : null;
+            occ.newestInWindow = nextMs === null;
+            const cutMs = occ.resetReason !== null && occ.resetReason !== 'SELL_FILLED' ? occ.resetMs : null;
+            const endMs = cutMs ?? nextMs ?? referenceMs;
+            occ.aliveHours = Math.max(0, endMs - occ.firstMs) / 3_600_000;
+          }
         }
         const idlessNew = Math.max(0, s.newRounds - occurrences.length);
         const idlessCompleted = s.unmatchedCompletions;
@@ -356,10 +391,10 @@ export function roundsAnalysis(): Analysis {
           unfinishedAging.push({
             symbol,
             roundId: occ.displayId,
-            ageHours: Math.max(0, referenceMs - occ.firstMs) / 3_600_000,
+            ageHours: occ.aliveHours ?? 0,
             hasPosition: occ.firstBuyMs !== null,
             lastBuyHours: occ.lastBuyMs === null ? null : Math.max(0, referenceMs - occ.lastBuyMs) / 3_600_000,
-            outcome: outcomeOf(occ, newestOccurrences),
+            outcome: outcomeOf(occ),
           });
         }
 
@@ -430,7 +465,7 @@ export function roundsAnalysis(): Analysis {
         const referenceLabel = ctx.window.toMs > ctx.now.getTime() ? '此刻' : '窗口结束';
         sections.push({
           heading: `未完成轮 Top ${agingSorted.length}（已建仓的在前）`,
-          headers: ['币种', '轮次', '已运行(h)', '已建仓', '末笔买入后(h)', '结局'],
+          headers: ['币种', '轮次', '存活(h)', '已建仓', '末笔买入后(h)', '结局'],
           rows: agingSorted.map((a) => [
             a.symbol,
             a.roundId,
@@ -439,9 +474,11 @@ export function roundsAnalysis(): Analysis {
             a.lastBuyHours === null ? '-' : a.lastBuyHours.toFixed(1),
             a.outcome,
           ]),
-          note: `已运行 = ${referenceLabel} − 该轮在窗口内的首条事件（窗口还没结束时按"此刻"算，不把未来时间算进去）；`
+          note: `存活 = 从开轮算到"结束那一刻"（复位掐断的算到复位、被下一轮取代的算到下一轮开轮，`
+            + `${referenceLabel === '此刻' ? '否则算到此刻' : '否则算到窗口结束'}）；`
             + '已建仓（有无买入成交）才是"卡"的前提 —— "否"表示这一轮一直没等到买单成交（空等/被复位掐断），不是持仓卡住。'
-            + ' 末笔买入后 = 建完仓又等了多久（更接近"卡了多久"）。结局的"窗口内最新"只覆盖本窗口，跨窗口的现状见 stuck 视图（批二）。',
+            + ' 末笔买入后 = 建完仓又等了多久（更接近"卡了多久"）。'
+            + ' 结局的"本窗口内未见收口"**不等于"现在还在开"**：窗口外的事件本窗口看不见（跨窗口现状见批二 stuck 视图）。',
         });
       }
 

@@ -250,6 +250,7 @@ async function syncOnce(deps: PullDeps, opts: { force?: boolean }): Promise<Pull
     bytes: result.bytes,
     errors: result.failed.map((f) => `${f.key}: ${f.error}`),
     deferred: result.deferred.length,
+    pruned: result.pruned.length,
     whitelistChanges: result.whitelistChanges,
   };
   saveState(statePath, state);

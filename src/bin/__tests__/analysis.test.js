@@ -137,6 +137,10 @@ test('cmdList：标出"已同步 / 远端已变 / 不符合契约"三种状态',
   const state = emptyState();
   state.objects[synced] = { etag: store.metas[0].etag, size: 1, dataLines: 1, final: true, pulledAt: 'x', warnings: [] };
   state.objects[changed] = { etag: 'OLD', size: 1, dataLines: 1, final: false, pulledAt: 'x', warnings: [] };
+  // 已淘汰的对象：不能标成"· 本地没有"（那会让人以为下次会拉；其实永远不会再拉）
+  const prunedKey = 'snapshot/boye888/2019-12-31.jsonl.gz';
+  store.metas.push({ key: prunedKey, etag: 'E-OLD', size: 5, lastModified: '', lastModifiedMs: null });
+  state.pruned[prunedKey] = { etag: 'E-OLD', prunedAt: '2026-10-04T00:00:00.000Z' };
   saveState(statePathOf(env.config), state);
 
   const { code, out } = await capture(() => cli.cmdList({ config: env.config, logger: env.logger, store }));
@@ -144,6 +148,8 @@ test('cmdList：标出"已同步 / 远端已变 / 不符合契约"三种状态',
   assert.match(out, /✓ 已同步/);
   assert.match(out, /↻ 远端已变/);
   assert.match(out, /✗ 不符合契约/);
+  assert.match(out, /🗑 已淘汰（不再拉，除非翻新）/);
+  assert.ok(!/· 本地没有\s+snapshot\/boye888\/2019-12-31/.test(out), '已淘汰的不能显示成"本地没有"');
 });
 
 test('cmdVerify：合法分片 → 0 并打印契约核对要素（行数/事件分布/连接类事件）', async () => {

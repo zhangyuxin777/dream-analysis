@@ -67,6 +67,8 @@ export interface RunSummary {
   whitelistChanges?: string[];
   /** 本轮是否因为"另一个同步正在进行"而整体跳过 */
   refusedByLock?: boolean;
+  /** 本轮淘汰掉的本地分片数（持久化下来，status 才看得出"最近还在不在淘汰"） */
+  pruned?: number;
 }
 
 export interface SyncState {
@@ -204,10 +206,13 @@ export function planPull(metas: ObjectMeta[], state: SyncState, opts: PlanOption
     }
     if (known && known.etag !== meta.etag) plan.recomputed.push(meta.key);
 
-    // 已淘汰过的（本地按保留期删掉了、但桶里还在）：同 ETag 就**永远 skip**，
-    // 否则会变成"下载 → 淘汰 → 再下载"的每小时循环（墓碑见 PrunedTombstone 注释）
+    // 已淘汰过的（本地按保留期删掉了、但桶里还在）：**一律 skip**，否则会变成
+    // "下载 → 淘汰 → 再下载"的每小时循环（墓碑见 PrunedTombstone 注释）。
+    // ⚠️ 空 ETag 也必须 skip：那是"淘汰时没有水位线"（状态文件丢失/损坏后仍留在盘上的老文件），
+    //    如果这里放行，桶里那份老对象每一轮都会被重新下载再淘汰 —— 正是本次要修的缺陷原地复活。
+    //    淘汰本来就是"按年龄不再需要本地保留"的决定，不是"内容不可信"的拉黑；要找回用 `sync --force`。
     const tombstone = state.pruned?.[meta.key];
-    if (tombstone && !opts.force && tombstone.etag !== '' && tombstone.etag === meta.etag) {
+    if (tombstone && !opts.force) {
       plan.skipped.push({ key: meta.key, reason: 'pruned' });
       continue;
     }

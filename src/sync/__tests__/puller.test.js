@@ -338,6 +338,29 @@ test('★淘汰墓碑：ETag 变了（上传侧重算）仍然要重拉 —— �
   assert.deepEqual(after.pulled, [key]);
 });
 
+test('★P5 Critical：淘汰时没有水位线（状态文件丢过）⇒ 墓碑 ETag 为空，也必须挡住重拉', async () => {
+  const env = makeEnv();
+  const key = 'snapshot/boye888/2020-01-01.jsonl.gz';
+  const store = new FakeStore({}); // 远端此刻没有这个对象（模拟"状态丢了、远端也查不到"）
+  env.config.sync.retentionDays = 2; // 2 天：2020 那份该淘汰，10-02 那份留着（"至少留一份"的底线不能兜住它）
+  for (const [inst, date] of [['boye888', '2020-01-01'], ['boye888', '2026-10-02']]) {
+    const p = shardPathOf(env.config, inst, date);
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, shardBuffer(inst, date, okEvents));
+  }
+
+  const first = await runSync({ store, config: env.config, logger: env.logger, now: env.now });
+  assert.deepEqual(first.pruned.map((x) => path.basename(x)), ['2020-01-01.jsonl.gz']);
+  assert.equal(loadState(statePathOf(env.config)).state.pruned[key].etag, '', '淘汰时没有水位线 ⇒ 墓碑 ETag 为空');
+
+  // 远端对象后来出现了（又被上传/重算过）：**不许**重新下载再淘汰
+  store.contents[key] = shardBuffer('boye888', '2020-01-01', okEvents);
+  store.metas.push(store.metaOf(key, 'E-NEW'));
+  const second = await runSync({ store, config: env.config, logger: env.logger, now: env.now });
+  assert.deepEqual(second.pulled, [], '空 ETag 的墓碑也必须挡住重拉（否则就是"拉了又删"的循环）');
+  assert.equal(second.skipped, 1);
+});
+
 test('状态文件损坏时不崩：按空状态重拉，并带 warning 返回', async () => {
   const env = makeEnv();
   const key = 'snapshot/boye888/2026-10-02.jsonl.gz';

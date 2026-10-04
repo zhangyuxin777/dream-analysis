@@ -159,6 +159,24 @@ test('★淘汰墓碑：saveState/loadState 往返一致；老状态文件（没
   assert.deepEqual(emptyState(), { version: 1, objects: {}, suspects: {}, pruned: {}, lastRun: null });
 });
 
+test('★planPull：淘汰墓碑一律 skip（含"淘汰时没有水位线"的空 ETag 场景）；force 才放行', () => {
+  const state = emptyState();
+  const key = 'snapshot/a/2020-01-01.jsonl.gz';
+  state.pruned[key] = { etag: '', prunedAt: '2026-10-04T00:00:00.000Z' }; // 状态文件丢过 ⇒ 淘汰时不知道 ETag
+  const meta = [{ key, etag: 'E-ANY', size: 10, lastModified: '', lastModifiedMs: Date.parse('2020-01-01T00:00:00Z') }];
+
+  const plan = planPull(meta, state, { prefix: 'snapshot/', minAgeSeconds: 60, now: NOW });
+  assert.deepEqual(plan.toPull, [], '空 ETag 的墓碑放行 ⇒ 桶里那份老对象每轮都会被重下再淘汰（循环原地复活）');
+  assert.deepEqual(plan.skipped, [{ key, reason: 'pruned' }]);
+
+  const forced = planPull(meta, state, { prefix: 'snapshot/', minAgeSeconds: 60, now: NOW, force: true });
+  assert.deepEqual(forced.toPull.map((m) => m.key), [key], 'force 是找回历史（重新下载）的出口');
+
+  const known = emptyState();
+  known.pruned[key] = { etag: 'E-ANY', prunedAt: '2026-10-04T00:00:00.000Z' };
+  assert.deepEqual(planPull(meta, known, { prefix: 'snapshot/', minAgeSeconds: 60, now: NOW }).toPull, [], 'ETag 相同也 skip');
+});
+
 test('loadState：文件缺失/损坏都不抛，按空状态处理并给 warning', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'state-bad-'));
   const missing = loadState(path.join(dir, 'nope.json'));
