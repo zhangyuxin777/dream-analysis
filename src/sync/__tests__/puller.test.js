@@ -321,21 +321,35 @@ test('★淘汰之后不许再重拉：老对象仍在桶里，但本地已按�
   assert.equal(third.skipped, 2, '两份都该是 skip（老的那份理由 = pruned）');
 });
 
-test('★淘汰墓碑：ETag 变了（上传侧重算）仍然要重拉 —— 墓碑不能变成永久拉黑', async () => {
+test('★淘汰墓碑：ETag 变了（上传侧重算/补数）仍然要重拉 —— 但每次只多下一次，不进循环', async () => {
   const env = makeEnv();
-  const key = 'snapshot/boye888/2020-01-01.jsonl.gz';
-  const store = new FakeStore({ [key]: shardBuffer('boye888', '2020-01-01', okEvents) });
+  const oldKey = 'snapshot/boye888/2020-01-01.jsonl.gz';
+  const newKey = 'snapshot/boye888/2026-10-02.jsonl.gz';
+  const store = new FakeStore({
+    [oldKey]: shardBuffer('boye888', '2020-01-01', okEvents),
+    [newKey]: shardBuffer('boye888', '2026-10-02', okEvents),
+  });
 
   env.config.sync.retentionDays = 3650;
   await runSync({ store, config: env.config, logger: env.logger, now: env.now });
-  env.config.sync.retentionDays = 1;
-  await runSync({ store, config: env.config, logger: env.logger, now: env.now });
-  assert.equal((await runSync({ store, config: env.config, logger: env.logger, now: env.now })).pulled.length, 0);
 
-  // 上传侧把这一天重算了（ETag 变了）⇒ 必须重新拉，不能因为"以前淘汰过"就永远不看
-  store.metas.find((m) => m.key === key).etag = 'E-CHANGED';
+  env.config.sync.retentionDays = 2; // 只淘汰 2020 那份（10-02 留着，兜住"至少留一份"底线）
+  const prunedRun = await runSync({ store, config: env.config, logger: env.logger, now: env.now });
+  assert.deepEqual(prunedRun.pruned.map((p) => path.basename(p)), ['2020-01-01.jsonl.gz'], '前提：这一轮真的写了墓碑');
+  assert.equal(loadState(statePathOf(env.config)).state.pruned[oldKey].etag, 'E1');
+
+  // 同 ETag：不许重拉
+  assert.deepEqual((await runSync({ store, config: env.config, logger: env.logger, now: env.now })).pulled, []);
+
+  // 上传侧补数/重算这一天（ETag 变了）⇒ 必须重新拉一次，不能因为"以前淘汰过"就永远忽略
+  store.metas.find((m) => m.key === oldKey).etag = 'E-CHANGED';
   const after = await runSync({ store, config: env.config, logger: env.logger, now: env.now });
-  assert.deepEqual(after.pulled, [key]);
+  assert.deepEqual(after.pulled, [oldKey], '墓碑不能变成永久拉黑');
+  assert.match(after.recomputed.join(), /2020-01-01/, '要能被识别成"远端已变"');
+  // 同一轮里它又被淘汰了，墓碑换成新 ETag ⇒ 下一轮恢复 skip（不会每轮都下）
+  assert.deepEqual(after.pruned.map((p) => path.basename(p)), ['2020-01-01.jsonl.gz']);
+  assert.equal(loadState(statePathOf(env.config)).state.pruned[oldKey].etag, 'E-CHANGED');
+  assert.deepEqual((await runSync({ store, config: env.config, logger: env.logger, now: env.now })).pulled, [], '不会进循环');
 });
 
 test('★P5 Critical：淘汰时没有水位线（状态文件丢过）⇒ 墓碑 ETag 为空，也必须挡住重拉', async () => {

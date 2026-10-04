@@ -206,15 +206,19 @@ export function planPull(metas: ObjectMeta[], state: SyncState, opts: PlanOption
     }
     if (known && known.etag !== meta.etag) plan.recomputed.push(meta.key);
 
-    // 已淘汰过的（本地按保留期删掉了、但桶里还在）：**一律 skip**，否则会变成
-    // "下载 → 淘汰 → 再下载"的每小时循环（墓碑见 PrunedTombstone 注释）。
-    // ⚠️ 空 ETag 也必须 skip：那是"淘汰时没有水位线"（状态文件丢失/损坏后仍留在盘上的老文件），
-    //    如果这里放行，桶里那份老对象每一轮都会被重新下载再淘汰 —— 正是本次要修的缺陷原地复活。
-    //    淘汰本来就是"按年龄不再需要本地保留"的决定，不是"内容不可信"的拉黑；要找回用 `sync --force`。
+    // 已淘汰过的（本地按保留期删掉了、但桶里还在）：见 PrunedTombstone 注释。两种情形分开处理：
+    // ① 墓碑**没有** ETag（淘汰时水位线丢了/状态文件损坏过）：一律 skip。
+    //    若放行，桶里那老对象每轮都会被重下再淘汰 —— 正是本次要修的循环原地复活。
+    // ② 墓碑有 ETag：**只挡"内容没变"**。ETag 变了（上传侧重算/补数）⇒ 放行一次，
+    //    重下后同一轮又会被淘汰、墓碑用新 ETag 重建 ⇒ 每次远端变更最多多下一次，不会循环。
+    //    （不能一律 skip：那会让"上传侧补数了这一天"被永久忽略，且与本文件承诺的"ETag 变了就重拉"矛盾。）
     const tombstone = state.pruned?.[meta.key];
     if (tombstone && !opts.force) {
-      plan.skipped.push({ key: meta.key, reason: 'pruned' });
-      continue;
+      if (tombstone.etag === '' || tombstone.etag === meta.etag) {
+        plan.skipped.push({ key: meta.key, reason: 'pruned' });
+        continue;
+      }
+      plan.recomputed.push(meta.key); // 淘汰过但远端翻新了 ⇒ 再拉一次（随后会被重新淘汰）
     }
 
     if (meta.lastModifiedMs !== null) {

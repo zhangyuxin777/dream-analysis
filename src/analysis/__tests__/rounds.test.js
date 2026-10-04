@@ -305,6 +305,20 @@ test('★真数据（R004 形态）：零成交、被偏离复位掐断的轮**�
   assert.match(aging.note, /不等于"现在还在开"/, '措辞必须留余地：窗口外的事件本窗口看不见');
 });
 
+test('★存活取"先到者"：复位行排在下一轮开轮之后时，不能按复位算（对抗复验的反例）', async () => {
+  const ev2 = (ts, event, symbol, data, roundId) => ({ ts, event, symbol, roundId, instance: 'a', localDate: ts.slice(0, 10), seq: 1, data });
+  const events = [
+    ev2('2026-10-01T00:37:00.000Z', 'NEW_ROUND', 'ETHFDUSD', {}, 'R004-083700'),
+    ev2('2026-10-01T02:37:00.000Z', 'NEW_ROUND', 'ETHFDUSD', {}, 'R005-103700'), // 02:37 就被顶掉了
+    ev2('2026-10-01T09:03:00.000Z', 'RESET_CANCEL_SUCCESS', 'ETHFDUSD', { reason: 'PRICE_DEVIATION' }, 'R004-083700'), // 复位行迟到
+  ];
+  const result = await run(events, {}, { window: '2026-10-01' });
+  const aging = result.sections.find((s) => s.heading.startsWith('未完成轮'));
+  const r004 = aging.rows.find((r) => r[1] === 'R004-083700');
+  assert.equal(r004[2], '2.0', '00:37 被 02:37 的新轮取代 ⇒ 存活 2.0h（按 09:03 的复位算会得 8.4h）');
+  assert.match(r004[5], /复位掐断/, '结局仍按"确实被复位过"报（两件事都真）');
+});
+
 test('★开轮不在窗口内的轮：不假装"已建仓=否"，而是计数 + 出告警', async () => {
   const ev2 = (ts, event, symbol, data, roundId) => ({ ts, event, symbol, roundId, instance: 'a', localDate: ts.slice(0, 10), seq: 1, data });
   const events = [

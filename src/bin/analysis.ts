@@ -264,7 +264,11 @@ export async function cmdList(ctx: CommandContext): Promise<number> {
   for (const m of metas.sort((a, b) => a.key.localeCompare(b.key))) {
     const parsed = parseShardKey(m.key, config.oss.prefix);
     const known = state.objects[m.key];
-    const marked = state.pruned?.[m.key] ? '🗑 已淘汰（不再拉，除非翻新）' : null;
+    const tomb = state.pruned?.[m.key];
+    const marked = !tomb ? null
+      : tomb.etag !== '' && tomb.etag !== m.etag
+        ? '🗑 已淘汰（远端已翻新 ⇒ 下轮会重拉一次再淘汰）'
+        : '🗑 已淘汰（不再拉，除非翻新）';
     const mark = !parsed ? '✗ 不符合契约' : marked ?? (!known ? '· 本地没有' : known.etag === m.etag ? '✓ 已同步' : '↻ 远端已变（待重拉）');
     console.log(`  ${mark}  ${m.key}  ${formatBytes(m.size)}  etag=${m.etag.slice(0, 8)}  ${m.lastModified}`);
   }

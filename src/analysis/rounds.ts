@@ -373,7 +373,10 @@ export function roundsAnalysis(): Analysis {
             const nextMs = i + 1 < sorted.length ? sorted[i + 1].firstMs : null;
             occ.newestInWindow = nextMs === null;
             const cutMs = occ.resetReason !== null && occ.resetReason !== 'SELL_FILLED' ? occ.resetMs : null;
-            const endMs = cutMs ?? nextMs ?? referenceMs;
+            // 结束时刻取**先到者**：复位行理论上总在下一次开轮之前，但真数据不能假设顺序
+            // （对抗复验给过反例：开轮 00:37 → 下一轮 02:37 → 复位行 09:03，按复位算会得 8.4h，实际只活了 2.0h）
+            const ends = [cutMs, nextMs].filter((v): v is number => v !== null);
+            const endMs = ends.length > 0 ? Math.min(...ends) : referenceMs;
             occ.aliveHours = Math.max(0, endMs - occ.firstMs) / 3_600_000;
           }
         }

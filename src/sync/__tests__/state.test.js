@@ -175,6 +175,12 @@ test('★planPull：淘汰墓碑一律 skip（含"淘汰时没有水位线"的�
   const known = emptyState();
   known.pruned[key] = { etag: 'E-ANY', prunedAt: '2026-10-04T00:00:00.000Z' };
   assert.deepEqual(planPull(meta, known, { prefix: 'snapshot/', minAgeSeconds: 60, now: NOW }).toPull, [], 'ETag 相同也 skip');
+
+  // 墓碑有 ETag 且远端翻新了 ⇒ 必须放行一次（否则"上传侧补数/重算这一天"会被永久忽略）
+  const metaChanged = [{ ...meta[0], etag: 'E-NEW' }];
+  const changed = planPull(metaChanged, known, { prefix: 'snapshot/', minAgeSeconds: 60, now: NOW });
+  assert.deepEqual(changed.toPull.map((m) => m.key), [key]);
+  assert.deepEqual(changed.recomputed, [key]);
 });
 
 test('loadState：文件缺失/损坏都不抛，按空状态处理并给 warning', () => {
