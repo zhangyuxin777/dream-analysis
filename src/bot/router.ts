@@ -153,7 +153,7 @@ export class CommandRouter {
         ?? ((opts: { force: boolean }) => runSync({ store: buildStore(this.deps.config), config: this.deps.config, logger: this.deps.logger.child('sync') }, opts));
       const r = await fn({ force });
       if (r.refusedByLock) return '已有同步在进行（可能是常驻进程），稍后再试';
-      return `同步完成：列举 ${r.listed} / 拉取 ${r.pulled.length} / 跳过 ${r.skipped} / 忽略 ${r.ignored} / 失败 ${r.failed.length} / 退避 ${r.deferred.length}，共 ${formatBytes(r.bytes)}`;
+      return `同步完成：列举 ${r.listed} / 拉取 ${r.pulled.length} / 跳过 ${r.skipped} / 忽略 ${r.ignored} / 失败 ${r.failed.length} / 退避 ${r.deferred.length} / 淘汰 ${r.pruned.length}，共 ${formatBytes(r.bytes)}`;
     } catch (err) {
       return `同步失败：${errorText(err)}`;
     }

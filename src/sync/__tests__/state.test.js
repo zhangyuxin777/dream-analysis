@@ -141,6 +141,24 @@ test('loadState：suspects 旧格式（裸数字）迁移成 SuspectState，并�
   assert.ok(warnings.some((w) => w.includes('旧格式')));
 });
 
+test('★淘汰墓碑：saveState/loadState 往返一致；老状态文件（没有 pruned 字段）读成空，不报错', () => {
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'state-tomb-')), 'state.json');
+  const state = emptyState();
+  state.pruned['snapshot/a/2020-01-01.jsonl.gz'] = { etag: 'E-OLD', prunedAt: '2026-10-04T00:00:00.000Z' };
+  saveState(file, state);
+  const back = loadState(file).state;
+  assert.deepEqual(back.pruned['snapshot/a/2020-01-01.jsonl.gz'], { etag: 'E-OLD', prunedAt: '2026-10-04T00:00:00.000Z' });
+
+  // 老版本写的状态文件里没有 pruned ⇒ 必须是空对象而不是 undefined（否则淘汰那一步会炸）
+  fs.writeFileSync(file, JSON.stringify({ version: 1, objects: {}, suspects: {}, lastRun: null }));
+  const legacy = loadState(file);
+  assert.deepEqual(legacy.state.pruned, {});
+  assert.deepEqual(legacy.warnings, []);
+
+  // 空状态与保存后的形状必须一致（否则每次同步都会"发现"状态变了）
+  assert.deepEqual(emptyState(), { version: 1, objects: {}, suspects: {}, pruned: {}, lastRun: null });
+});
+
 test('loadState：文件缺失/损坏都不抛，按空状态处理并给 warning', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'state-bad-'));
   const missing = loadState(path.join(dir, 'nope.json'));

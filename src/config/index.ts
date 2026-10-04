@@ -132,8 +132,10 @@ export function parseConfig(raw: unknown, opts: { rootDir: string }): ParseResul
     intervalMinutes: num(syncRaw.intervalMinutes, 60),
     minAgeSeconds: num(syncRaw.minAgeSeconds, 60),
     countIncludesHeader: bool(syncRaw.countIncludesHeader, false),
-    maxDiskGB: num(syncRaw.maxDiskGB, 2),
-    retentionDays: num(syncRaw.retentionDays, 90),
+    maxDiskGB: num(syncRaw.maxDiskGB, 5),
+    // 730 天 = 两年。回测里最长卡住 165 天（≈ 3967h），保留期必须显著大于它，
+    // 否则"卡住轮"视图找不到轮次的起点。磁盘代价很小：~200KB/天/实例 ⇒ 两年 ≈ 150MB/实例。
+    retentionDays: num(syncRaw.retentionDays, 730),
     concurrency: num(syncRaw.concurrency, 1),
   };
   if (sync.intervalMinutes < 1 || sync.intervalMinutes > 1440) problems.push('sync.intervalMinutes 应在 1~1440 之间');

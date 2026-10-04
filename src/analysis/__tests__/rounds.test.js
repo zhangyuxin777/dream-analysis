@@ -145,7 +145,10 @@ test('未完成轮也要能看出"卡了多久"（只看已结束的轮会把"�
   const result = await run(events, {}, { window: '2026-10-01' });
   const aging = result.sections.find((s) => s.heading.startsWith('未完成轮'));
   // 窗口 2026-10-01（上海日）= [09-30T16:00Z, 10-01T16:00Z)；它已结束（NOW=10-02T12:00Z）⇒ 按窗口结束算
-  assert.deepEqual(aging.rows[0], ['ETHFDUSD', 'R001', '15.0']);
+  assert.deepEqual(aging.rows[0].slice(0, 3), ['ETHFDUSD', 'R001', '15.0']);
+  assert.equal(aging.rows[0][3], '否', '全程没有买入成交 ⇒ 未建仓');
+  assert.equal(aging.rows[0][4], '-', '没有买入时间戳就不编造"末笔买入后"');
+  assert.equal(aging.rows[0][5], '窗口内最新');
   assert.deepEqual(aging.rows[1].slice(0, 2), ['BTCFDUSD', 'R002']);
   assert.match(aging.note, /已运行 = 窗口结束 −/);
 });
@@ -155,7 +158,7 @@ test('窗口还没结束时，"已运行"按**此刻**算（不能把还没发�
   // 窗口 = 2026-10-02（结束于 10-02T16:00Z，晚于 NOW=12:00Z）⇒ 参考时刻必须是 NOW
   const result = await run(events, {}, { window: '2026-10-02' });
   const aging = result.sections.find((s) => s.heading.startsWith('未完成轮'));
-  assert.deepEqual(aging.rows[0], ['ETHFDUSD', 'R001', '11.0'], '按窗口结束算会得到 15.0h —— 那是未来时间');
+  assert.deepEqual(aging.rows[0].slice(0, 3), ['ETHFDUSD', 'R001', '11.0'], '按窗口结束算会得到 15.0h —— 那是未来时间');
   assert.match(aging.note, /按"此刻"算/);
 });
 
@@ -270,6 +273,49 @@ test('isRecoveredRoundId / isErrorRoundId：错误态 id 不算改名', () => {
   assert.equal(isRecoveredRoundId('R596-190959'), false);
   assert.equal(isErrorRoundId('R000-ERR-RCV'), true);
   assert.equal(isErrorRoundId('R596-191307-RCV'), false);
+});
+
+test('★真数据（R004 形态）：零成交、被偏离复位掐断的轮**不许**冒充"最卡"，且要标出真相', async () => {
+  const ev2 = (ts, event, symbol, data, roundId) => ({ ts, event, symbol, roundId, instance: 'a', localDate: ts.slice(0, 10), seq: 1, data });
+  const events = [
+    // ① 08:37 开轮，一路没成交（无 BUY_FILLED）
+    ev2('2026-10-01T00:37:13.000Z', 'NEW_ROUND', 'ETHFDUSD', {}, 'R004-083713'),
+    // ② 同实例后面又开了两轮（说明它已被顶掉），其中一轮真建了仓
+    ev2('2026-10-01T09:03:22.000Z', 'NEW_ROUND', 'ETHFDUSD', {}, 'R005-170322'),
+    ev2('2026-10-01T09:54:37.000Z', 'BUY_FILLED', 'ETHFDUSD', { index: 0, buyPrice: 2683.81, accCost: 224.36 }, 'R005-170322'),
+    // ③ R004 收到的是"偏离复位"（不是正常卖出）
+    ev2('2026-10-01T09:03:21.000Z', 'RESET_CANCEL_SUCCESS', 'ETHFDUSD', { reason: 'PRICE_DEVIATION' }, 'R004-083713'),
+  ];
+  const result = await run(events, {}, { window: '2026-10-01' });
+  const aging = result.sections.find((s) => s.heading.startsWith('未完成轮'));
+
+  // R005 已建仓 ⇒ 必须排在前面（即使 R004 的"已运行"更久）
+  assert.equal(aging.rows[0][1], 'R005-170322', '已建仓的轮优先：' + JSON.stringify(aging.rows));
+  assert.equal(aging.rows[0][3], '是');
+
+  const r004 = aging.rows.find((r) => r[1] === 'R004-083713');
+  assert.ok(r004, '零成交的轮也要列出来（它是"没接到货"，不是卡单，不能藏）');
+  assert.equal(r004[3], '否', '没成交 ⇒ 未建仓');
+  assert.match(r004[5], /复位掐断\(PRICE_DEVIATION\)/, '要从 RESET_CANCEL_SUCCESS.reason 认出掐断，不能只说"未完成"');
+  assert.match(aging.heading, /已建仓的在前/);
+  assert.match(aging.note, /空等\/被复位掐断/);
+});
+
+test('★补仓时长：已结束的轮要能看出"慢在补仓还是慢在等"', async () => {
+  const ev2 = (ts, event, symbol, data, roundId) => ({ ts, event, symbol, roundId, instance: 'a', localDate: ts.slice(0, 10), seq: 1, data });
+  const events = [
+    ev2('2026-10-01T00:00:00.000Z', 'NEW_ROUND', 'ETHFDUSD', {}, 'R003-000200'),
+    ev2('2026-10-01T00:07:54.000Z', 'BUY_FILLED', 'ETHFDUSD', { index: 0 }, 'R003-000200'),
+    ev2('2026-10-01T02:39:40.000Z', 'BUY_FILLED', 'ETHFDUSD', { index: 9 }, 'R003-000200'), // 补仓到 02:39
+    ev2('2026-10-01T08:37:11.000Z', 'ROUND_COMPLETED', 'ETHFDUSD', { profit: 7.72, durationHours: 5.95 }, 'R003-000200'),
+  ];
+  const result = await run(events, {}, { window: '2026-10-01' });
+  const worst = result.sections.find((s) => s.heading.startsWith('最长卡轮'));
+  assert.deepEqual(worst.headers, ['币种', '轮次', '等待(h)', '补仓(h)', '整轮利润', '深跌']);
+  const row = worst.rows[0];
+  assert.equal(row[2], '5.95', '等待 = ROUND_COMPLETED.durationHours（末次买入→卖出）');
+  assert.equal(row[3], '2.53', '补仓 = 首笔 00:07:54 → 末笔 02:39:40 = 2.53h（自己 join BUY_FILLED）');
+  assert.match(worst.note, /末次买入→卖出/, '口径必须写清（曾经写成"首笔买入→卖出"，错 30%）');
 });
 
 test('分片读不出来 / 带数据告警时，轮数结论必须打折说明', async () => {

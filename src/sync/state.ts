@@ -36,6 +36,21 @@ export interface SuspectState {
   lastErrorAt: string;
 }
 
+/**
+ * **淘汰墓碑**：本地按保留期/磁盘上限删掉的分片，记下删时的 ETag。
+ *
+ * 为什么必须有：淘汰曾经连水位线条目一起删 ⇒ 桶里仍在的老对象下一轮又变成"本地没有" ⇒
+ * **重新下载 → 再淘汰 → 再下载**（每小时一轮、无限循环，日志看起来还完全正常）。
+ * 上传侧的 OSS 没有生命周期清理，所以这个循环一旦开始就永不停止（实测：修之前一定会重拉）。
+ *
+ * 墓碑不是拉黑：**ETag 变了（上传侧重算/封存）照样重拉** ✓
+ */
+export interface PrunedTombstone {
+  /** 淘汰那一刻该对象的 ETag（空串 = 当时不知道，退化为"总是允许重拉"） */
+  etag: string;
+  prunedAt: string;
+}
+
 export interface RunSummary {
   startedAt: string;
   finishedAt: string;
@@ -60,11 +75,13 @@ export interface SyncState {
   objects: Record<string, ObjectState>;
   /** key → 失败退避状态 */
   suspects: Record<string, SuspectState>;
+  /** key → 已淘汰墓碑（同 ETag 不再重拉） */
+  pruned: Record<string, PrunedTombstone>;
   lastRun: RunSummary | null;
 }
 
 export function emptyState(): SyncState {
-  return { version: 1, objects: {}, suspects: {}, lastRun: null };
+  return { version: 1, objects: {}, suspects: {}, pruned: {}, lastRun: null };
 }
 
 /**
@@ -94,8 +111,15 @@ export function loadState(filePath: string): { state: SyncState; warnings: strin
         };
       }
     }
+    const pruned: Record<string, PrunedTombstone> = {};
+    for (const [key, value] of Object.entries((raw.pruned as Record<string, unknown>) ?? {})) {
+      if (value && typeof value === 'object') {
+        const p = value as Partial<PrunedTombstone>;
+        pruned[key] = { etag: String(p.etag ?? ''), prunedAt: String(p.prunedAt ?? new Date(0).toISOString()) };
+      }
+    }
     return {
-      state: { version: 1, objects: raw.objects as Record<string, ObjectState>, suspects, lastRun: raw.lastRun ?? null },
+      state: { version: 1, objects: raw.objects as Record<string, ObjectState>, suspects, pruned, lastRun: raw.lastRun ?? null },
       warnings,
     };
   } catch (err) {
@@ -107,9 +131,10 @@ export function loadState(filePath: string): { state: SyncState; warnings: strin
 /** 原子写（tmp + rename），键排序保证 diff 稳定；父目录自动建 */
 export function saveState(filePath: string, state: SyncState): void {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  const sorted: SyncState = { version: 1, objects: {}, suspects: {}, lastRun: state.lastRun };
+  const sorted: SyncState = { version: 1, objects: {}, suspects: {}, pruned: {}, lastRun: state.lastRun };
   for (const key of Object.keys(state.objects).sort()) sorted.objects[key] = state.objects[key];
   for (const key of Object.keys(state.suspects).sort()) sorted.suspects[key] = state.suspects[key];
+  for (const key of Object.keys(state.pruned ?? {}).sort()) sorted.pruned[key] = state.pruned[key];
   const tmp = `${filePath}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify(sorted, null, 2) + '\n', 'utf8');
   fs.renameSync(tmp, filePath);
@@ -123,7 +148,7 @@ export function suspectCooldownMs(count: number): number {
   return Math.min(base * Math.pow(2, exponent), cap);
 }
 
-export type SkipReason = 'etag-unchanged' | 'too-fresh' | 'suspect-cooldown';
+export type SkipReason = 'etag-unchanged' | 'too-fresh' | 'suspect-cooldown' | 'pruned';
 export type IgnoreReason = 'key-not-matching-contract';
 
 export interface DeferredShard {
@@ -178,6 +203,14 @@ export function planPull(metas: ObjectMeta[], state: SyncState, opts: PlanOption
       continue;
     }
     if (known && known.etag !== meta.etag) plan.recomputed.push(meta.key);
+
+    // 已淘汰过的（本地按保留期删掉了、但桶里还在）：同 ETag 就**永远 skip**，
+    // 否则会变成"下载 → 淘汰 → 再下载"的每小时循环（墓碑见 PrunedTombstone 注释）
+    const tombstone = state.pruned?.[meta.key];
+    if (tombstone && !opts.force && tombstone.etag !== '' && tombstone.etag === meta.etag) {
+      plan.skipped.push({ key: meta.key, reason: 'pruned' });
+      continue;
+    }
 
     if (meta.lastModifiedMs !== null) {
       const ageSeconds = (opts.now.getTime() - meta.lastModifiedMs) / 1000;
@@ -245,7 +278,8 @@ export function selectShardsToPrune(
   shards: LocalShard[],
   opts: { retentionDays: number; maxDiskGB: number; now: Date },
 ): LocalShard[] {
-  const ascending = [...shards].sort((a, b) => a.date.localeCompare(b.date));
+  // 显式 (日期, 实例)：同一天多实例时"先淘汰哪个实例"也必须确定，不依赖调用方给的顺序
+  const ascending = [...shards].sort((a, b) => (a.date === b.date ? a.instance.localeCompare(b.instance) : a.date.localeCompare(b.date)));
   const doomed = new Set<string>();
   const cutoffMs = opts.now.getTime() - opts.retentionDays * 24 * 3600 * 1000;
 

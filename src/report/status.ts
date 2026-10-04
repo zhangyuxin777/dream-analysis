@@ -82,6 +82,15 @@ export function buildStatusText(config: AppConfig, opts: StatusOptions = {}): st
     for (const [k, s] of suspects.slice(0, 5)) lines.push(`  ⏸ ${k}（已失败 ${s.count} 次，最后失败于 ${s.lastErrorAt}）`);
   }
 
+  // 已淘汰（本地按保留期/磁盘上限删掉、但桶里还在）：显式列出来 ——
+  // 不然"淘汰"这件事在状态里完全不可见，而它正是"会不会被重复下载"的关键
+  const pruned = Object.entries(state.pruned ?? {});
+  if (pruned.length > 0) {
+    const newest = pruned.map(([, p]) => p.prunedAt).sort().pop() ?? '';
+    lines.push(`已淘汰（不再重拉，ETag 变了才拉）: ${pruned.length} 个，最近一次 ${newest}`);
+    for (const [k, p] of pruned.slice(-3)) lines.push(`  🗑 ${k}（淘汰于 ${p.prunedAt}）`);
+  }
+
   // 锁是"此刻有没有同步在跑"的唯一准确来源（被拒轮次不写状态文件 —— 写了会和持有者互相覆盖）
   const holder = readLock(lockPathOf(config));
   if (holder) {

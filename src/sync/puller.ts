@@ -194,6 +194,7 @@ async function syncOnce(deps: PullDeps, opts: { force?: boolean }): Promise<Pull
         whitelistVersion,
       };
       delete state.suspects[meta.key];
+      delete state.pruned[meta.key]; // 重新拉回来了 ⇒ 墓碑作废（ETag 变了才会走到这里）
       result.pulled.push(meta.key);
       result.bytes += meta.size;
       logger.info('已拉取分片', {
@@ -227,8 +228,13 @@ async function syncOnce(deps: PullDeps, opts: { force?: boolean }): Promise<Pull
   });
   for (const shard of doomed) {
     safeUnlink(shard.filePath);
-    delete state.objects[buildShardKey(config.oss.prefix, shard.instance, shard.date)];
-    delete state.suspects[buildShardKey(config.oss.prefix, shard.instance, shard.date)];
+    const key = buildShardKey(config.oss.prefix, shard.instance, shard.date);
+    // ★ 留墓碑再删水位线：桶里的老对象不会消失（上传侧没有生命周期清理），
+    //   没有墓碑就会"下一轮又当成本地没有 → 重新下载 → 再淘汰"，每小时循环一次。
+    //   ETag 变了（上传侧重算）时墓碑自动失效 ⇒ 不会变成永久拉黑。
+    state.pruned[key] = { etag: state.objects[key]?.etag ?? '', prunedAt: now().toISOString() };
+    delete state.objects[key];
+    delete state.suspects[key];
     result.pruned.push(shard.filePath);
   }
   if (doomed.length > 0) logger.info('已淘汰本地旧分片', { count: doomed.length, sample: doomed.slice(0, 5).map((s) => `${s.instance}/${s.date}`) });

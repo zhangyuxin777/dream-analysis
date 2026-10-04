@@ -157,7 +157,7 @@ export async function cmdSync(ctx: CommandContext, force: boolean): Promise<numb
     console.error('已有同步在进行（可能是常驻进程），本轮未执行；稍后重试即可');
     return 1;
   }
-  console.log(`列举 ${result.listed} 个，拉取 ${result.pulled.length}，跳过 ${result.skipped}，忽略 ${result.ignored}，失败 ${result.failed.length}，退避 ${result.deferred.length}，共 ${formatBytes(result.bytes)}，耗时 ${Date.now() - started}ms`);
+  console.log(`列举 ${result.listed} 个，拉取 ${result.pulled.length}，跳过 ${result.skipped}，忽略 ${result.ignored}，失败 ${result.failed.length}，退避 ${result.deferred.length}，淘汰 ${result.pruned.length}，共 ${formatBytes(result.bytes)}，耗时 ${Date.now() - started}ms`);
   for (const c of result.whitelistChanges) console.log(`  ⚠️ 数据口径变更: ${c}`);
   for (const d of result.deferred) console.log(`  ⏸ ${d.key}（已失败 ${d.count} 次）`);
   for (const f of result.failed) console.error(`  ❌ ${f.key}: ${f.error}`);

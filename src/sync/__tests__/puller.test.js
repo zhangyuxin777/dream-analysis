@@ -292,6 +292,52 @@ test('淘汰：保留期外的本地分片被删，同时清掉水位线条目',
   assert.ok(fs.existsSync(shardPathOf(env.config, 'boye888', '2026-10-02')), '新分片必须留着');
 });
 
+test('★淘汰之后不许再重拉：老对象仍在桶里，但本地已按保留期淘汰 ⇒ 必须一直 skip（否则每小时"拉了又删"）', async () => {
+  const env = makeEnv();
+  const oldKey = 'snapshot/boye888/2020-01-01.jsonl.gz';
+  const newKey = 'snapshot/boye888/2026-10-02.jsonl.gz';
+  const store = new FakeStore({
+    [oldKey]: shardBuffer('boye888', '2020-01-01', okEvents),
+    [newKey]: shardBuffer('boye888', '2026-10-02', okEvents),
+  });
+
+  // ① 首次：保留期放宽，两份都拉下来
+  env.config.sync.retentionDays = 3650;
+  const first = await runSync({ store, config: env.config, logger: env.logger, now: env.now });
+  assert.equal(first.pulled.length, 2);
+
+  // ② 保留期收紧到 1 天：2020 那份被淘汰（文件 + 水位线都没了）
+  env.config.sync.retentionDays = 1;
+  const second = await runSync({ store, config: env.config, logger: env.logger, now: env.now });
+  assert.deepEqual(second.pruned.map((p) => path.basename(p)), ['2020-01-01.jsonl.gz']);
+  assert.ok(!fs.existsSync(shardPathOf(env.config, 'boye888', '2020-01-01')));
+
+  // ③ 关键：再同步一轮，**不许**因为"水位线被删了"就把它重新下载一遍
+  //    （真数据里桶不会清理老对象，所以这会变成每小时 55MB 的无限拉删循环）
+  const downloadsBefore = store.downloads.length;
+  const third = await runSync({ store, config: env.config, logger: env.logger, now: env.now });
+  assert.deepEqual(third.pulled, [], '被淘汰的对象不许重拉');
+  assert.equal(store.downloads.length, downloadsBefore, '一次下载都不该发生');
+  assert.equal(third.skipped, 2, '两份都该是 skip（老的那份理由 = pruned）');
+});
+
+test('★淘汰墓碑：ETag 变了（上传侧重算）仍然要重拉 —— 墓碑不能变成永久拉黑', async () => {
+  const env = makeEnv();
+  const key = 'snapshot/boye888/2020-01-01.jsonl.gz';
+  const store = new FakeStore({ [key]: shardBuffer('boye888', '2020-01-01', okEvents) });
+
+  env.config.sync.retentionDays = 3650;
+  await runSync({ store, config: env.config, logger: env.logger, now: env.now });
+  env.config.sync.retentionDays = 1;
+  await runSync({ store, config: env.config, logger: env.logger, now: env.now });
+  assert.equal((await runSync({ store, config: env.config, logger: env.logger, now: env.now })).pulled.length, 0);
+
+  // 上传侧把这一天重算了（ETag 变了）⇒ 必须重新拉，不能因为"以前淘汰过"就永远不看
+  store.metas.find((m) => m.key === key).etag = 'E-CHANGED';
+  const after = await runSync({ store, config: env.config, logger: env.logger, now: env.now });
+  assert.deepEqual(after.pulled, [key]);
+});
+
 test('状态文件损坏时不崩：按空状态重拉，并带 warning 返回', async () => {
   const env = makeEnv();
   const key = 'snapshot/boye888/2026-10-02.jsonl.gz';
@@ -306,5 +352,5 @@ test('状态文件损坏时不崩：按空状态重拉，并带 warning 返回',
 });
 
 test('空状态对象的形状（供调用方断言用）', () => {
-  assert.deepEqual(emptyState(), { version: 1, objects: {}, suspects: {}, lastRun: null });
+  assert.deepEqual(emptyState(), { version: 1, objects: {}, suspects: {}, pruned: {}, lastRun: null });
 });
