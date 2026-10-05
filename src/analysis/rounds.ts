@@ -156,9 +156,10 @@ export function roundsAnalysis(): Analysis {
       if (worst.length > 0) {
         sections.push({
           heading: `最长卡轮 Top ${worst.length}（已结束的轮）`,
-          headers: ['币种', '轮次', '等待(h)', '补仓(h)', '整轮利润', '深跌'],
+          headers: ['币种', '轮次', '等待(h)', '加仓(h)', '整轮利润', '深跌'],
           note: '等待 = ROUND_COMPLETED.durationHours（主仓口径：**末次买入→卖出**，即"建完仓等价格回到止盈位"等了多久）。'
-            + '补仓 = 首笔→末笔买入（自己 join BUY_FILLED；缺时间戳时为 "-"）。两段相加 ≈ 整轮跨度。',
+            + '加仓 = 首笔→末笔**网格买单**（自己 join BUY_FILLED；缺时间戳时为 "-"）——'
+            + '注意这**不是**"补仓"：补仓是 `TOPUP_*` 那套独立机制（看 `topup` 视图）。两段相加 ≈ 整轮跨度。',
           rows: worst.map((r) => [
             r.symbol,
             r.displayId,

@@ -51,8 +51,16 @@ export interface RoundState {
   /** 复位原因（`RESET_CANCEL_SUCCESS.reason`；`SELL_FILLED` = 正常卖出，其余 = 掐断重开） */
   resetReason: string | null;
   resetMs: number | null;
-  /** 买入成交笔数（补仓次数 ≈ 笔数 − 1） */
+  /**
+   * 网格**买单成交笔数**。⚠️ 这**不是**"补仓"：网格越跌越买的是加仓，
+   * 而"补仓"是 `RoundSalvageManager` 那套独立机制（`TOPUP_*`，有自己的额度与冷却）。
+   * 真数据踩过：把"笔数 − 1"当补仓列出来，而那 7 天 `TOPUP_*` 一条都没有。
+   */
   buyFills: number;
+  /** 补仓下单次数（`TOPUP_EXECUTED` = 限价单已下单，**不等于成交**） */
+  topupOrders: number;
+  /** 补仓成交次数（`TOPUP_ORDER_FILLED`） */
+  topupFills: number;
   /** 累计买入成本（最近一条 BUY_FILLED 的 `accCost`，事件里的**观测值**） */
   accCost: number | null;
   /**
@@ -109,6 +117,11 @@ export interface SymbolRoundStats {
 const ROUND_EVENTS = new Set([
   'NEW_ROUND', 'ROUND_FIRST_FILL', 'BUY_FILLED', 'SELL_FILLED', 'ROUND_COMPLETED', 'RESET_CANCEL_SUCCESS',
   'STARTUP_RECOVERY_DONE',
+  // 补仓（`RoundSalvageManager` 那套独立机制，有它自己的额度）—— 它带 roundId 且说明该轮在持仓，
+  // 所以既用来认轮，也用来回答"这一轮到底补过没有"。
+  // ⚠️ 术语：网格自己的 `BUY_FILLED`（越跌越买）**不是**"补仓"，别混（真数据踩过：把买单次数-1 当补仓列出来，
+  // 而那 7 天 `TOPUP_*` 一条都没有）。
+  'TOPUP_EXECUTED', 'TOPUP_ORDER_FILLED',
 ]);
 
 export function newSymbolRoundStats(): SymbolRoundStats {
@@ -206,7 +219,7 @@ export function createRoundCollector(): RoundCollector {
         r = {
           counter, instance: e.instance, symbol, displayId, firstMs: ms,
           startOutsideScan: e.event !== 'NEW_ROUND', completed: false,
-          firstBuyMs: null, lastBuyMs: null, resetReason: null, resetMs: null, buyFills: 0, accCost: null, qty: 0,
+          firstBuyMs: null, lastBuyMs: null, resetReason: null, resetMs: null, buyFills: 0, topupOrders: 0, topupFills: 0, accCost: null, qty: 0,
           completedAtMs: null, durationHours: null, profitCents: null, isCrashMode: false, reusedCount: 0,
         };
         s.rounds.set(key, r);
@@ -233,6 +246,8 @@ export function createRoundCollector(): RoundCollector {
             r.resetReason = null;
             r.resetMs = null;
             r.buyFills = 0;
+            r.topupOrders = 0;
+            r.topupFills = 0;
             r.accCost = null;
             r.qty = 0;
             r.completedAtMs = null;
@@ -281,6 +296,13 @@ export function createRoundCollector(): RoundCollector {
           if (profit !== null) s.sellProfitCents += Math.round(profit * 100);
           break;
         }
+        case 'TOPUP_EXECUTED':
+          // 补仓单**已下单**（不等于成交；模板注释明确说不能说"成功买入"）
+          r.topupOrders++;
+          break;
+        case 'TOPUP_ORDER_FILLED':
+          r.topupFills++;
+          break;
         case 'RESET_CANCEL_SUCCESS':
           r.resetReason = strOf(e.data, 'reason');
           r.resetMs = ms;

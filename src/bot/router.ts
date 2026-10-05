@@ -148,6 +148,9 @@ export class CommandRouter {
       case 'st':
       case 'stream':
         return this.runNamed('stream', parseAnalysisParams(rest, positionalNamesOf(this.registry.get('stream'))), msg);
+      case 'tu':
+      case 'topup':
+        return this.runNamed('topup', parseAnalysisParams(rest, positionalNamesOf(this.registry.get('topup'))), msg);
       default:
         if (command === '') return buildHelpText(this.registry);
         return `未知指令: ${command}（发 h 看指令列表）`;

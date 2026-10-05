@@ -59,6 +59,10 @@ test('★核心：跨窗口未收口的轮要能看见，带观测仓位/成本/
     ev('2026-10-01T05:00:00.000Z', 'BUY_FILLED', 'ETHFDUSD', { index: 1, buyPrice: 2550, accCost: 5150 }, 'R007-080000'),
     // 最近一次账户观测：锁仓 2 个 ETH，市值 5000（成本 5150 ⇒ 浮亏 -150）
     account('2026-10-04T11:00:00.000Z', [{ asset: 'ETH', qtyFree: 0, qtyLocked: 2, value: 5000 }, { asset: 'FDUSD', qtyFree: 40000, qtyLocked: 0, value: 40000 }], 45000),
+    // 补仓 = TOPUP_* 那套独立机制（**不是**网格买单）：下单 2 次、成交 1 次
+    ev('2026-10-02T00:00:00.000Z', 'TOPUP_EXECUTED', 'ETHFDUSD', { cost: 500, quantity: 0.2, buyPrice: 2500, remainingTopUp: 1500 }, 'R007-080000'),
+    ev('2026-10-02T00:05:00.000Z', 'TOPUP_EXECUTED', 'ETHFDUSD', { cost: 500, quantity: 0.2, buyPrice: 2490, remainingTopUp: 1000 }, 'R007-080000'),
+    ev('2026-10-02T00:07:00.000Z', 'TOPUP_ORDER_FILLED', 'ETHFDUSD', { clientOrderId: 'DT01', price: 2490, qty: 0.2 }, 'R007-080000'),
   ];
   const result = await run(events);
 
@@ -72,7 +76,8 @@ test('★核心：跨窗口未收口的轮要能看见，带观测仓位/成本/
   assert.equal(cell(detail, row, '账户同币'), '2', '账户里该资产总量（观测值）');
   assert.equal(cell(detail, row, '轮次成本'), '5150.00', '成本 = 该轮最近一条 BUY_FILLED 的 accCost');
   assert.equal(cell(detail, row, '浮亏'), '-150.00', '浮亏 = 本轮数量 × 观测价格(5000/2) − 本轮成本 = 5000 − 5150');
-  assert.equal(cell(detail, row, '补仓'), '1', '补仓 = 买入笔数 2 − 1');
+  assert.equal(cell(detail, row, '加仓'), '1', '加仓 = 网格买单笔数 2 − 1（**不是**补仓）');
+  assert.equal(cell(detail, row, '补仓'), '1/2下单', '补仓 = TOPUP 成交/下单（成交 1、下单 2 ⇒ 有一单挂着没吃到）');
   assert.match(detail.note, /观测值/, '必须写明这两个数是观测值，不是推算');
 });
 

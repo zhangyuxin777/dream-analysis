@@ -334,7 +334,7 @@ test('★补仓时长：已结束的轮要能看出"慢在补仓还是慢在等"
   ];
   const result = await run(events, {}, { window: '2026-10-01' });
   const worst = result.sections.find((s) => s.heading.startsWith('最长卡轮'));
-  assert.deepEqual(worst.headers, ['币种', '轮次', '等待(h)', '补仓(h)', '整轮利润', '深跌']);
+  assert.deepEqual(worst.headers, ['币种', '轮次', '等待(h)', '加仓(h)', '整轮利润', '深跌']);
   const row = worst.rows[0];
   assert.equal(row[2], '5.95', '等待 = ROUND_COMPLETED.durationHours（末次买入→卖出）');
   assert.equal(row[3], '2.53', '补仓 = 首笔 00:07:54 → 末笔 02:39:40 = 2.53h（自己 join BUY_FILLED）');

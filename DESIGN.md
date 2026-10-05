@@ -227,6 +227,16 @@ dream-analysis/
 `SELL_STATE_UNRECONCILED`/`SELL_FILLED_IGNORED`/`WORKER_WS_STALE_RECONNECT`/`WORKER_TICKER_INVALID`/
 `HEALTH_CHECK_NO_ORDERS`/`TOPUP_EXHAUSTED` 等一大票（真数据实测：近 7 天真实是 32 条，正则只数出十几条）。
 另：设计稿里的 `STOP_SIGNAL`/`STOP_SIGNAL_RESUMED` **不存在**，真名是 `STOP_SIGNAL`/`STOP_SIGNAL_RESUMED`。
+### 术语：**加仓 ≠ 补仓**（真数据踩过，写死在这里）
+
+- **加仓** = 网格自己的 `BUY_FILLED`（越跌越买，价格层面自动）；报表里的"加仓"列 = 网格买单笔数 − 1。
+- **补仓** = `RoundSalvageManager` 那套**独立机制**（`TOPUP_*`，有额度 `topUpRemaining`、冷却、档位），
+  关键词：`TOPUP_LAST_TIER_REACHED.elapsedHours` = **程序自己**报"我到最后一档、已经卡了多久"。
+  报表里的"补仓"列只来自 `TOPUP_*`。
+- **下单 ≠ 成交**：`TOPUP_EXECUTED` 是**限价单已下单**（模板注释明确说不能说"成功买入"），成交看 `TOPUP_ORDER_FILLED`。
+  两者差值是"补仓单挂着还没吃到"。
+- 我此前把"网格买单笔数 − 1"当"补仓"列出来（真数据那 7 天 `TOPUP_*` 一条都没有）⇒ 已改名并分开两列。
+
 ### 两条定案（2026-10-04，改了就别再绕回去）
 
 **① 本地分片永不自动删除。** 曾经有过"按保留期（90 天）+ 磁盘上限淘汰最旧"，为此还得维护"淘汰墓碑"
@@ -281,6 +291,7 @@ interface Analysis {
 | stuck | sk | **状态语义**：当前还开着的轮（跨窗口）、已持有/卡住多久、本轮仓位与浮亏、>24h/>72h/>7天 分档 | NEW_ROUND BUY_FILLED ROUND_COMPLETED RESET_CANCEL_SUCCESS STARTUP_RECOVERY_DONE ACCOUNT_OBSERVED | — |
 | `topup` | `tu` | 补仓次数/贡献、深跌期行为 | `TOPUP_*` `CRASH_*` | — |
 | `errors` | `e` | **需要看的事件**明细（异常/退化/未恢复）：按类型/实例/类别 + 最严重的一批 + 最近明细 | 事件目录的 attention 清单 | — |
+| `topup` | `tu` | **补仓行为**：触发/下单/成交/跳过/失败/耗尽次数、补了多少、补到哪一档、为什么没补、"卡了多久"（程序自己的判据） | `TOPUP_*` | — |
 | `stream` | `st` | **行情流健康**：断流次数与时长、重连、未恢复、WS 关闭原因 | `UDS_CONN_*`/`UDS_RETRY_*`/`MARKET_STREAM_*`/`WS_*`/`WORKER_WS_*` | — |
 | `stopgaps` | `sg` | **有没有偷偷停轮**：`STOP_SIGNAL` / `STOP_SIGNAL_RESUMED` 时间线（真名；设计稿那两个不存在） | 停轮/复轮 | — |
 | `trend` | `tr` | 按小时/天的活跃度与收益趋势 | 同 `rounds` | — |

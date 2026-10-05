@@ -298,7 +298,7 @@ export function stuckAnalysis(): Analysis {
       if (shown.length > 0) {
         sections.push({
           heading: `未收口轮 Top ${Math.min(topN, shown.length)}（按卡住时长降序）`,
-          headers: ['实例', '数据', '币种', '轮次', '已开', '持仓', '卡住', '本轮仓位', '账户同币', '轮次成本', '浮亏', '补仓'],
+          headers: ['实例', '数据', '币种', '轮次', '已开', '持仓', '卡住', '本轮仓位', '账户同币', '轮次成本', '浮亏', '加仓', '补仓'],
           rows: shown.slice(0, topN).map((r) => {
             const openHours = Math.max(0, nowMs - r.round.firstMs) / 3_600_000;
             const stale = r.dataAgeHours > STALE_INSTANCE_HOURS;
@@ -315,6 +315,10 @@ export function stuckAnalysis(): Analysis {
               money(r.round.accCost),
               r.pnl === null ? '-' : (r.pnl >= 0 ? `+${money(r.pnl)}` : money(r.pnl)),
               String(Math.max(0, r.round.buyFills - 1)),
+              // 真正的"补仓"= TOPUP_* 那套机制（成交/下单）；下单多于成交说明补仓单挂着没吃到
+              r.round.topupOrders === 0 && r.round.topupFills === 0
+                ? '-'
+                : (r.round.topupFills === r.round.topupOrders ? String(r.round.topupFills) : `${r.round.topupFills}/${r.round.topupOrders}下单`),
             ];
           }),
           note: '本轮仓位 = 该轮买入成交累加出来的数量（`BUY_FILLED` 没有数量字段，用**累计成本增量 ÷ 该笔价**推得）；'

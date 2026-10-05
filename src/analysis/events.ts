@@ -61,6 +61,9 @@ export const CRITICAL_EVENTS: readonly string[] = [
   'UDS_RETRY_FAIL_ALERT', 'MARKET_STREAM_UNRECOVERED',
   'SELL_ORDER_LOST', 'SELL_STATE_UNRECONCILED', 'SELL_STATE_NO_LEDGER_MANUAL',
   'RESET_CANCEL_FAILED', // 撤单失败 ⇒ 交易所可能仍留着本程序的挂单（资金安全）
+  // 补仓已成交但**换卖单失败**：模板注释写"本轮补过仓属于'不自动重建'的守卫，程序不会自动重挂卖单；
+  // 下一笔买单成交时会再挂"⇒ 这轮在下一笔买单成交前**不会卖出**（就是我们看到的"卡住"），且注释明说要人工核对
+  'TOPUP_REPLACE_FAILED',
   'STARTUP_ERROR', 'RECOVERY_WRITE_FAILED',
 ];
 
