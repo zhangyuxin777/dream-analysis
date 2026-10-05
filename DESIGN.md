@@ -187,7 +187,7 @@ dream-analysis/
    e. 通过 → 原子 rename 到 data/<instance>/<date>.jsonl.gz，写 state{etag,size,count,final,whitelistVersion}
       失败 → 删除 tmp，suspects[key] = {count, etag, lastErrorAt}（**退避，不是拉黑**）
 4. 更新 runtime/sync-state.json：每 (instance,date) 一条记录 + lastRun（含 deferred/whitelistChanges）
-5. 清理：>1 小时的 tmp 残留；raw 按 retentionDays / maxDiskGB 淘汰最旧（记日志）
+5. 清理：只清 >1 小时的 tmp 残留。**本地分片永不自动删除**（见 §五 的说明）；盘满就响亮失败
 6. 释放锁（finally）
 ```
 
@@ -212,12 +212,27 @@ dream-analysis/
 | 手动 sync 撞上常驻同步 | 后来者拿不到锁 ⇒ **明确拒绝**并在输出里说明；`status` 会显示当前持有者与时长 |
 | 残留锁（持有者进程已死） | 下一次同步**自动接管**（同机判活）；`status` 提示"残留锁，下次自动接管" |
 | OSS 不可达 / 403 | 不抛出进程；记 error；本轮结束、下一轮按间隔重试（**list 的指数退避重试列为 M4 待办**） |
-| 磁盘水位 | 超 `sync.maxDiskGB` → 淘汰最旧日期（至少留一份） |
+| 磁盘水位 | **不自动淘汰**：本地就是源数据的唯一副本，消费端不当看门人（盘满则写入报错，需人工处理） |
 | 时区 | 全部 `Asia/Shanghai`（契约时区；判日期归属必须用它，不能拿 `ts` 的 UTC 日期前缀） |
 | 并发 | **进程内单并发**（调度器 promise 闸门）+ **跨进程单并发**（`sync.lock`）；分析任务同样串行（§九） |
 
 ---
 
+### 两条定案（2026-10-04，改了就别再绕回去）
+
+**① 本地分片永不自动删除。** 曾经有过"按保留期（90 天）+ 磁盘上限淘汰最旧"，为此还得维护"淘汰墓碑"
+（否则删掉水位线后，桶里的老对象每轮都会被重新下载再删一遍）。那套机制自己长出两轮 P5 缺陷（含 1 个 Critical），
+而收益≈0：分片 ~200KB/天/实例 ⇒ 10 实例 5 年 ≈ 3.6GB。**消费端只做过滤与分析，不当数据的看门人**；
+盘满就响亮失败（写入报错），要腾地方用显式手段。`retentionDays`/`maxDiskGB` 已废弃（配置里留着只告警）。
+
+**② 轮次身份 = `R<计数器>`**（取第一段中划线之前）：`R596-190959` / `R596-191307-RCV` / `R000-ERR-RCV`
+都归到 `R596` / `R000`。主仓重启时能从**本地缓存**恢复准确的计数器，所以计数器就是稳定身份；
+`-RCV` 与时间戳后缀只是**同一轮的显示名**。这条规则取代了此前那套"出现记录数组 + `-RCV` 兜底 + 错误态 id 特例"
+（在消费端重建身份 = 过度设计）。仍保留两个安全网：计数器复用 ⇒ 当作新轮 + 告警；带仓恢复快照
+（`STARTUP_RECOVERY_DONE{round,accCost,accSz}`）也算一轮（有些轮的 `NEW_ROUND` 没采到，只靠它才认得出）。
+
+**③ 分析器的窗口上限由它自己声明**（`Analysis.maxWindowHours`）：`stuck` 要回看几个月，
+否则 `window=近90d` 会先被通用的 30 天上限拦掉。
 ## 六、分析层设计
 
 ### 统一契约
@@ -253,7 +268,8 @@ interface Analysis {
 | name | 别名 | 说明 | 依赖事件 | 依赖上传侧 |
 |---|---|---|---|---|
 | `health` | `hc` | 数据新鲜度、事件密度、`ACCOUNT_OBSERVED` 心跳缺口、异常计数 | 全部 + account | — |
-| `rounds` | `r` | 轮数、成交笔数、止盈/整轮利润、未完成轮、卡轮 Top N | `NEW_ROUND` `SELL_FILLED` `ROUND_COMPLETED` | — |
+| ounds |  | **窗口语义**：轮数、成交笔数、止盈/整轮利润、未完成轮、最长卡轮 Top N | NEW_ROUND SELL_FILLED ROUND_COMPLETED | — |
+| stuck | sk | **状态语义**：当前还开着的轮（跨窗口）、已持有/卡住多久、本轮仓位与浮亏、>24h/>72h/>7天 分档 | NEW_ROUND BUY_FILLED ROUND_COMPLETED RESET_CANCEL_SUCCESS STARTUP_RECOVERY_DONE ACCOUNT_OBSERVED | — |
 | `topup` | `tu` | 补仓次数/贡献、深跌期行为 | `TOPUP_*` `CRASH_*` | — |
 | `stopgaps` | `sg` | **有没有偷偷停轮**：`STOP_SIGNAL_RECEIVED` / `RESUME_SIGNAL_RECEIVED` 时间线 | 停轮/复轮 | — |
 | `errors` | `e` | 异常事件分组明细（按类型 + 最近 N 条） | `*_ERROR` `*_FAILED` `SELL_STATE_*` | 部分需 ③ |
@@ -358,9 +374,7 @@ report [instance] [窗口]      M3：概览（health + rounds 摘要）——**�
     "intervalMinutes": 60,                // 与上传侧产出同频（不要 10 分钟，见 §3.5）
     "minAgeSeconds": 60,                  // 竞态保护
     "countIncludesHeader": false,         // 待上传侧确认
-    "maxDiskGB": 2,
-    "retentionDays": 90,
-    "concurrency": 1
+        "concurrency": 1
   },
   "bot": {
     "type": "lark",                       // 或 dingtalk；**必须独立应用**
@@ -408,7 +422,7 @@ report [instance] [窗口]      M3：概览（health + rounds 摘要）——**�
 ## 十一、测试策略
 
 - **分析器**：真实 ndjson 裁剪样本 → 结果快照；必须覆盖"窗口内缺天"与"含 final:false 天"两个告警分支。
-- **拉取器**：mock `ObjectStore` —— ETag 命中跳过、ETag 变化重拉、解压失败、行数不符、退避重试、磁盘淘汰。
+- **拉取器**：mock `ObjectStore` —— ETag 命中跳过、ETag 变化重拉、解压失败、行数不符、退避重试；**本地分片永不被删**（有测试钉着）。
 - **ndjson 解析**：gz 流式、header 校验、坏行计数、account 行处理。
 - **时间窗口解析**：表驱动。
 - **指令路由**：表驱动（鉴权、未知指令、并发上限、help 由注册表生成）。
@@ -447,7 +461,7 @@ report [instance] [窗口]      M3：概览（health + rounds 摘要）——**�
 0. **M4：`list` 失败的指数退避重试**（现在失败只记 error + 等下一轮，间隔 60 分钟）。要加就加在有注入 sleep 的地方，并补"退避期间不重复调用"的单测。
 1. **只读用户**（建议，**不阻塞开工**）：给分析侧单独一对 AK（`GetObject` + `ListObjects` + `GetObjectMeta`，资源 `snapshot/*`）。**新增用户不动现有策略**。理由：分析服务挂着机器人、对外接收消息，是暴露面最大的一环，不宜持有"能写能删"的钥匙。
 2. **钉钉应用凭据**：AppKey/AppSecret 由大哥填进 002 的 `env.json`（不经我手）；随后在群里 @ 机器人一次，用 `whoami` 取 `staffId` / `conversationId` 回填白名单。
-3. **保留策略**：OSS 90 天 / 本地 90 天，独立可调。
+3. **保留策略**：OSS 侧由上传侧决定（当前无生命周期清理）；**本地永不自动删除**（消费端只读源数据）。
 4. **M1 契约核对清单**（拿第一批真数据跑）：
    ① `header.count` 与数据行数一致；
    ② `firstTs/lastTs` 覆盖整天；
