@@ -307,7 +307,7 @@ test('★存活取"先到者"：复位行排在下一轮开轮之后时，不能
   assert.match(r004[5], /复位掐断/, '结局仍按"确实被复位过"报（两件事都真）');
 });
 
-test('★开轮不在窗口内的轮：存活标成 ≥（下界），并出告警——不假装知道起点', async () => {
+test('★开轮不在窗口内的轮：不进"未完成轮"表（那是窗口语义），但要告警指向 stuck 视图', async () => {
   const events = [
     // 这一轮的 NEW_ROUND 在窗口之前（短窗口把它切成了两半），窗口内只有成交
     ev('2026-10-01T05:00:00.000Z', 'BUY_FILLED', 'ETHFDUSD', { index: 0 }, 'R009-010000'),
@@ -318,13 +318,11 @@ test('★开轮不在窗口内的轮：存活标成 ≥（下界），并出告�
   const result = await run(events, {}, { window: '2026-10-01' });
   const warning = result.warnings.join('\n');
   assert.match(warning, /1 轮的开轮事件不在本窗口内/);
-  assert.match(warning, /下界/);
+  assert.match(warning, /stuck/);
 
   const aging = result.sections.find((s) => s.heading.startsWith('未完成轮'));
-  const r009 = aging.rows.find((r) => r[1].includes('R009'));
-  assert.ok(r009, '这一轮必须列出来（它有成交、真在开着）：' + JSON.stringify(aging.rows));
-  assert.match(r009[2], /^≥/, '起点不在窗口内 ⇒ 存活只能给下界');
-  assert.equal(r009[3], '是', '窗口内有买入成交 ⇒ 已建仓');
+  assert.ok(!aging.rows.some((r) => String(r[1]).includes('R009')), '起点不在窗口内的轮不进窗口表（避免把窗口统计撑大）');
+  assert.ok(aging.rows.some((r) => String(r[1]).includes('R010')), '窗口内开的那轮要在：' + JSON.stringify(aging.rows));
 });
 test('★补仓时长：已结束的轮要能看出"慢在补仓还是慢在等"', async () => {
   const ev2 = (ts, event, symbol, data, roundId) => ({ ts, event, symbol, roundId, instance: 'a', localDate: ts.slice(0, 10), seq: 1, data });

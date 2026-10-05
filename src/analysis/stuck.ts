@@ -75,6 +75,8 @@ export function stuckAnalysis(): Analysis {
     name: 'stuck',
     aliases: ['sk'],
     help: '卡住轮：当前仍未收口的轮（跨窗口）、已持有/卡住多久、本轮仓位与浮亏、>24h/>72h/>7天 分档',
+    // 回看上限用**自己的** MAX_LOOKBACK_DAYS（不是通用的 30 天）：卡住轮本来就可能跨越几个月
+    maxWindowHours: MAX_LOOKBACK_DAYS * 24,
     params: [
       { name: 'instance', description: '实例名（默认全部实例）', example: 'zyx666' },
       { name: 'symbol', description: '币种（支持短名，默认全部）', example: 'eth' },
@@ -86,13 +88,13 @@ export function stuckAnalysis(): Analysis {
       const nowMs = ctx.now.getTime();
       const warnings: string[] = [];
 
-      // `window` 只当**回看起点**用（不拿它过滤事件！）—— 过滤会让"开轮在窗口外"的轮整个消失或让时长被低估
+      // `window` 只当**回看起点**用（不拿它过滤事件！）—— 过滤会让"开轮在窗口外"的轮整个消失或让时长被低估。
+      // 注意：传了 window 时 runner 已经解析过一遍（并带上了本分析器自己的上限），这里直接用它，别再解析第二次。
       let boundMs: number | null = null;
       let boundLabel = `最多回看 ${MAX_LOOKBACK_DAYS} 天`;
       if (ctx.params.window) {
-        const w = parseWindow(ctx.params.window, ctx.now, '近30d', { maxHours: MAX_WINDOW_HOURS });
-        boundMs = w.fromMs;
-        boundLabel = `回看起点 ${w.label}`;
+        boundMs = ctx.window.fromMs;
+        boundLabel = `回看起点 ${ctx.window.label}`;
       }
 
       // 可用天数：从最新往回，最多 MAX_LOOKBACK_DAYS 天（成本 ∝ 实际扫的天数，不 ∝ 历史总量）
@@ -122,12 +124,16 @@ export function stuckAnalysis(): Analysis {
         for (const f of dayStats.failedShards) failedShards.push(f.key);
         buffers.push({ ms: day.ms, events });
         scannedDays++;
-        const progress = scanProgress(buffers);
-        // 停的条件：**已经找到每个见过的 (实例,币种) 当前那轮的开轮** 且 **最旧那天没带来新的 (实例,币种)**
-        // （后者是"静默日"判据；否则会出现"只扫了最新一天就把别的币种/停了的实例整个漏掉"）。
-        if (scannedDays >= MIN_LOOKBACK_DAYS && progress.allOpened && !progress.addedNewKeys) {
-          stoppedEarly = true;
-          break;
+        // 显式给了 window ⇒ 用户在指定范围，**扫满不早停**（否则 `window=近90d` 也会在 3 天就停，
+        // 而告警又建议"用近90d"，形成一条跑不通的建议 —— 真数据踩过）
+        if (!ctx.params.window) {
+          const progress = scanProgress(buffers);
+          // 停的条件：**已经找到每个见过的 (实例,币种) 当前那轮的开轮** 且 **最旧那天没带来新的 (实例,币种)**
+          // （后者是"静默日"判据；否则会出现"只扫了最新一天就把别的币种/停了的实例整个漏掉"）。
+          if (scannedDays >= MIN_LOOKBACK_DAYS && progress.allOpened && !progress.addedNewKeys) {
+            stoppedEarly = true;
+            break;
+          }
         }
       }
       if (days.length === 0) warnings.push('本地没有任何分片落在选定范围内 —— 先同步（sync），或把 window 放宽');
@@ -138,12 +144,21 @@ export function stuckAnalysis(): Analysis {
       const accounts = collector.accounts();
       const lastSeen = collector.lastSeen();
 
+      // 本地有、但这几天的回看范围里一条事件都没有的实例 —— 静默跳过等于把它的轮次瞒下来（复验的 Critical）
+      const unscanned = ctx.source.instances().filter((inst) => !lastSeen.has(inst));
+      if (unscanned.length > 0) {
+        warnings.push(
+          `本地还有 ${unscanned.length} 个实例（${unscanned.slice(0, 3).join('、')}${unscanned.length > 3 ? ' 等' : ''}）`
+            + `的分片不在已回看的 ${scannedDays} 天内 ⇒ 它们的轮次**没有参与本次判断**（可能实例已停）；`
+            + '要用 `window=近90d` 往前多扫一段再确认',
+        );
+      }
+
       // **还开着**的轮 = 没有 ROUND_COMPLETED **且没有后继轮**。
       // 只判"没看到完成事件"是不够的：偏离复位（PRICE_DEVIATION）掐断的轮也不会有完成事件，
       // 但它已经结束了（后面开了新一轮）——真数据上那样会把 10 个空等轮全列成"未收口"，把真正在开的那轮埋掉。
       const rows: StuckRow[] = [];
       for (const [symbol, s] of bySymbol.entries()) {
-        if (ctx.params.symbol && !symbol.toUpperCase().startsWith(ctx.params.symbol.toUpperCase())) continue;
         for (const list of groupByInstance(allRoundsOf(s)).values()) {
           for (let i = 0; i < list.length; i++) {
             const r = list[i];
@@ -178,6 +193,9 @@ export function stuckAnalysis(): Analysis {
         }
       }
       rows.sort((a, b) => b.stuckHours - a.stuckHours);
+      // 币种过滤只影响**显示**：交叉核对要用未过滤的全集（否则 `sk eth` 会把别的币种的持仓误报成"对不上轮次"）
+      const allRows = rows;
+      const shown = ctx.params.symbol ? rows.filter((r) => r.symbol.toUpperCase().startsWith(ctx.params.symbol!.toUpperCase())) : rows;
 
       // ---- 告警（每一条都要能指向"哪里不对"）----
       stats0Guard(warnings, days.length, scannedDays, stoppedEarly, boundLabel);
@@ -188,14 +206,14 @@ export function stuckAnalysis(): Analysis {
         );
       }
       if (badLines > 0) warnings.push(`有 ${badLines} 行无法解析（分片本身可疑，见 verify）`);
-      const withPosition = rows.filter((r) => r.round.firstBuyMs !== null);
-      const noAccount = rows.filter((r) => r.accountQty === null);
-      if (rows.length === 0) {
+      const withPosition = shown.filter((r) => r.round.firstBuyMs !== null);
+      const noAccount = shown.filter((r) => r.accountQty === null);
+      if (shown.length === 0) {
         warnings.push('当前没有还开着的轮（每个 (实例,币种) 的最后一轮都已收口/被掐断）—— 若与实盘不符，先确认数据是否已同步');
       } else if (noAccount.length > 0) {
         warnings.push(`有 ${noAccount.length} 轮拿不到账户观测（ACCOUNT_OBSERVED 里没有对应资产）⇒ 市值/浮亏显示为 "-"`);
       }
-      const mismatch = rows.filter(
+      const mismatch = shown.filter(
         (r) => r.accountQty !== null && r.round.qty > 0 && Math.abs(r.accountQty - r.round.qty) / Math.max(r.accountQty, r.round.qty) > 0.02,
       );
       if (mismatch.length > 0) {
@@ -204,7 +222,7 @@ export function stuckAnalysis(): Analysis {
             + '浮亏只按**本轮自己的数量**算，账户总量见"账户同币"列',
         );
       }
-      const outsideScan = rows.filter((r) => r.round.startOutsideScan).length;
+      const outsideScan = shown.filter((r) => r.round.startOutsideScan).length;
       if (outsideScan > 0) {
         warnings.push(
           `有 ${outsideScan} 轮的开轮事件不在已扫描范围（${boundLabel}）⇒ 它们的"已开/卡住"是**下界**（已用 ≥ 标出）`,
@@ -215,7 +233,7 @@ export function stuckAnalysis(): Analysis {
         warnings.push(`发生 ${reused} 次计数器复用（同一个 R<计数器> 开过两轮）—— 理论上不该发生，请核对主仓的轮次计数器`);
       }
       const staleInstances = new Map<string, number>();
-      for (const r of rows) {
+      for (const r of shown) {
         if (r.dataAgeHours > STALE_INSTANCE_HOURS) {
           const prev = staleInstances.get(r.instance);
           if (prev === undefined || r.dataAgeHours > prev) staleInstances.set(r.instance, r.dataAgeHours);
@@ -235,7 +253,7 @@ export function stuckAnalysis(): Analysis {
       const heldWithoutRound: string[] = [];
       const seenBases = new Set<string>();
       for (const symbol of bySymbol.keys()) seenBases.add(baseAssetOf(symbol));
-      const openByInstanceBase = new Set(rows.map((r) => `${r.instance}\u0000${baseAssetOf(r.symbol)}`));
+      const openByInstanceBase = new Set(allRows.map((r) => `${r.instance}\u0000${baseAssetOf(r.symbol)}`));
       for (const acc of accounts.values()) {
         for (const [asset, b] of acc.balances) {
           if (b.qtyFree + b.qtyLocked <= 0) continue;
@@ -265,23 +283,23 @@ export function stuckAnalysis(): Analysis {
         heading: '卡住分档',
         headers: ['档位', '轮数'],
         rows: [
-          ['未收口合计', String(rows.length)],
+          ['未收口合计', String(shown.length)],
           ['其中已建仓', String(withPosition.length)],
           // 分档只算**已建仓**的轮：回测的 duration_hours 只存在于有成交的轮上，
           // 把"空等"（一笔没成交就被复位）也算进来会把卡住率系统性抬高（P5 批二的 Warning）
           ...buckets.map((b) => [b.label, String(withPosition.filter((r) => b.test(r.stuckHours)).length)]),
-          ['空等轮（未建仓，不计入分档）', String(rows.length - withPosition.length)],
+          ['空等轮（未建仓，不计入分档）', String(shown.length - withPosition.length)],
           ['最长卡住（已建仓）', longest === null ? '-' : hoursText(longest)],
         ],
         note: '卡住 = 从**末笔买入**算起（与回测 duration_hours 同口径：末次买入→卖出）；空等轮（还没成交就被复位/一直没等到买单）'
           + '不参与分档，单列出来。未收口 = 既没有 ROUND_COMPLETED、后面也没有再开新一轮（**真还开着**）。',
       });
 
-      if (rows.length > 0) {
+      if (shown.length > 0) {
         sections.push({
-          heading: `未收口轮 Top ${Math.min(topN, rows.length)}（按卡住时长降序）`,
+          heading: `未收口轮 Top ${Math.min(topN, shown.length)}（按卡住时长降序）`,
           headers: ['实例', '数据', '币种', '轮次', '已开', '持仓', '卡住', '本轮仓位', '账户同币', '轮次成本', '浮亏', '补仓'],
-          rows: rows.slice(0, topN).map((r) => {
+          rows: shown.slice(0, topN).map((r) => {
             const openHours = Math.max(0, nowMs - r.round.firstMs) / 3_600_000;
             const stale = r.dataAgeHours > STALE_INSTANCE_HOURS;
             return [
@@ -325,9 +343,9 @@ export function stuckAnalysis(): Analysis {
         });
       }
 
-      const summary = rows.length === 0
+      const summary = shown.length === 0
         ? `当前没有还开着的轮（扫了 ${scannedDays} 天 / ${bySymbol.size} 个币种）`
-        : `${rows.length} 轮还开着（已建仓 ${withPosition.length}）` + (longest === null ? '' : `，最长卡住 ${hoursText(longest)}`);
+        : `${shown.length} 轮还开着（已建仓 ${withPosition.length}）` + (longest === null ? '' : `，最长卡住 ${hoursText(longest)}`);
 
       return {
         title: `卡住轮 · ${ctx.params.symbol ? ctx.params.symbol.toUpperCase() + ' · ' : ''}${boundLabel}`,

@@ -64,6 +64,12 @@ export interface Analysis {
   /** 一行用法说明（自动进 help） */
   help: string;
   params?: ParamSpec[];
+  /**
+   * 这个分析器允许的最大窗口（小时），默认 `MAX_WINDOW_HOURS`。
+   * 例：`stuck` 要回看几个月（卡住轮本来就可能跨越几个月）⇒ 自己声明更大的上限，
+   * 否则 `window=近90d` 会先被通用上限拦掉（真数据踩过）。
+   */
+  maxWindowHours?: number;
   run(ctx: AnalysisContext): Promise<AnalysisResult>;
 }
 

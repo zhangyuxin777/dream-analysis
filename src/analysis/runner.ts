@@ -53,7 +53,10 @@ export async function runAnalysis(opts: RunAnalysisOptions): Promise<RunAnalysis
   const now = opts.now ?? new Date();
 
   // 窗口解析的错误（WindowParseError / WindowTooLongError）原样抛出，由调用方给出对应文案
-  const window = parseWindow(opts.params.window, now, undefined, { maxHours: opts.maxWindowHours ?? MAX_WINDOW_HOURS });
+  const window = parseWindow(opts.params.window, now, undefined, {
+    // 上限由**分析器自己**决定（如 stuck 要回看几个月），否则 window=近90d 会先被通用上限拦掉
+    maxHours: opts.maxWindowHours ?? analysis.maxWindowHours ?? MAX_WINDOW_HOURS,
+  });
 
   const { state, warnings } = loadState(statePathOf(opts.config));
   const source = new LocalEventSource({

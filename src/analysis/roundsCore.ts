@@ -99,9 +99,16 @@ export interface SymbolRoundStats {
   duplicateCompletions: number;
 }
 
-/** 允许创建/更新轮次记录的事件（其余带 roundId 的事件一律不进账本，避免"影子轮"） */
+/**
+ * 允许创建/更新轮次记录的事件。
+ * `STARTUP_RECOVERY_DONE` 也在内：它是**带仓恢复的仓位快照**（`round`/`accCost`/`accSz`），
+ * 有些轮的 `NEW_ROUND` 根本没采到、只靠它才认得出当前轮（真数据 localtest BTC 就是这个形态）——
+ * 之前把它排除掉，会让"上一轮还开着"的虚报和整轮丢失（P5 复验的 Critical）。
+ * 其余带 roundId 的事件（PROFIT_PLACE_*、ATR、配置类）仍然不进账本，避免造出"影子轮"。
+ */
 const ROUND_EVENTS = new Set([
   'NEW_ROUND', 'ROUND_FIRST_FILL', 'BUY_FILLED', 'SELL_FILLED', 'ROUND_COMPLETED', 'RESET_CANCEL_SUCCESS',
+  'STARTUP_RECOVERY_DONE',
 ]);
 
 export function newSymbolRoundStats(): SymbolRoundStats {
@@ -186,15 +193,18 @@ export function createRoundCollector(): RoundCollector {
     }
 
     const roundId = e.roundId ?? strOf(e.data, 'roundId') ?? '';
-    const counter = roundId === '' ? '' : roundCounterOf(roundId);
+    // 带仓恢复快照：只有真有仓位（accCost > 0）才当一轮；空仓重启的 round:0 不是轮
+    const recovery = e.event === 'STARTUP_RECOVERY_DONE' ? recoveryCounterOf(e.data) : '';
+    const counter = roundId !== '' ? roundCounterOf(roundId) : recovery;
 
     if (counter !== '') {
       const key = `${e.instance}\u0000${symbol}\u0000${counter}`;
+      const displayId = roundId !== '' ? roundId : counter;
       let r = s.rounds.get(key);
       if (!r) {
         // 被非开轮事件创建（开轮在扫描范围外）⇒ 起点只是下界，必须标出来
         r = {
-          counter, instance: e.instance, symbol, displayId: roundId, firstMs: ms,
+          counter, instance: e.instance, symbol, displayId, firstMs: ms,
           startOutsideScan: e.event !== 'NEW_ROUND', completed: false,
           firstBuyMs: null, lastBuyMs: null, resetReason: null, resetMs: null, buyFills: 0, accCost: null, qty: 0,
           completedAtMs: null, durationHours: null, profitCents: null, isCrashMode: false, reusedCount: 0,
@@ -204,7 +214,7 @@ export function createRoundCollector(): RoundCollector {
         // ⚠️ 只有**非开轮**事件才更新显示名（恢复改名后的 ROUND_FIRST_FILL/成交带的 -RCV 名字）。
         // 开轮事件的改名在下面的复用分支里处理 —— 否则"归档旧轮"会把**新轮的名字**抄到旧轮上
         // （真数据实测过：两行都显示最新的那个 roundId）。
-        if (e.event !== 'NEW_ROUND') r.displayId = roundId;
+        if (e.event !== 'NEW_ROUND' && roundId !== '') r.displayId = roundId;
       }
 
       switch (e.event) {
@@ -275,6 +285,14 @@ export function createRoundCollector(): RoundCollector {
           r.resetReason = strOf(e.data, 'reason');
           r.resetMs = ms;
           break;
+        case 'STARTUP_RECOVERY_DONE': {
+          // 带仓恢复快照：accSz 是**观测到的持仓数量**（比从成交推更准），accCost 是累计成本
+          const accSz = numOf(e.data, 'accSz');
+          const accCost = numOf(e.data, 'accCost');
+          if (accSz !== null && accSz > 0) r.qty = accSz;
+          if (accCost !== null && accCost > 0) r.accCost = accCost;
+          break;
+        }
         default: break; // ROUND_FIRST_FILL：只用来认轮（上面的 get/create 已完成）
       }
       return;
@@ -321,6 +339,14 @@ export function aliveHours(state: RoundState, nextFirstMs: number | null, refere
   const ends = [cutMs, nextFirstMs].filter((v): v is number => v !== null);
   const endMs = ends.length > 0 ? Math.min(...ends) : referenceMs;
   return Math.max(0, endMs - state.firstMs) / 3_600_000;
+}
+
+/** 带仓恢复快照里的计数器：`STARTUP_RECOVERY_DONE{round, accCost}`；空仓（accCost ≤ 0）不算 */
+function recoveryCounterOf(data: Record<string, unknown> | undefined): string {
+  const accCost = numOf(data, 'accCost');
+  const round = numOf(data, 'round');
+  if (accCost === null || accCost <= 0 || round === null || round < 0) return '';
+  return `R${String(round).padStart(3, '0')}`;
 }
 
 /** 一个币种下的**全部**轮次（当前 + 被计数器复用顶掉的旧轮）——报表与 stuck 都要看全 */

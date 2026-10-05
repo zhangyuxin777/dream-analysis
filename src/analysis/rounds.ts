@@ -98,10 +98,13 @@ export function roundsAnalysis(): Analysis {
         const rounds = allRoundsOf(s);
         for (const list of groupByInstance(rounds).values()) {
           for (let i = 0; i < list.length; i++) {
-            if (!list[i].completed) openRows.push({ symbol, round: list[i], nextFirstMs: nextFirstMsOf(list, i) });
+            const r = list[i];
+            // 只算"窗口内**开了新轮**"的（note 的定义）：靠带仓恢复快照才认出来的轮（startOutsideScan）
+            // 起点不在本窗口 ⇒ 不进这张表（它们的现状归 stuck 视图）
+            if (!r.completed && !r.startOutsideScan) openRows.push({ symbol, round: r, nextFirstMs: nextFirstMsOf(list, i) });
           }
         }
-        const open = rounds.filter((r) => !r.completed).length;
+        const open = rounds.filter((r) => !r.completed && !r.startOutsideScan).length;
         // 不带 id 的新轮（旧日志）按计数差兜底：与不带 id 的完成事件配对
         const unfinished = open + Math.max(0, s.newRoundsWithoutId - s.idlessCompletions);
 
