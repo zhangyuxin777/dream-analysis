@@ -5,9 +5,9 @@
  * - **数据完整性**：窗口覆盖的本地日里缺哪几天（缺口必须出现在结果里）
  * - **事件密度**：总事件数 / 分片数 / 窗口时长
  * - **心跳**：`ACCOUNT_OBSERVED` 是账户级观测（上传侧每小时跑一次），把它当"程序还活着"的脉搏；
- *   相邻两条间隔超过阈值 ⇒ 疑似停摆/断流。**注意**：白名单当前不一定包含 `UDS_*`/`MARKET_STREAM_*`，
- *   所以这里只能报"疑似停摆"，分不清断流、停机还是单纯没成交 —— 这句话必须写进结论里，别让人误读。
- * - **异常计数**：事件名命中 `_ERROR/_FAILED/UNRECOVERED/_ALERT` 的按类型计数
+ *   相邻两条间隔超过阈值 ⇒ 疑似停摆。**断流与停机的区分请用 `stream` 分析器**（它直接读
+ *   `UDS_CONN_*`/`MARKET_STREAM_*`/`WS_*` —— 这些**都在白名单里**，2026-10-05 核对）。
+ * - **需要看的事件计数**：清单在 `events.ts`（逐个列名，不再用后缀正则 —— 那会漏报）
  */
 import { Analysis, AnalysisContext, AnalysisResult, MAX_WINDOW_HOURS, Section, numOf, strOf } from './types';
 import { formatShanghai, windowHours } from '../common/time';
@@ -142,8 +142,8 @@ export function healthAnalysis(): Analysis {
       if (totals.events === 0) warnings.push('窗口内没有任何事件 —— 先确认上传侧是否在产出、本机是否同步过（doctor --deep）');
       if (totals.heartbeatMaxGapMs !== null && totals.heartbeatMaxGapMs > HEARTBEAT_GAP_ALERT_MS) {
         warnings.push(
-          `ACCOUNT_OBSERVED 最大间隔 ${(totals.heartbeatMaxGapMs / 3_600_000).toFixed(1)}h（实例 ${totals.heartbeatWorstInstance ?? '-'}，阈值 ${HEARTBEAT_GAP_ALERT_MS / 3_600_000}h）—— 疑似停摆/断流；` +
-            '当前数据源不含 UDS_*/MARKET_STREAM_* 连接事件，无法区分"断流"与"进程停机"',
+          `ACCOUNT_OBSERVED 最大间隔 ${(totals.heartbeatMaxGapMs / 3_600_000).toFixed(1)}h（实例 ${totals.heartbeatWorstInstance ?? '-'}，阈值 ${HEARTBEAT_GAP_ALERT_MS / 3_600_000}h）—— 疑似停摆；` +
+            '要区分"断流"与"进程停机"请跑 stream（它直接读连接事件）',
         );
       }
       if (totals.heartbeatCount === 0 && totals.events > 0) {
@@ -233,7 +233,7 @@ export function healthAnalysis(): Analysis {
         summary:
           totals.events === 0
             ? '窗口内没有事件（数据没到或没同步）'
-            : `${totals.shards} 个分片 / ${totals.events} 条事件，异常类事件 ${[...totals.errorCounts.values()].reduce((s, n) => s + n, 0)} 条` +
+            : `${totals.shards} 个分片 / ${totals.events} 条事件，需要看的事件 ${[...totals.errorCounts.values()].reduce((s, n) => s + n, 0)} 条` +
               (totals.heartbeatMaxGapMs === null ? '' : `，心跳最大间隔 ${(totals.heartbeatMaxGapMs / 60_000).toFixed(0)}min`),
         sections,
         warnings,

@@ -13,19 +13,16 @@
  */
 import { Analysis, AnalysisContext, AnalysisResult, MAX_WINDOW_HOURS, Section } from './types';
 import { formatShanghai, windowHours } from '../common/time';
-import {
-  CONNECTION_EVENTS,
-  OUTAGE_END_EVENTS,
-  OUTAGE_START_EVENTS,
-  detailOf,
-  isConnection,
-} from './events';
+import { CONNECTION_EVENTS, ConnChannel, detailOf, isConnection, outageEndChannel, outageStartChannel } from './events';
 
 /** 累计断流超过窗口的这个比例就告警（行情流断这么久，策略等于瞎跑） */
 export const OUTAGE_RATIO_ALERT = 0.02;
+/** 最近明细只保留这么多条（连接事件可能很多） */
+export const DETAIL_KEEP = 500;
 
 interface Outage {
   instance: string;
+  channel: ConnChannel;
   startMs: number;
   startEvent: string;
   endMs: number | null;
@@ -52,7 +49,8 @@ export function streamAnalysis(): Analysis {
 
       const byType = new Map<string, number>();
       const outages: Outage[] = [];
-      const openByInstance = new Map<string, Outage>();
+      // 按 (实例, 通道) 各记一张未闭合表：三条连接互相独立，混着配对会把断流次数/时长算错
+      const openByKey = new Map<string, Outage>();
       const recent: Array<{ ts: string; instance: string; event: string; detail: string }> = [];
       let events = 0;
 
@@ -63,23 +61,28 @@ export function streamAnalysis(): Analysis {
           events++;
           byType.set(e.event, (byType.get(e.event) ?? 0) + 1);
           recent.push({ ts: e.ts, instance: e.instance, event: e.event, detail: detailOf(e.data, 2) });
+          if (recent.length > DETAIL_KEEP) recent.shift();
           const ms = Date.parse(e.ts);
           if (!Number.isFinite(ms)) return;
 
-          if (OUTAGE_START_EVENTS.includes(e.event)) {
-            const prev = openByInstance.get(e.instance);
-            if (prev && prev.endMs === null) return; // 已经在断流：不重复计时（连续几条断开事件算一次）
-            const outage: Outage = { instance: e.instance, startMs: ms, startEvent: e.event, endMs: null, endEvent: '' };
+          const startChannel = outageStartChannel(e.event);
+          if (startChannel !== null) {
+            const key = `${e.instance}\u0000${startChannel}`;
+            const prev = openByKey.get(key);
+            if (prev && prev.endMs === null) return; // 该通道已在断流：不重复计时（连续几条断开事件算一次）
+            const outage: Outage = { instance: e.instance, channel: startChannel, startMs: ms, startEvent: e.event, endMs: null, endEvent: '' };
             outages.push(outage);
-            openByInstance.set(e.instance, outage);
+            openByKey.set(key, outage);
             return;
           }
-          if (OUTAGE_END_EVENTS.includes(e.event)) {
-            const open = openByInstance.get(e.instance);
+          const endChannel = outageEndChannel(e.event);
+          if (endChannel !== null) {
+            const key = `${e.instance}\u0000${endChannel}`;
+            const open = openByKey.get(key);
             if (open && open.endMs === null && ms >= open.startMs) {
               open.endMs = ms;
               open.endEvent = e.event;
-              openByInstance.delete(e.instance);
+              openByKey.delete(key);
             }
           }
         },
@@ -138,7 +141,9 @@ export function streamAnalysis(): Analysis {
             ['未恢复告警 / 连续失败告警', `${unrecovered} / ${failAlerts}`],
             ['窗口结束时仍在断流', stillOpen.length === 0 ? '否' : `是（${stillOpen.map((o) => o.instance).join('、')}）`],
           ],
-          note: '断开 = `UDS_CONN_CLOSED`/`_CLOSED_STALE`/`_UNAVAILABLE`；恢复 = `UDS_SUBSCRIBE_OK`/`UDS_RETRY_OK`/`MARKET_STREAM_RECOVERED`。'
+          note: '按**三条独立通道**分别配对：uds（`UDS_CONN_CLOSED`/`_CLOSED_STALE`/`_UNAVAILABLE` → `UDS_SUBSCRIBE_OK`/`UDS_RETRY_OK`）、'
+            + 'market（`MARKET_STREAM_REARM` → `MARKET_STREAM_REARM_OK`/`MARKET_STREAM_RECOVERED`；币安路径不发 `UDS_CONN_CLOSED` 表示行情断流，rearm 才是权威起点）、'
+            + 'worker-ws（`WORKER_WS_CLOSE`/`WORKER_WS_STALE_RECONNECT` → `WS_RECONNECTED`/`WORKER_WS_SUBSCRIBED`）。'
             + '`UDS_CONN_ERROR` 只算报错、不算断开（瞬时错误当断流会把时长虚高）。',
         },
       ];

@@ -9,10 +9,12 @@
  */
 import { Analysis, AnalysisContext, AnalysisResult, MAX_WINDOW_HOURS, Section } from './types';
 import { windowHours } from '../common/time';
-import { detailOf, isAttention, isCritical, kindOf } from './events';
+import { EVENT_KINDS, detailOf, isAttention, isCritical, kindOf } from './events';
 
 /** 单类事件超过这个次数就提示"可能是风暴"（低频状态变化事件不该这么密） */
 export const STORM_THRESHOLD = 20;
+/** 明细只保留最近这么多条（窗口内可能几十万条匹配事件，全留在内存里会顶到 512M 重启线） */
+export const DETAIL_KEEP = 500;
 
 const KIND_LABEL: Record<string, string> = {
   round: '轮次/复位', profit: '止盈/订单', topup: '补仓', crash: '深跌', stop: '停轮',
@@ -29,12 +31,11 @@ export function errorsAnalysis(): Analysis {
       { name: 'instance', description: '实例名（默认全部实例）', example: 'zyx666' },
       { name: 'window', description: `时间窗口（最长 ${MAX_WINDOW_HOURS}h）`, example: '近7d' },
       { name: 'top', description: '最近明细条数（默认 10）', example: '30' },
-      { name: 'kind', description: '只看某一类（round/profit/topup/crash/stop/order/connection/recovery）', example: 'connection' },
+      { name: 'kind', description: `只看某一类（${EVENT_KINDS.join('/')}）—— 必须写 kind=xxx`, example: 'kind=connection' },
     ],
     async run(ctx: AnalysisContext): Promise<AnalysisResult> {
       const topN = Math.max(1, Math.min(200, Number(ctx.params.top ?? '10') || 10));
       const kindFilter = (ctx.params.kind ?? '').toLowerCase();
-      const knownKinds = ['round', 'profit', 'topup', 'crash', 'stop', 'order', 'connection', 'recovery', 'account', 'config', 'signal', 'other'];
 
       const byType = new Map<string, number>();
       const byInstance = new Map<string, number>();
@@ -54,15 +55,26 @@ export function errorsAnalysis(): Analysis {
           byInstance.set(e.instance, (byInstance.get(e.instance) ?? 0) + 1);
           byKind.set(kind, (byKind.get(kind) ?? 0) + 1);
           const row = { ts: e.ts, instance: e.instance, symbol: e.symbol ?? '-', event: e.event, detail: detailOf(e.data, 3) };
-          if (isCritical(e.event)) critical.push(row);
+          if (isCritical(e.event)) {
+            critical.push(row);
+            if (critical.length > DETAIL_KEEP) critical.shift();
+          }
           recent.push(row);
+          if (recent.length > DETAIL_KEEP) recent.shift();
         },
       );
 
       const warnings: string[] = [];
       // kind 写错要给告警：否则会输出"窗口内没有需要看的事件"，把拼写错误伪装成"一切正常"
-      if (kindFilter !== '' && !knownKinds.includes(kindFilter)) {
-        warnings.push(`kind="${ctx.params.kind}" 不是已知类别（可用：${knownKinds.join('/')}）—— 本次按该类别过滤，结果必然是空的`);
+      if (kindFilter !== '' && !EVENT_KINDS.includes(kindFilter as (typeof EVENT_KINDS)[number])) {
+        warnings.push(`kind="${ctx.params.kind}" 不是已知类别（可用：${EVENT_KINDS.join('/')}）—— 本次按该类别过滤，结果必然是空的`);
+      }
+      // `e connection`：裸参数会被绑到**位置参数第一位**（instance）⇒ 静默丢掉用户真正想看的实例
+      if (EVENT_KINDS.includes(ctx.params.instance as (typeof EVENT_KINDS)[number])) {
+        warnings.push(
+          `instance="${ctx.params.instance}" 是**类别名**，看起来你想写的是 kind=${ctx.params.instance}` +
+            '（裸参数按 symbol → instance → top 顺序填；kind 必须写成 kind=xxx）',
+        );
       }
       if (stats.missingDays.length > 0) {
         warnings.push(`窗口内缺 ${stats.missingDays.length} 天的本地数据: ${stats.missingDays.join(', ')}（异常可能被漏掉）`);

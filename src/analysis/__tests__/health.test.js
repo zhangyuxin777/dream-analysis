@@ -66,7 +66,7 @@ test('概览：事件数/分片/异常计数/心跳间隔/最近估值', async (
   assert.deepEqual(symbols.rows, [['__account__', '2'], ['ETHFDUSD', '2'], ['BTCFDUSD', '1']], '并列时按名字升序（顺序必须确定）');
 });
 
-test('心跳缺口超阈值 ⇒ 报"疑似停摆"，并**明确写出**分不清断流还是停机', async () => {
+test('心跳缺口超阈值 ⇒ 报"疑似停摆"，并指向 stream 去区分断流/停机', async () => {
   const gap = HEARTBEAT_GAP_ALERT_MS + 60_000;
   const events = [
     ev('2026-10-01T01:00:00.000Z', 'ACCOUNT_OBSERVED', '__account__', { totalValue: 1 }),
@@ -75,8 +75,8 @@ test('心跳缺口超阈值 ⇒ 报"疑似停摆"，并**明确写出**分不清
   const result = await run(events);
   const warning = result.warnings.join('\n');
   assert.match(warning, /ACCOUNT_OBSERVED 最大间隔/);
-  assert.match(warning, /疑似停摆\/断流/);
-  assert.match(warning, /无法区分"断流"与"进程停机"/, '必须写清数据源的局限，别让人误读成确诊');
+  assert.match(warning, /疑似停摆/);
+  assert.match(warning, /请跑 stream/, '连接事件本来就在白名单里 ⇒ 不能再说"数据源不含连接事件"，要把人指到 stream');
 });
 
 test('心跳按实例分开统计：一个实例停摆不会被另一个实例的正常心跳抵消', async () => {

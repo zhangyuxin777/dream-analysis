@@ -7,7 +7,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { errorsAnalysis } = require('../../../dist/analysis/errors');
 const { streamAnalysis } = require('../../../dist/analysis/stream');
-const { ATTENTION_EVENTS, CRITICAL_EVENTS } = require('../../../dist/analysis/events');
+const { ATTENTION_EVENTS, CRITICAL_EVENTS, CONNECTION_EVENTS, STOP_EVENTS, TOPUP_EVENTS, CRASH_EVENTS } = require('../../../dist/analysis/events');
 const { parseWindow } = require('../../../dist/common/time');
 
 const NOW = new Date('2026-10-03T12:00:00.000Z');
@@ -40,11 +40,28 @@ const section = (result, prefix) => result.sections.find((s) => s.heading.starts
 const overview = (result) => Object.fromEntries(section(result, '概览').rows.map((r) => [r[0], r[1]]));
 
 test('事件目录：逐个列名（后缀正则会漏的那几个必须在清单里）', () => {
-  for (const name of ['ORDER_EXPIRED', 'ORDER_UNKNOWN_STATUS', 'RESET_RATE_LIMITED', 'RATE_LIMITED', 'SELL_ORDER_LOST', 'SELL_STATE_UNRECONCILED', 'WORKER_WS_STALE_RECONNECT', 'WORKER_TICKER_INVALID', 'HEALTH_CHECK_NO_ORDERS', 'TOPUP_EXHAUSTED']) {
+  // ⚠️ `WORKER_WS_STALE_RECONNECT` **故意不算**"需要看"（模板注释：能自愈就不出声），所以不在这里
+  for (const name of ['ORDER_EXPIRED', 'ORDER_UNKNOWN_STATUS', 'RESET_RATE_LIMITED', 'RATE_LIMITED', 'SELL_ORDER_LOST', 'SELL_STATE_UNRECONCILED', 'WORKER_TICKER_INVALID', 'HEALTH_CHECK_NO_ORDERS', 'TOPUP_EXHAUSTED', 'RESET_CANCEL_FAILED', 'SELL_STATE_NO_LEDGER_MANUAL']) {
     assert.ok(ATTENTION_EVENTS.includes(name), `${name} 必须算"需要看"（旧的 _ERROR|_FAILED 后缀正则会漏掉它）`);
   }
   assert.ok(CRITICAL_EVENTS.includes('MARKET_STREAM_UNRECOVERED'));
   assert.ok(CRITICAL_EVENTS.includes('SELL_ORDER_LOST'));
+});
+
+test('★漂移检查：我引用的事件名必须都在主仓白名单里（本机有 dream_develop 时才跑，否则跳过）', () => {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const producer = path.join(__dirname, '..', '..', '..', '..', 'dream_develop', 'src', 'common', 'ossExport.ts');
+  if (!fs.existsSync(producer)) return; // 别的机器/CI 没有主仓 ⇒ 跳过，不算失败
+  const src = fs.readFileSync(producer, 'utf8');
+  const m = /TIMELINE_EVENT_WHITELIST[^=]*=\s*\[([\s\S]*?)\];/.exec(src);
+  assert.ok(m, '解析不出主仓白名单（格式变了？）');
+  const whitelist = new Set([...m[1].matchAll(/'([A-Z0-9_]+)'/g)].map((x) => x[1]));
+  assert.ok(whitelist.size >= 100, `白名单规模异常：${whitelist.size}`);
+
+  const mine = [...ATTENTION_EVENTS, ...CRITICAL_EVENTS, ...CONNECTION_EVENTS, ...STOP_EVENTS, ...TOPUP_EVENTS, ...CRASH_EVENTS];
+  const missing = [...new Set(mine)].filter((name) => !whitelist.has(name));
+  assert.deepEqual(missing, [], '这些事件名不在主仓白名单里 ⇒ 永远不会出现在分片里（清单漂移了，改回主仓的真名）');
 });
 
 test('errors：只列"需要看"的事件，分档最严重的那批，并能按类别过滤', async () => {
@@ -55,7 +72,7 @@ test('errors：只列"需要看"的事件，分档最严重的那批，并能按
     ev('2026-10-03T04:00:00.000Z', 'WORKER_DEVIATION_RESET', { bidPrice: 1, buy1Price: 1.01 }),
   ];
   const result = await runErrors(events);
-  assert.match(result.summary, /3 条需要看的事件（最该立刻看 1 条/);
+  assert.match(result.summary, /2 条需要看的事件（最该立刻看 1 条/); // WORKER_DEVIATION_RESET 是正常换锚机制，不算"需要看"
   const critical = section(result, '最该立刻看');
   assert.equal(critical.rows.length, 1);
   assert.equal(critical.rows[0][3], 'SELL_ORDER_LOST');
@@ -109,7 +126,7 @@ test('stream：未恢复/连续失败告警要单独点名；UDS_CONN_ERROR 不�
   ];
   const result = await runStream(events);
   const o = overview(result);
-  assert.equal(o['断开次数'], '0', 'UDS_CONN_ERROR 不算断开');
+  assert.equal(o['断开次数'], '1', 'MARKET_STREAM_UNRECOVERED 是行情流断流的权威起点（算 1 次）；UDS_CONN_ERROR 不算断开');
   assert.equal(o['未恢复告警 / 连续失败告警'], '1 / 1');
   assert.match(result.warnings.join('\n'), /未恢复\/连续失败/);
 });
