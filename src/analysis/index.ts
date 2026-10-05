@@ -5,10 +5,12 @@ import { Analysis, AnalysisRegistry, createDefaultRegistry } from './types';
 import { healthAnalysis } from './health';
 import { roundsAnalysis } from './rounds';
 import { stuckAnalysis } from './stuck';
+import { errorsAnalysis } from './errors';
+import { streamAnalysis } from './stream';
 
 /** 默认注册的实现清单（顺序即 help 的展示顺序，这里按名字排序了） */
 export function defaultAnalyses(): Analysis[] {
-  return [healthAnalysis(), roundsAnalysis(), stuckAnalysis()];
+  return [healthAnalysis(), roundsAnalysis(), stuckAnalysis(), errorsAnalysis(), streamAnalysis()];
 }
 
 export function createAnalysisRegistry(): AnalysisRegistry {

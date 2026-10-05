@@ -83,7 +83,7 @@ snapshot/<instance>/<YYYY-MM-DD>.jsonl.gz
 - `<instance>` = `env.json` 的 `name`（与 PM2 名 `grid-runner-<name>` 同源；**没配就拒绝上传**）✅
 - **只覆盖写两个键**：今天（`final:false`，每小时重写）、昨天（跨日后最后一次补齐 → `final:true`，之后不再碰）；`--backfill <date>` 是例外
 - 数据来自 `events_<symbol>.ndjson` **与** `events_account.ndjson`（**合并时间线**，account 行无业务 symbol）
-- 白名单（业务动作子集）：轮次生命周期、成交 `BUY_FILLED/SELL_FILLED`、`TOPUP_*`、`CRASH_ENTERED/EXITED`、`DYNAMIC_PROFIT_REDUCED`/`PROFIT_PLACE_*`、`STOP_SIGNAL_RECEIVED`/`RESUME_SIGNAL_RECEIVED`、`ACCOUNT_OBSERVED`、配置与信号读数
+- 白名单（业务动作子集）：轮次生命周期、成交 `BUY_FILLED/SELL_FILLED`、`TOPUP_*`、`CRASH_ENTERED/EXITED`、`DYNAMIC_PROFIT_REDUCED`/`PROFIT_PLACE_*`、`STOP_SIGNAL`/`STOP_SIGNAL_RESUMED`、`ACCOUNT_OBSERVED`、配置与信号读数
 
 ### 3.2 消费侧必须适配的四条（v1 假设作废）
 
@@ -218,6 +218,15 @@ dream-analysis/
 
 ---
 
+### 事件名以**主仓白名单**为准（`analysis/events.ts` 是消费端唯一真源）
+
+只有进 `dream_develop/src/common/ossExport.ts` → `TIMELINE_EVENT_WHITELIST` 的事件才会出现在分片里。
+消费端把它抄成逐个列名的清单（`ATTENTION_EVENTS` / `CRITICAL_EVENTS` / `CONNECTION_EVENTS` / `STOP_EVENTS` / `TOPUP_EVENTS`），
+**不要用后缀正则猜**：`health` 早先用 `(_ERROR|_FAILED|UNRECOVERED|_ALERT)$` 数"异常类事件"，
+漏掉了 `ORDER_EXPIRED`/`ORDER_UNKNOWN_STATUS`/`RESET_RATE_LIMITED`/`RATE_LIMITED`/`SELL_ORDER_LOST`/
+`SELL_STATE_UNRECONCILED`/`SELL_FILLED_IGNORED`/`WORKER_WS_STALE_RECONNECT`/`WORKER_TICKER_INVALID`/
+`HEALTH_CHECK_NO_ORDERS`/`TOPUP_EXHAUSTED` 等一大票（真数据实测：近 7 天真实是 32 条，正则只数出十几条）。
+另：设计稿里的 `STOP_SIGNAL`/`STOP_SIGNAL_RESUMED` **不存在**，真名是 `STOP_SIGNAL`/`STOP_SIGNAL_RESUMED`。
 ### 两条定案（2026-10-04，改了就别再绕回去）
 
 **① 本地分片永不自动删除。** 曾经有过"按保留期（90 天）+ 磁盘上限淘汰最旧"，为此还得维护"淘汰墓碑"
@@ -271,12 +280,13 @@ interface Analysis {
 | ounds |  | **窗口语义**：轮数、成交笔数、止盈/整轮利润、未完成轮、最长卡轮 Top N | NEW_ROUND SELL_FILLED ROUND_COMPLETED | — |
 | stuck | sk | **状态语义**：当前还开着的轮（跨窗口）、已持有/卡住多久、本轮仓位与浮亏、>24h/>72h/>7天 分档 | NEW_ROUND BUY_FILLED ROUND_COMPLETED RESET_CANCEL_SUCCESS STARTUP_RECOVERY_DONE ACCOUNT_OBSERVED | — |
 | `topup` | `tu` | 补仓次数/贡献、深跌期行为 | `TOPUP_*` `CRASH_*` | — |
-| `stopgaps` | `sg` | **有没有偷偷停轮**：`STOP_SIGNAL_RECEIVED` / `RESUME_SIGNAL_RECEIVED` 时间线 | 停轮/复轮 | — |
-| `errors` | `e` | 异常事件分组明细（按类型 + 最近 N 条） | `*_ERROR` `*_FAILED` `SELL_STATE_*` | 部分需 ③ |
-| `stream` | `st` | 断流/断连次数、累计时长、未恢复告警 | `UDS_*` `MARKET_STREAM_*` | **⛔ 需 §3.4-③** |
+| `errors` | `e` | **需要看的事件**明细（异常/退化/未恢复）：按类型/实例/类别 + 最严重的一批 + 最近明细 | 事件目录的 attention 清单 | — |
+| `stream` | `st` | **行情流健康**：断流次数与时长、重连、未恢复、WS 关闭原因 | `UDS_CONN_*`/`UDS_RETRY_*`/`MARKET_STREAM_*`/`WS_*`/`WORKER_WS_*` | — |
+| `stopgaps` | `sg` | **有没有偷偷停轮**：`STOP_SIGNAL` / `STOP_SIGNAL_RESUMED` 时间线（真名；设计稿那两个不存在） | 停轮/复轮 | — |
 | `trend` | `tr` | 按小时/天的活跃度与收益趋势 | 同 `rounds` | — |
 
-> 若 §3.4-③ 不解决：`stream` 降级为"**疑似停摆**"（用 account 心跳间隔推断），并在结果里明确写"数据源不含连接事件，无法区分断流/停机"。
+> ③（连接类稀疏事件）已在白名单里（`UDS_CONN_*`/`UDS_RETRY_*`/`MARKET_STREAM_*`/`WS_*`/`WORKER_WS_*` 都在），
+> 所以 `stream` 不需要降级 —— 它直接读这些事件算断流时长。真数据近 7 天：0 次断开、3 次 `WS_RECONNECTED`。
 
 ### M2 已交付（2026-10-02）
 
@@ -438,7 +448,7 @@ report [instance] [窗口]      M3：概览（health + rounds 摘要）——**�
 | **M2 首批分析** | `ndjson` 解析 + `health`/`rounds` + 渲染 | 样本结果稳定；缺天/未封存告警有测试 |
 | **M3 机器人** | 复制 bot 客户端 + router + 异步 ack + 白名单 | 群里发 `r boye888 昨天` 拿到结果；越权被拒 |
 | **M4 部署** | 每小时同步、落后告警、pm2、README 排障 | 断网/403 不崩；重启续跑 |
-| **M5 扩展** | `errors`/`stream`/`trend`/`topup`/`stopgaps` + 签名 URL | 群里可用 |
+| **M5 扩展** | `errors`/`stream` 已交付；`trend`/`topup`/`stopgaps` + 签名 URL 待做 | 部分可用 |
 
 ---
 

@@ -11,8 +11,9 @@
  */
 import { Analysis, AnalysisContext, AnalysisResult, MAX_WINDOW_HOURS, Section, numOf, strOf } from './types';
 import { formatShanghai, windowHours } from '../common/time';
+import { isAttention } from './events';
 
-const ERROR_EVENT_RE = /(_ERROR|_FAILED|UNRECOVERED|_ALERT)$/;
+// 事件清单的单一真源在 events.ts（对照主仓白名单逐个列名，不用后缀正则猜）
 /**
  * 配置回显类事件（每次启动各打一遍：`WORKER_CONFIG_*` / `WORKER_ENV_*`）。
  *
@@ -62,7 +63,7 @@ export function healthAnalysis(): Analysis {
   return {
     name: 'health',
     aliases: ['hc'],
-    help: '数据新鲜度 / 事件密度 / 心跳缺口 / 异常计数',
+    help: '数据新鲜度 / 事件密度 / 心跳缺口 / 需要看的事件计数',
     params: [
       { name: 'instance', description: '实例名（默认全部实例）', example: 'boye888' },
       { name: 'window', description: `时间窗口（最长 ${MAX_WINDOW_HOURS}h）`, example: '昨天' },
@@ -80,7 +81,7 @@ export function healthAnalysis(): Analysis {
         totals.eventCounts.set(e.event, (totals.eventCounts.get(e.event) ?? 0) + 1);
         const symbol = e.symbol ?? '(无 symbol)';
         totals.symbolCounts.set(symbol, (totals.symbolCounts.get(symbol) ?? 0) + 1);
-        if (ERROR_EVENT_RE.test(e.event)) totals.errorCounts.set(e.event, (totals.errorCounts.get(e.event) ?? 0) + 1);
+        if (isAttention(e.event)) totals.errorCounts.set(e.event, (totals.errorCounts.get(e.event) ?? 0) + 1);
 
         const ms = Date.parse(e.ts);
         if (totals.firstTs === null || ms < totals.firstTs) totals.firstTs = ms;
@@ -161,7 +162,7 @@ export function healthAnalysis(): Analysis {
             ['分片 / 事件', `${totals.shards} / ${totals.events}`],
             ['坏行', String(totals.badLines)],
             ['首 / 末事件', `${totals.firstTs ? formatShanghai(totals.firstTs) : '-'} → ${totals.lastTs ? formatShanghai(totals.lastTs) : '-'}`],
-            ['异常类事件', String([...totals.errorCounts.values()].reduce((s, n) => s + n, 0))],
+            ['需要看的事件（异常/退化）', String([...totals.errorCounts.values()].reduce((s, n) => s + n, 0))],
             ['心跳次数 / 最大间隔', `${totals.heartbeatCount} / ${totals.heartbeatMaxGapMs === null ? '-' : (totals.heartbeatMaxGapMs / 60_000).toFixed(0) + 'min'}`],
             ['最近账户估值', totals.lastTotalValue === null ? '-' : `${totals.lastTotalValue.toFixed(2)}${totals.lastExchange ? ` @${totals.lastExchange}` : ''}`],
           ],
@@ -170,7 +171,7 @@ export function healthAnalysis(): Analysis {
 
       if (totals.errorCounts.size > 0) {
         sections.push({
-          heading: '异常事件',
+          heading: '需要看的事件（按类型）',
           headers: ['事件', '次数'],
           rows: [...totals.errorCounts.entries()].sort(byCountThenName).map(([name, n]) => [name, String(n)]),
         });

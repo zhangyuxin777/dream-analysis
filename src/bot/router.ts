@@ -70,6 +70,8 @@ export function buildHelpText(registry: AnalysisRegistry): string {
     '  hc / health […]       运行健康（数据完整性 / 心跳 / 异常计数）',
     '  r / rounds […]        轮次与成交（当天/某日的窗口统计）',
     '  sk / stuck […]        卡住轮（当前还没收口的轮、卡了多久、浮亏多少）',
+    '  e / errors […]        异常事件明细（需要看一眼的：退化/未恢复/丢单…）',
+    '  st / stream […]       行情流健康（断流次数与时长、重连、未恢复）',
     '',
     '参数：裸参数里长得像窗口的（2026-10-01 / 昨天 / 近24h / 区间）一律当 window；',
     '      其余按 symbol → instance → top 顺序填；也可以写 key=value。',
@@ -140,6 +142,12 @@ export class CommandRouter {
       case 'sk':
       case 'stuck':
         return this.runNamed('stuck', parseAnalysisParams(rest, positionalNamesOf(this.registry.get('stuck'))), msg);
+      case 'e':
+      case 'errors':
+        return this.runNamed('errors', parseAnalysisParams(rest, positionalNamesOf(this.registry.get('errors'))), msg);
+      case 'st':
+      case 'stream':
+        return this.runNamed('stream', parseAnalysisParams(rest, positionalNamesOf(this.registry.get('stream'))), msg);
       default:
         if (command === '') return buildHelpText(this.registry);
         return `未知指令: ${command}（发 h 看指令列表）`;

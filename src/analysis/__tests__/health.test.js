@@ -57,10 +57,10 @@ test('概览：事件数/分片/异常计数/心跳间隔/最近估值', async (
   const overview = result.sections.find((s) => s.heading === '概览');
   const rows = Object.fromEntries(overview.rows.map((r) => [r[0], r[1]]));
   assert.equal(rows['分片 / 事件'], '1 / 5');
-  assert.equal(rows['异常类事件'], '2', 'PROFIT_PLACE_ERROR 与 TOPUP_FAILED 都算异常类');
+  assert.equal(rows['需要看的事件（异常/退化）'], '2', 'PROFIT_PLACE_ERROR 与 TOPUP_FAILED 都在事件目录的 attention 清单里');
   assert.equal(rows['最近账户估值'], '1010.00 @binance');
 
-  const errors = result.sections.find((s) => s.heading === '异常事件');
+  const errors = result.sections.find((s) => s.heading === '需要看的事件（按类型）');
   assert.deepEqual(errors.rows, [['PROFIT_PLACE_ERROR', '1'], ['TOPUP_FAILED', '1']]);
   const symbols = result.sections.find((s) => s.heading === '按 symbol');
   assert.deepEqual(symbols.rows, [['__account__', '2'], ['ETHFDUSD', '2'], ['BTCFDUSD', '1']], '并列时按名字升序（顺序必须确定）');
