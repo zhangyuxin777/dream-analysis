@@ -21,6 +21,7 @@
 import { Analysis, AnalysisContext, AnalysisResult, MAX_WINDOW_HOURS, Section, numOf } from './types';
 import { windowHours } from '../common/time';
 import { TOPUP_EVENTS, detailOf } from './events';
+import { roundCounterOf } from './roundsCore';
 
 /** 明细保留条数上限（窗口内可能很多） */
 export const DETAIL_KEEP = 500;
@@ -65,17 +66,25 @@ export function topupAnalysis(): Analysis {
       let costCents = 0;      // Σ 下单金额
       let filledCents = 0;    // Σ 成交金额（price×qty，观测量自己算）
       let lastRemainingCents: number | null = null; // 最近一次下单后的剩余额度
+      let maxElapsedHours = 0;  // 用标量记峰值：明细环缓冲会被 DETAIL_KEEP 截断，拿它算最大值会低估
+      let matched = 0;          // 通过币种过滤的事件数（判断"没有数据"必须用它，不能用未过滤的 stats.events）
+      const symbolsWithMoney = new Set<string>();
 
       const stats = await ctx.source.scan(
         { window: ctx.window, instance: ctx.params.instance },
         (e) => {
-          if (!TOPUP_EVENTS.includes(e.event)) return;
           // ⚠️ 币种过滤必须在**计数之前**：否则概览会算上被过滤掉的币种（明细表却是过滤后的 ⇒ 自相矛盾）
           const symbol = e.symbol ?? '(无 symbol)';
           if (ctx.params.symbol && !symbol.toUpperCase().startsWith(ctx.params.symbol.toUpperCase())) return;
+          // `matched` 数的是**该币种的全部事件**（不限补仓类）：用来区分"这个币种没数据"与"有数据但没触发补仓"
+          matched++;
+          if (!TOPUP_EVENTS.includes(e.event)) return;
           byType.set(e.event, (byType.get(e.event) ?? 0) + 1);
 
-          const round = e.roundId ?? '-';
+          // ⚠️ 轮次身份 = `R<计数器>`（不是整串 roundId）：主仓重启后同一轮会改名
+          // （`R596-190959` → `R596-191307-RCV`），用整串会把一轮拆成好几行、排名错，
+          // 且与 stuck 的"补仓"列（按计数器聚合）对同一轮给出不同数字。
+          const round = roundCounterOf(e.roundId ?? '') || (e.roundId ?? '-');
           const row: Row = {
             ts: e.ts, instance: e.instance, symbol, round, event: e.event,
             detail: detailOf(e.data, 4), costCents: 0, qty: null, elapsedHours: null,
@@ -91,6 +100,7 @@ export function topupAnalysis(): Analysis {
               const c = cents(numOf(e.data, 'cost'));
               row.costCents = c; row.qty = numOf(e.data, 'quantity');
               costCents += c; per.orders++; per.costCents += c; perRound.orders++; perRound.costCents += c;
+              if (c > 0) symbolsWithMoney.add(symbol);
               const rem = numOf(e.data, 'remainingTopUp');
               if (rem !== null) lastRemainingCents = cents(rem);
               break;
@@ -102,6 +112,7 @@ export function topupAnalysis(): Analysis {
               if (px !== null && q !== null) {
                 const c = cents(px * q);
                 row.costCents = c; filledCents += c; per.fills++; perRound.fills++;
+                if (c > 0) symbolsWithMoney.add(symbol);
               } else {
                 per.fills++; perRound.fills++;
               }
@@ -116,6 +127,7 @@ export function topupAnalysis(): Analysis {
             case 'TOPUP_LAST_TIER_REACHED': {
               per.lastTier++; perRound.lastTier++;
               row.elapsedHours = numOf(e.data, 'elapsedHours');
+              if (row.elapsedHours !== null) maxElapsedHours = Math.max(maxElapsedHours, row.elapsedHours);
               lastTierRows.push(row);
               break;
             }
@@ -160,19 +172,30 @@ export function topupAnalysis(): Analysis {
         warnings.push(`${exhausted} 次补仓额度**已用尽**（本轮不再补仓）—— 之后只能等价格回来卖出；这就是"卡住"的典型成因`);
       }
       if (lastTier > 0) {
-        const longest = lastTierRows.reduce((m, r) => Math.max(m, r.elapsedHours ?? 0), 0);
         warnings.push(
-          `有 ${lastTier} 次走到**最后一档**（程序自己的判据）` + (longest > 0 ? `，其中报出的最长已卡 ${longest.toFixed(1)}h` : '') +
-            ' —— 到最后一档后补仓只能靠通道 B（跌幅够才补），横盘/慢跌时会一直等',
+          `有 ${lastTier} 次走到**最后一档**（程序自己的判据）` + (maxElapsedHours > 0 ? `，其中程序自报的最长"stuck" ${maxElapsedHours.toFixed(1)}h` : '') +
+            ' —— 注意这个数是主仓按 `now − lastBuyFillTime` 算的（**不是**"到达最后一档之后过了多久"，跨重启还可能被替换），' +
+            '只能当量级看；到最后一档后补仓只能靠通道 B（跌幅够才补），横盘/慢跌时会一直等',
         );
       }
       if (failed > 0) warnings.push(`有 ${failed} 次补仓**下单失败**（额度未扣；模板注释：程序每 60 秒自动重试，持续刷屏多为补仓额/精度配置问题）`);
       if (orders > fills && orders - fills > 0) {
-        warnings.push(`下单 ${orders} 次但只看到 ${fills} 次成交 —— 差值可能是"补仓单挂着还没成交"（也可能成交事件是 notify:false 采得少），看挂单要核对交易所`);
+        warnings.push(
+          `下单 ${orders} 次但只看到 ${fills} 次成交 —— 成交事件 TOPUP_ORDER_FILLED 在白名单里、level 是 info（notify:false 只影响钉钉推送，**不影响落盘**），`
+            + '所以差值就是"补仓单挂着还没成交"（若已成交但没卖单，看有没有 TOPUP_REPLACE_FAILED）；建议去交易所核挂单',
+        );
       }
       if (skips > 0 && orders === 0) warnings.push(`有 ${skips} 次"到最后一档但跌幅不够"的跳过、一次补仓都没下 —— 触发条件可能偏紧，看下面的跌幅 vs 阈值`);
-      if (byType.size === 0 && stats.events > 0) warnings.push('窗口内没有补仓事件（这本身是有用信息：这段没触发过补仓）');
+      // 判断"没有数据"必须用**过滤后**的计数：否则问一个本地没分片的币种时，会拿别的币种的事件数当证据
+      if (byType.size === 0) {
+        if (matched > 0) warnings.push('窗口内该范围内没有补仓事件（这本身是有用信息：这段确实没触发过补仓）');
+        else if (stats.events > 0) warnings.push(`窗口内**该币种一条事件都没有**（${ctx.params.symbol ?? ''}）—— 可能币种写错，或本地没有它的分片；这不是"没触发补仓"`);
+        else warnings.push('窗口内没有任何事件 —— 数据没到或没同步');
+      }
 
+      // 金额**不能跨币种相加**（不同报价币的钱不是一回事）⇒ 只有一个币种时才给合计，多币种指向按币种表
+      const singleSymbol = symbolsWithMoney.size <= 1;
+      const moneyCell = (c: number): string => (singleSymbol ? money(c) : '-（多币种，见"按币种"表）');
       const sections: Section[] = [
         {
           heading: '概览',
@@ -180,15 +203,20 @@ export function topupAnalysis(): Analysis {
           rows: [
             ['窗口', `${ctx.window.label}（${windowHours(ctx.window).toFixed(1)}h）`],
             ['分片 / 事件', `${stats.shards} / ${stats.events}`],
-            ['触发 / 下单 / 成交', `${byType.get('TOPUP_TRIGGERED') ?? 0} / ${orders} / ${fills}`],
+            ['下单 / 成交', `${orders} / ${fills}`],
             ['跳过（跌幅不够）/ 最后档 / 耗尽', `${skips} / ${lastTier} / ${exhausted}`],
             ['下单失败 / 换卖单失败', `${failed} / ${replaceFailed}`],
-            ['补仓下单金额合计', money(costCents)],
-            ['补仓成交金额合计', money(filledCents)],
-            ['最近一次下单后的剩余额度', lastRemainingCents === null ? '-' : money(lastRemainingCents)],
+            ['补仓下单金额合计', moneyCell(costCents)],
+            ['补仓成交金额合计', moneyCell(filledCents)],
+            ['最近一次下单后的剩余额度', lastRemainingCents === null ? '-' : moneyCell(lastRemainingCents)],
+            // `TOPUP_TRIGGERED` 在主仓**全仓没有任何 emit 点**（白名单/模板里有条目但没有 emit）⇒ 恒为 0，
+            // 不列进表头（列一个永远为 0 的"触发"会让人以为"触发→下单"的转化率是 100%，那是假的）
+            ['触发事件 TOPUP_TRIGGERED', (byType.get('TOPUP_TRIGGERED') ?? 0) === 0
+              ? '0（该事件在主仓无 emit 点，白名单里有条目但没人发 —— 别当成功率分母）'
+              : String(byType.get('TOPUP_TRIGGERED'))],
           ],
           note: '**下单 ≠ 成交**：`TOPUP_EXECUTED` 是限价单已下单（模板注释明确说不能说"成功买入"），成交看 `TOPUP_ORDER_FILLED`。'
-            + '金额按事件里的报价币浮点转整数分累加。',
+            + '金额是**报价币**浮点转整数分累加；多币种时不给合计（不同报价币不能相加）。',
         },
       ];
 
@@ -198,7 +226,7 @@ export function topupAnalysis(): Analysis {
           rows.push(['换卖单失败(需人工)', r.ts.replace('T', ' ').slice(0, 19), r.instance, r.symbol, r.round, r.detail]);
         }
         for (const r of [...lastTierRows].reverse().slice(0, topN)) {
-          rows.push(['到最后一档', r.ts.replace('T', ' ').slice(0, 19), r.instance, r.symbol, r.round, `已卡 ${r.elapsedHours === null ? '-' : r.elapsedHours.toFixed(1)}h ${r.detail}`]);
+          rows.push(['到最后一档', r.ts.replace('T', ' ').slice(0, 19), r.instance, r.symbol, r.round, `程序自报 stuck=${r.elapsedHours === null ? '-' : r.elapsedHours.toFixed(1)}h（= 距上次买单成交） ${r.detail}`]);
         }
         for (const r of [...exhaustedRows].reverse().slice(0, topN)) {
           rows.push(['额度用尽', r.ts.replace('T', ' ').slice(0, 19), r.instance, r.symbol, r.round, r.detail]);
@@ -243,7 +271,7 @@ export function topupAnalysis(): Analysis {
         });
       }
 
-      if (bySymbol.size > 1) {
+      if (bySymbol.size > 0) {
         sections.push({
           heading: '按币种',
           headers: ['币种', '下单', '成交', '跳过', '最后档', '耗尽', '失败', '换卖单失败', '下单金额'],
@@ -255,7 +283,7 @@ export function topupAnalysis(): Analysis {
 
       const summary = byType.size === 0
         ? (stats.events === 0 ? '窗口内没有事件（数据没到或没同步）' : '窗口内没有补仓事件')
-        : `下单 ${orders} / 成交 ${fills} / 跳过 ${skips} / 最后档 ${lastTier} / 耗尽 ${exhausted}` + (costCents > 0 ? `，下单金额 ${money(costCents)}` : '');
+        : `下单 ${orders} / 成交 ${fills} / 跳过 ${skips} / 最后档 ${lastTier} / 耗尽 ${exhausted}` + (costCents > 0 && symbolsWithMoney.size <= 1 ? `，下单金额 ${money(costCents)}` : '');
 
       return {
         title: `补仓 · ${ctx.window.label}${ctx.params.symbol ? ` · ${ctx.params.symbol.toUpperCase()}` : ''}`,

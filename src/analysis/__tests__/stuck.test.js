@@ -71,11 +71,12 @@ test('★核心：跨窗口未收口的轮要能看见，带观测仓位/成本/
   assert.equal(detail.rows.length, 1);
   const row = detail.rows[0];
   assert.deepEqual([cell(detail, row, '实例'), cell(detail, row, '币种'), cell(detail, row, '轮次')], ['a', 'ETHFDUSD', 'R007-080000']);
-  assert.equal(cell(detail, row, '卡住'), '3.3天', '卡住 = 末笔买入(10-01T05:00) → 此刻(10-04T12:00) = 79h ⇒ 3.3 天');
-  assert.equal(cell(detail, row, '本轮仓位'), '2', '本轮数量 = ΔaccCost/buyPrice 累加（2600/2600 + 2550/2550 = 2）');
+  assert.equal(cell(detail, row, '卡住'), '2.5天', '卡住 = **末笔买入** → 此刻；补仓成交(10-02T00:07)也算买入 ⇒ 59.9h（主仓 lastBuyFillTime 同口径）');
+  assert.equal(cell(detail, row, '本轮仓位'), '2.2', '本轮数量 = 网格(2600/2600 + 2550/2550 = 2) + 补仓成交 0.2（补仓成交是**观测**数量，直接加）');
   assert.equal(cell(detail, row, '账户同币'), '2', '账户里该资产总量（观测值）');
-  assert.equal(cell(detail, row, '轮次成本'), '5150.00', '成本 = 该轮最近一条 BUY_FILLED 的 accCost');
-  assert.equal(cell(detail, row, '浮亏'), '-150.00', '浮亏 = 本轮数量 × 观测价格(5000/2) − 本轮成本 = 5000 − 5150');
+  assert.equal(cell(detail, row, '轮次成本'), '5150.00', '成本 = 该轮最近一条 BUY_FILLED 的 accCost（补仓在它之后 ⇒ 不含补仓）');
+  assert.equal(cell(detail, row, '浮亏'), '+350.00', '浮亏 = 本轮数量 2.2 × 观测价格(5000/2) − 成本 5150 = 5500 − 5150');
+  assert.match(result.warnings.join('\n'), /本轮数量.*与账户该资产总量不一致/, '本轮(2.2) 与账户(2) 不一致必须告警');
   assert.equal(cell(detail, row, '加仓'), '1', '加仓 = 网格买单笔数 2 − 1（**不是**补仓）');
   assert.equal(cell(detail, row, '补仓'), '1/2下单', '补仓 = TOPUP 成交/下单（成交 1、下单 2 ⇒ 有一单挂着没吃到）');
   assert.match(detail.note, /观测值/, '必须写明这两个数是观测值，不是推算');

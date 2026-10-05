@@ -125,15 +125,32 @@ export interface EventSourceLike {
 }
 
 /** 从事件 `data` 里安全取数字（外部数据一律校验后再用） */
+/**
+ * 从事件 `data` 里安全取数字。
+ * 接受**数字字符串**（防御性）：主仓日志模板里价格类字段常按 `:trim` 打印，字段类型不保证是 number。
+ * ⚠️ 但**别夸大**：截至 2026-10-05 的真分片里，数值类字段**全都是 number**，
+ * 唯一的非 number 是 localtest `RECOVERY_APPLIED.buyPrice = "-"`（占位符）——
+ * 那种就该返回 null（`Number('-')` 是 NaN，这里会挡住）。
+ * 所以这条是"类型不统一时别静默丢值"的保险，不是已观测到的数据问题。
+ */
 export function numOf(data: Record<string, unknown> | undefined, key: string): number | null {
   const v = data?.[key];
-  return typeof v === 'number' && Number.isFinite(v) ? v : null;
+  if (typeof v === 'number') return Number.isFinite(v) ? v : null;
+  if (typeof v === 'string') {
+    const t = v.trim();
+    if (t === '') return null;
+    const n = Number(t);
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
 }
 
-/** 从事件 `data` 里安全取字符串 */
+/** 从事件 `data` 里安全取字符串（数字也接受 —— `roundId` 之类可能是数字，别静默丢） */
 export function strOf(data: Record<string, unknown> | undefined, key: string): string | null {
   const v = data?.[key];
-  return typeof v === 'string' && v !== '' ? v : null;
+  if (typeof v === 'string') return v !== '' ? v : null;
+  if (typeof v === 'number' && Number.isFinite(v)) return String(v);
+  return null;
 }
 
 export class AnalysisRegistry {

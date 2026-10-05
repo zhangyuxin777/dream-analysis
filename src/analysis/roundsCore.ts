@@ -61,6 +61,11 @@ export interface RoundState {
   topupOrders: number;
   /** 补仓成交次数（`TOPUP_ORDER_FILLED`） */
   topupFills: number;
+  /**
+   * 上次记录 `accCost` 之后、补仓成交花掉的钱（累计）。
+   * 用来把 `BUY_FILLED.accCost` 的增量还原成"网格买单自己花的钱" —— 见 `BUY_FILLED` 分支的注释。
+   */
+  topupCostSinceAcc: number;
   /** 累计买入成本（最近一条 BUY_FILLED 的 `accCost`，事件里的**观测值**） */
   accCost: number | null;
   /**
@@ -219,7 +224,7 @@ export function createRoundCollector(): RoundCollector {
         r = {
           counter, instance: e.instance, symbol, displayId, firstMs: ms,
           startOutsideScan: e.event !== 'NEW_ROUND', completed: false,
-          firstBuyMs: null, lastBuyMs: null, resetReason: null, resetMs: null, buyFills: 0, topupOrders: 0, topupFills: 0, accCost: null, qty: 0,
+          firstBuyMs: null, lastBuyMs: null, resetReason: null, resetMs: null, buyFills: 0, topupOrders: 0, topupFills: 0, topupCostSinceAcc: 0, accCost: null, qty: 0,
           completedAtMs: null, durationHours: null, profitCents: null, isCrashMode: false, reusedCount: 0,
         };
         s.rounds.set(key, r);
@@ -248,6 +253,7 @@ export function createRoundCollector(): RoundCollector {
             r.buyFills = 0;
             r.topupOrders = 0;
             r.topupFills = 0;
+            r.topupCostSinceAcc = 0;
             r.accCost = null;
             r.qty = 0;
             r.completedAtMs = null;
@@ -283,10 +289,13 @@ export function createRoundCollector(): RoundCollector {
           const accCost = numOf(e.data, 'accCost');
           const buyPrice = numOf(e.data, 'buyPrice');
           if (accCost !== null) {
-            // 累计成本的增量 = 这一笔花的钱 ⇒ 数量 = ΔaccCost / buyPrice（BUY_FILLED 没有数量字段）
-            const delta = r.accCost === null ? accCost : accCost - r.accCost;
+            // 累计成本的增量 = 这一笔花的钱 ⇒ 数量 = ΔaccCost / buyPrice（BUY_FILLED 没有数量字段）。
+            // ⚠️ 减掉"上次记 accCost 之后补仓成交花掉的钱"：`accCost` 是**账户累计**，
+            // 补仓成交会让它跳增，不减就会把补仓的金额当成网格买单的钱 ⇒ 本轮数量/浮亏偏高（P5 批四的 Warning）。
+            const delta = (r.accCost === null ? accCost : accCost - r.accCost) - r.topupCostSinceAcc;
             if (buyPrice !== null && buyPrice > 0 && delta > 0) r.qty += delta / buyPrice;
             r.accCost = accCost;
+            r.topupCostSinceAcc = 0;
           }
           break;
         }
@@ -300,9 +309,19 @@ export function createRoundCollector(): RoundCollector {
           // 补仓单**已下单**（不等于成交；模板注释明确说不能说"成功买入"）
           r.topupOrders++;
           break;
-        case 'TOPUP_ORDER_FILLED':
+        case 'TOPUP_ORDER_FILLED': {
+          // 补仓**真的成交了**（与 `TOPUP_EXECUTED` = 已下单 是两回事）。它也是这一轮的买入：
+          // ① 数量是**观测值**（`price`/`qty` 直接给），比从 accCost 推更准；
+          // ② 主仓的 `lastBuyFillTime` 会把补仓成交也算进去（`durationHours` 口径 = 末次买入→卖出）⇒ 这里同样更新末笔买入。
           r.topupFills++;
+          const q = numOf(e.data, 'qty');
+          const px = numOf(e.data, 'price');
+          if (q !== null && q > 0) r.qty += q;
+          if (px !== null && q !== null && px > 0 && q > 0) r.topupCostSinceAcc += px * q;
+          if (r.firstBuyMs === null) r.firstBuyMs = ms;
+          r.lastBuyMs = ms;
           break;
+        }
         case 'RESET_CANCEL_SUCCESS':
           r.resetReason = strOf(e.data, 'reason');
           r.resetMs = ms;

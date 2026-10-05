@@ -38,15 +38,23 @@ test('all() 去重并按名字排序；helpText 由注册表生成（含参数�
   assert.match(help, /^分析器:/);
 });
 
-test('numOf / strOf：外部数据只认正确类型（NaN、字符串数字、空串都要挡）', () => {
+test('numOf / strOf：数字字符串接受（防御），占位符/垃圾值要挡', () => {
   assert.equal(numOf({ profit: 12.5 }, 'profit'), 12.5);
-  assert.equal(numOf({ profit: '12.5' }, 'profit'), null, '字符串数字不认（避免悄悄算出错的金额）');
+  // 真分片里数值字段都是 number，唯一的非 number 是 localtest `RECOVERY_APPLIED.buyPrice = "-"`（占位符）。
+  // 这里接受数字字符串是"类型不统一时别静默丢值"的保险 —— 不声称这是已观测到的数据问题。
+  assert.equal(numOf({ profit: '12.5' }, 'profit'), 12.5, '数字字符串要认（保险）');
+  assert.equal(numOf({ profit: ' 12.5 ' }, 'profit'), 12.5, '两边空白要能容错');
+  assert.equal(numOf({ profit: '-' }, 'profit'), null, '占位符 "-" ⇒ null（真数据里的那种）');
+  assert.equal(numOf({ profit: '' }, 'profit'), null, '空串 ⇒ null');
+  assert.equal(numOf({ profit: '   ' }, 'profit'), null, '纯空白 ⇒ null');
+  assert.equal(numOf({ profit: 'abc' }, 'profit'), null, '非数字串 ⇒ null');
   assert.equal(numOf({ profit: NaN }, 'profit'), null);
   assert.equal(numOf({ profit: Infinity }, 'profit'), null);
+  assert.equal(numOf({ profit: true }, 'profit'), null, '布尔不是数字');
   assert.equal(numOf(undefined, 'profit'), null);
   assert.equal(strOf({ exchange: 'binance' }, 'exchange'), 'binance');
   assert.equal(strOf({ exchange: '' }, 'exchange'), null);
-  assert.equal(strOf({ exchange: 42 }, 'exchange'), null);
+  assert.equal(strOf({ exchange: 42 }, 'exchange'), '42', '数字也要能当字符串取（roundId 可能是数字，别静默丢）');
 });
 
 test('常量：窗口上限与位置参数顺序是单一口径（CLI 与将来的机器人共用）', () => {
