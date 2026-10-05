@@ -16,6 +16,7 @@ import { windowHours } from '../common/time';
 import {
   RoundState,
   aliveHours,
+  allRoundsOf,
   createRoundCollector,
   groupByInstance,
   nextFirstMsOf,
@@ -68,7 +69,7 @@ export function roundsAnalysis(): Analysis {
       if (stats.badLines > 0) warnings.push(`有 ${stats.badLines} 行无法解析（分片本身可疑，见 verify）`);
       if (stats.events === 0) warnings.push('窗口内没有任何轮次/成交类事件');
 
-      const allRounds = [...bySymbol.values()].flatMap((s) => [...s.rounds.values()]);
+      const allRounds = [...bySymbol.values()].flatMap((s) => allRoundsOf(s));
       const outsideScan = allRounds.filter((r) => r.startOutsideScan).length;
       if (outsideScan > 0) {
         warnings.push(
@@ -76,9 +77,10 @@ export function roundsAnalysis(): Analysis {
             + '也可能显示成"未建仓"；要看全貌请用 stuck（卡住轮）视图',
         );
       }
-      const reused = allRounds.filter((r) => r.reusedCount > 0).length;
+      // "计数器被复用"次数 = 留档的旧轮数（每个当前轮对象只记一次，别把归档副本也算一遍）
+      const reused = [...bySymbol.values()].reduce((n, s) => n + s.supersededRounds.length, 0);
       if (reused > 0) {
-        warnings.push(`有 ${reused} 个计数器被复用（同一个 R<计数器> 又开了一轮）—— 理论上不该发生，请核对主仓的轮次计数器`);
+        warnings.push(`发生 ${reused} 次计数器复用（同一个 R<计数器> 开过两轮）—— 理论上不该发生，请核对主仓的轮次计数器`);
       }
       const dup = [...bySymbol.values()].reduce((n, s) => n + s.duplicateCompletions, 0);
       if (dup > 0) warnings.push(`有 ${dup} 条完成事件是同一轮的重复上报（只计一次，供核对）`);
@@ -93,7 +95,7 @@ export function roundsAnalysis(): Analysis {
       let totalRoundProfitCents = 0;
 
       for (const [symbol, s] of [...bySymbol.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
-        const rounds = [...s.rounds.values()];
+        const rounds = allRoundsOf(s);
         for (const list of groupByInstance(rounds).values()) {
           for (let i = 0; i < list.length; i++) {
             if (!list[i].completed) openRows.push({ symbol, round: list[i], nextFirstMs: nextFirstMsOf(list, i) });

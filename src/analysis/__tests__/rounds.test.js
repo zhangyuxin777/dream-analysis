@@ -217,11 +217,13 @@ test('★安全网：同一个计数器又开一轮（不该发生）⇒ 当作�
   const result = await run(events);
   const row = rowOf(result, 'ETHFDUSD');
   assert.equal(row[1], '2', '两条 NEW_ROUND 事件都算');
-  assert.equal(row[3], '1', '只有最新那一轮算未收口（上一轮已被顶掉）');
+  assert.equal(row[3], '2', '两轮都没看到完成 ⇒ 都算未完成（旧轮不许被销毁：它可能还压着仓位）');
   const aging = result.sections.find((s) => s.heading.startsWith('未完成轮'));
-  assert.match(aging.rows[0][1], /R001-050000/, '显示的是最新那轮的名字');
-  assert.equal(aging.rows[0][3], '否', '新的一轮还没成交 ⇒ 未建仓');
-  assert.match(result.warnings.join('\n'), /计数器被复用/, '必须告警：主仓说计数器能从本地缓存恢复，复用就是异常');
+  assert.equal(aging.rows.length, 2, '新旧两轮都要在表里');
+  const newest = aging.rows.find((r) => r[1] === 'R001-050000');
+  assert.ok(newest, '最新那轮要在：' + JSON.stringify(aging.rows));
+  assert.equal(newest[3], '否', '新的一轮还没成交 ⇒ 未建仓');
+  assert.match(result.warnings.join('\n'), /发生 1 次计数器复用/, '必须告警：主仓说计数器能从本地缓存恢复，复用就是异常');
 });
 test('★主仓实证：空仓重启会复用计数器（R001 再来一次）—— 两轮绝不能被并成一轮', async () => {
   const events = [

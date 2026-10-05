@@ -55,6 +55,12 @@ export interface RoundState {
   buyFills: number;
   /** 累计买入成本（最近一条 BUY_FILLED 的 `accCost`，事件里的**观测值**） */
   accCost: number | null;
+  /**
+   * 这一轮的持仓数量 —— **派生值**：`BUY_FILLED` 只有 `{index,buyPrice,accCost}`（无数量字段），
+   * 用"累计成本的增量 ÷ 该笔价"逐步累加得到（每笔：ΔaccCost/buyPrice）。
+   * 只用于"这一轮自己的持仓值多少"，**不与账户级观测混算**。
+   */
+  qty: number;
   /** 完成事件带来的字段（都在事件里，直接取，不派生） */
   completedAtMs: number | null;
   /** `ROUND_COMPLETED.durationHours`（主仓口径：**末次买入→卖出**） */
@@ -79,6 +85,12 @@ export interface SymbolRoundStats {
   roundProfitCents: number;
   /** 键 = `实例\\0币种\\0R<计数器>`（同一 symbol 下多实例不会串） */
   rounds: Map<string, RoundState>;
+  /**
+   * 被"计数器复用"顶掉的旧轮（正常不该有；有就说明同一 `R<计数器>` 开了两轮）。
+   * **不能就地销毁**：旧轮可能仍持有仓位（真会卡住），而且它的 durationHours/利润已经在事件里了，
+   * 丢掉会让"最长卡轮"静默少行（P5 批二的 Warning）。
+   */
+  supersededRounds: RoundState[];
   /** 不带 roundId 的 NEW_ROUND 数（旧版本日志；只能按计数差兜底） */
   newRoundsWithoutId: number;
   /** 不带 roundId 的完成事件数（与上面的新轮配对） */
@@ -87,11 +99,16 @@ export interface SymbolRoundStats {
   duplicateCompletions: number;
 }
 
+/** 允许创建/更新轮次记录的事件（其余带 roundId 的事件一律不进账本，避免"影子轮"） */
+const ROUND_EVENTS = new Set([
+  'NEW_ROUND', 'ROUND_FIRST_FILL', 'BUY_FILLED', 'SELL_FILLED', 'ROUND_COMPLETED', 'RESET_CANCEL_SUCCESS',
+]);
+
 export function newSymbolRoundStats(): SymbolRoundStats {
   return {
     newRounds: 0, completedRounds: 0, buyFills: 0, sellFills: 0, orderFills: 0, crashEntered: 0,
     sellProfitCents: 0, roundProfitCents: 0,
-    rounds: new Map(), newRoundsWithoutId: 0, idlessCompletions: 0, duplicateCompletions: 0,
+    rounds: new Map(), supersededRounds: [], newRoundsWithoutId: 0, idlessCompletions: 0, duplicateCompletions: 0,
   };
 }
 
@@ -155,6 +172,19 @@ export function createRoundCollector(): RoundCollector {
 
     const symbol = e.symbol ?? '(无 symbol)';
     const s = statsOf(symbol);
+
+    // ⚠️ 只有**轮次/仓位相关**的事件才允许创建/更新轮次记录。
+    // 别的带 roundId 的事件（STARTUP_RECOVERY_*、PROFIT_PLACE_*、ATR_RATIO_CHANGE…）如果也建记录，
+    // 会凭空造出"影子轮"并顶掉真正在持仓的那一轮（P5 批二的 Critical）。
+    if (!ROUND_EVENTS.has(e.event)) {
+      switch (e.event) {
+        case 'ORDER_FILLED': s.orderFills++; break;
+        case 'CRASH_ENTERED': s.crashEntered++; break;
+        default: break;
+      }
+      return;
+    }
+
     const roundId = e.roundId ?? strOf(e.data, 'roundId') ?? '';
     const counter = roundId === '' ? '' : roundCounterOf(roundId);
 
@@ -166,19 +196,25 @@ export function createRoundCollector(): RoundCollector {
         r = {
           counter, instance: e.instance, symbol, displayId: roundId, firstMs: ms,
           startOutsideScan: e.event !== 'NEW_ROUND', completed: false,
-          firstBuyMs: null, lastBuyMs: null, resetReason: null, resetMs: null, buyFills: 0, accCost: null,
+          firstBuyMs: null, lastBuyMs: null, resetReason: null, resetMs: null, buyFills: 0, accCost: null, qty: 0,
           completedAtMs: null, durationHours: null, profitCents: null, isCrashMode: false, reusedCount: 0,
         };
         s.rounds.set(key, r);
       } else {
-        r.displayId = roundId;
+        // ⚠️ 只有**非开轮**事件才更新显示名（恢复改名后的 ROUND_FIRST_FILL/成交带的 -RCV 名字）。
+        // 开轮事件的改名在下面的复用分支里处理 —— 否则"归档旧轮"会把**新轮的名字**抄到旧轮上
+        // （真数据实测过：两行都显示最新的那个 roundId）。
+        if (e.event !== 'NEW_ROUND') r.displayId = roundId;
       }
 
       switch (e.event) {
         case 'NEW_ROUND':
           // 正常开轮：这条记录刚创建时 firstMs === ms；时间不同 ⇒ 同一个计数器被复用（不该发生）
           if (r.firstMs !== ms) {
+            // 先把**旧轮（带它自己的名字）**留档，再重置成新的一轮
+            s.supersededRounds.push({ ...r });
             r.reusedCount++;
+            r.displayId = roundId;
             r.firstMs = ms;
             r.startOutsideScan = false;
             r.completed = false;
@@ -188,6 +224,11 @@ export function createRoundCollector(): RoundCollector {
             r.resetMs = null;
             r.buyFills = 0;
             r.accCost = null;
+            r.qty = 0;
+            r.completedAtMs = null;
+            r.durationHours = null;
+            r.profitCents = null;
+            r.isCrashMode = false;
           }
           s.newRounds++;
           break;
@@ -215,7 +256,13 @@ export function createRoundCollector(): RoundCollector {
           if (r.firstBuyMs === null) r.firstBuyMs = ms;
           r.lastBuyMs = ms;
           const accCost = numOf(e.data, 'accCost');
-          if (accCost !== null) r.accCost = accCost;
+          const buyPrice = numOf(e.data, 'buyPrice');
+          if (accCost !== null) {
+            // 累计成本的增量 = 这一笔花的钱 ⇒ 数量 = ΔaccCost / buyPrice（BUY_FILLED 没有数量字段）
+            const delta = r.accCost === null ? accCost : accCost - r.accCost;
+            if (buyPrice !== null && buyPrice > 0 && delta > 0) r.qty += delta / buyPrice;
+            r.accCost = accCost;
+          }
           break;
         }
         case 'SELL_FILLED': {
@@ -228,9 +275,7 @@ export function createRoundCollector(): RoundCollector {
           r.resetReason = strOf(e.data, 'reason');
           r.resetMs = ms;
           break;
-        case 'ORDER_FILLED': s.orderFills++; break;
-        case 'CRASH_ENTERED': s.crashEntered++; break;
-        default: break; // ROUND_FIRST_FILL / ATR / 配置类等：只用来认轮（上面的 get/create 已完成）
+        default: break; // ROUND_FIRST_FILL：只用来认轮（上面的 get/create 已完成）
       }
       return;
     }
@@ -276,6 +321,11 @@ export function aliveHours(state: RoundState, nextFirstMs: number | null, refere
   const ends = [cutMs, nextFirstMs].filter((v): v is number => v !== null);
   const endMs = ends.length > 0 ? Math.min(...ends) : referenceMs;
   return Math.max(0, endMs - state.firstMs) / 3_600_000;
+}
+
+/** 一个币种下的**全部**轮次（当前 + 被计数器复用顶掉的旧轮）——报表与 stuck 都要看全 */
+export function allRoundsOf(s: SymbolRoundStats): RoundState[] {
+  return [...s.rounds.values(), ...s.supersededRounds];
 }
 
 /** 按实例分组 + 按开轮时间排序（同一 symbol 下不同实例的轮次时间不可比） */

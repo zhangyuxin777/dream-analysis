@@ -62,27 +62,28 @@ test('★核心：跨窗口未收口的轮要能看见，带观测仓位/成本/
   ];
   const result = await run(events);
 
-  assert.match(result.summary, /1 轮未收口（已建仓 1）/);
+  assert.match(result.summary, /1 轮还开着（已建仓 1）/);
   const detail = section(result, '未收口轮');
   assert.equal(detail.rows.length, 1);
   const row = detail.rows[0];
   assert.deepEqual([cell(detail, row, '实例'), cell(detail, row, '币种'), cell(detail, row, '轮次')], ['a', 'ETHFDUSD', 'R007-080000']);
   assert.equal(cell(detail, row, '卡住'), '3.3天', '卡住 = 末笔买入(10-01T05:00) → 此刻(10-04T12:00) = 79h ⇒ 3.3 天');
-  assert.equal(cell(detail, row, '仓位市值'), '2 / 5000.00', '仓位市值（观测值）');
-  assert.equal(cell(detail, row, '成本'), '5150.00', '成本 = 该轮最近一条 BUY_FILLED 的 accCost');
-  assert.equal(cell(detail, row, '浮亏'), '-150.00', '浮亏 = 市值 − 成本');
+  assert.equal(cell(detail, row, '本轮仓位'), '2', '本轮数量 = ΔaccCost/buyPrice 累加（2600/2600 + 2550/2550 = 2）');
+  assert.equal(cell(detail, row, '账户同币'), '2', '账户里该资产总量（观测值）');
+  assert.equal(cell(detail, row, '轮次成本'), '5150.00', '成本 = 该轮最近一条 BUY_FILLED 的 accCost');
+  assert.equal(cell(detail, row, '浮亏'), '-150.00', '浮亏 = 本轮数量 × 观测价格(5000/2) − 本轮成本 = 5000 − 5150');
   assert.equal(cell(detail, row, '补仓'), '1', '补仓 = 买入笔数 2 − 1');
   assert.match(detail.note, /观测值/, '必须写明这两个数是观测值，不是推算');
 });
 
-test('已收口的轮不算卡住（每个 (实例,币种) 只看最后一轮）', async () => {
+test('已收口/被掐断的轮不算卡住（还开着 = 没完成 且 没有后继轮）', async () => {
   const events = [
     ev('2026-10-01T00:00:00.000Z', 'NEW_ROUND', 'ETHFDUSD', {}, 'R007-080000'),
     ev('2026-10-01T06:00:00.000Z', 'ROUND_COMPLETED', 'ETHFDUSD', { profit: 1, durationHours: 5 }, 'R007-080000'),
   ];
   const result = await run(events);
-  assert.match(result.summary, /当前没有未收口的轮/);
-  assert.match(result.warnings.join('\n'), /当前没有未收口的轮/);
+  assert.match(result.summary, /当前没有还开着的轮/);
+  assert.match(result.warnings.join('\n'), /当前没有还开着的轮/);
 });
 
 test('★分档口径：>24h / >72h / >7天（对齐回测的卡住率）', async () => {
@@ -103,7 +104,7 @@ test('★分档口径：>24h / >72h / >7天（对齐回测的卡住率）', asyn
   assert.equal(at('>24h'), '3');
   assert.equal(at('>72h'), '2');
   assert.equal(at('>7天'), '1');
-  assert.equal(at('最长卡住'), '14.5天');
+  assert.equal(at('最长卡住（已建仓）'), '14.5天');
 });
 
 test('★起点不可知时给下界（≥）并告警，不假装知道开轮时间', async () => {
@@ -115,7 +116,7 @@ test('★起点不可知时给下界（≥）并告警，不假装知道开轮�
   const detail = section(result, '未收口轮');
   assert.match(cell(detail, detail.rows[0], '轮次'), /^≥R005/, '轮次名带 ≥：起点早于本地分片');
   assert.match(cell(detail, detail.rows[0], '已开'), /^≥/, '已开也是下界');
-  assert.match(result.warnings.join('\n'), /早于本地分片起点/);
+  assert.match(result.warnings.join('\n'), /不在已扫描范围/);
   assert.match(result.warnings.join('\n'), /下界/);
 });
 
@@ -127,7 +128,7 @@ test('拿不到账户观测时：市值/浮亏显示 "-" 并告警（不编数�
   const result = await run(events);
   const detail = section(result, '未收口轮');
   const row = detail.rows[0];
-  assert.equal(cell(detail, row, '仓位市值'), '-');
+  assert.equal(cell(detail, row, '本轮仓位'), '0', 'BUY_FILLED 没有 buyPrice 就推不出数量 —— 不编');
   assert.equal(cell(detail, row, '浮亏'), '-');
   assert.match(result.warnings.join('\n'), /拿不到账户观测/);
 });
@@ -182,5 +183,5 @@ test('symbol / instance 过滤生效（只看某个实例的卡住轮）', async
   assert.equal(cell(detailA, detailA.rows[0], '实例'), 'a');
 
   const onlyBtc = await run(events, { symbol: 'btc' });
-  assert.match(onlyBtc.summary, /当前没有未收口的轮/);
+  assert.match(onlyBtc.summary, /当前没有还开着的轮/);
 });
