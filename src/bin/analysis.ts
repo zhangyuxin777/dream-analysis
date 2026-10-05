@@ -157,7 +157,7 @@ export async function cmdSync(ctx: CommandContext, force: boolean): Promise<numb
     console.error('已有同步在进行（可能是常驻进程），本轮未执行；稍后重试即可');
     return 1;
   }
-  console.log(`列举 ${result.listed} 个，拉取 ${result.pulled.length}，跳过 ${result.skipped}，忽略 ${result.ignored}，失败 ${result.failed.length}，退避 ${result.deferred.length}，淘汰 ${result.pruned.length}，共 ${formatBytes(result.bytes)}，耗时 ${Date.now() - started}ms`);
+  console.log(`列举 ${result.listed} 个，拉取 ${result.pulled.length}，跳过 ${result.skipped}，忽略 ${result.ignored}，失败 ${result.failed.length}，退避 ${result.deferred.length}，共 ${formatBytes(result.bytes)}，耗时 ${Date.now() - started}ms`);
   for (const c of result.whitelistChanges) console.log(`  ⚠️ 数据口径变更: ${c}`);
   for (const d of result.deferred) console.log(`  ⏸ ${d.key}（已失败 ${d.count} 次）`);
   for (const f of result.failed) console.error(`  ❌ ${f.key}: ${f.error}`);
@@ -264,12 +264,7 @@ export async function cmdList(ctx: CommandContext): Promise<number> {
   for (const m of metas.sort((a, b) => a.key.localeCompare(b.key))) {
     const parsed = parseShardKey(m.key, config.oss.prefix);
     const known = state.objects[m.key];
-    const tomb = state.pruned?.[m.key];
-    const marked = !tomb ? null
-      : tomb.etag !== '' && tomb.etag !== m.etag
-        ? '🗑 已淘汰（远端已翻新 ⇒ 下轮会重拉一次再淘汰）'
-        : '🗑 已淘汰（不再拉，除非翻新）';
-    const mark = !parsed ? '✗ 不符合契约' : marked ?? (!known ? '· 本地没有' : known.etag === m.etag ? '✓ 已同步' : '↻ 远端已变（待重拉）');
+    const mark = !parsed ? '✗ 不符合契约' : !known ? '· 本地没有' : known.etag === m.etag ? '✓ 已同步' : '↻ 远端已变（待重拉）';
     console.log(`  ${mark}  ${m.key}  ${formatBytes(m.size)}  etag=${m.etag.slice(0, 8)}  ${m.lastModified}`);
   }
   return 0;

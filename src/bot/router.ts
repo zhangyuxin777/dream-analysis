@@ -68,7 +68,8 @@ export function buildHelpText(registry: AnalysisRegistry): string {
     '分析:',
     '  a / analyze <名字> …  执行分析（名字见下）',
     '  hc / health […]       运行健康（数据完整性 / 心跳 / 异常计数）',
-    '  r / rounds […]        轮次与成交（利润 / 未完成轮 / 卡轮）',
+    '  r / rounds […]        轮次与成交（当天/某日的窗口统计）',
+    '  sk / stuck […]        卡住轮（当前还没收口的轮、卡了多久、浮亏多少）',
     '',
     '参数：裸参数里长得像窗口的（2026-10-01 / 昨天 / 近24h / 区间）一律当 window；',
     '      其余按 symbol → instance → top 顺序填；也可以写 key=value。',
@@ -136,6 +137,9 @@ export class CommandRouter {
       case 'r':
       case 'rounds':
         return this.runNamed('rounds', parseAnalysisParams(rest, positionalNamesOf(this.registry.get('rounds'))), msg);
+      case 'sk':
+      case 'stuck':
+        return this.runNamed('stuck', parseAnalysisParams(rest, positionalNamesOf(this.registry.get('stuck'))), msg);
       default:
         if (command === '') return buildHelpText(this.registry);
         return `未知指令: ${command}（发 h 看指令列表）`;
@@ -153,7 +157,7 @@ export class CommandRouter {
         ?? ((opts: { force: boolean }) => runSync({ store: buildStore(this.deps.config), config: this.deps.config, logger: this.deps.logger.child('sync') }, opts));
       const r = await fn({ force });
       if (r.refusedByLock) return '已有同步在进行（可能是常驻进程），稍后再试';
-      return `同步完成：列举 ${r.listed} / 拉取 ${r.pulled.length} / 跳过 ${r.skipped} / 忽略 ${r.ignored} / 失败 ${r.failed.length} / 退避 ${r.deferred.length} / 淘汰 ${r.pruned.length}，共 ${formatBytes(r.bytes)}`;
+      return `同步完成：列举 ${r.listed} / 拉取 ${r.pulled.length} / 跳过 ${r.skipped} / 忽略 ${r.ignored} / 失败 ${r.failed.length} / 退避 ${r.deferred.length}，共 ${formatBytes(r.bytes)}`;
     } catch (err) {
       return `同步失败：${errorText(err)}`;
     }

@@ -275,24 +275,7 @@ test('契约外对象被忽略（不下载、计入 ignored）', async () => {
   assert.deepEqual(store.downloads, [good], '非法键绝不能被下载');
 });
 
-test('淘汰：保留期外的本地分片被删，同时清掉水位线条目', async () => {
-  const env = makeEnv();
-  const key = 'snapshot/boye888/2026-10-02.jsonl.gz';
-  const store = new FakeStore({ [key]: shardBuffer('boye888', '2026-10-02', okEvents) });
-  await runSync({ store, config: env.config, logger: env.logger, now: env.now });
-
-  // 手工塞一份 2020 年的旧分片
-  const old = shardPathOf(env.config, 'boye888', '2020-01-01');
-  fs.mkdirSync(path.dirname(old), { recursive: true });
-  fs.writeFileSync(old, shardBuffer('boye888', '2020-01-01', okEvents));
-
-  const result = await runSync({ store, config: env.config, logger: env.logger, now: env.now });
-  assert.deepEqual(result.pruned.map((p) => path.basename(p)), ['2020-01-01.jsonl.gz']);
-  assert.ok(!fs.existsSync(old));
-  assert.ok(fs.existsSync(shardPathOf(env.config, 'boye888', '2026-10-02')), '新分片必须留着');
-});
-
-test('★淘汰之后不许再重拉：老对象仍在桶里，但本地已按保留期淘汰 ⇒ 必须一直 skip（否则每小时"拉了又删"）', async () => {
+test('★本地分片永不自动删除：2020 年的老分片 + 桶里仍在的同名对象，同步一万轮也必须原样留着', async () => {
   const env = makeEnv();
   const oldKey = 'snapshot/boye888/2020-01-01.jsonl.gz';
   const newKey = 'snapshot/boye888/2026-10-02.jsonl.gz';
@@ -301,93 +284,19 @@ test('★淘汰之后不许再重拉：老对象仍在桶里，但本地已按�
     [newKey]: shardBuffer('boye888', '2026-10-02', okEvents),
   });
 
-  // ① 首次：保留期放宽，两份都拉下来
-  env.config.sync.retentionDays = 3650;
   const first = await runSync({ store, config: env.config, logger: env.logger, now: env.now });
   assert.equal(first.pulled.length, 2);
+  const oldPath = shardPathOf(env.config, 'boye888', '2020-01-01');
 
-  // ② 保留期收紧到 1 天：2020 那份被淘汰（文件 + 水位线都没了）
-  env.config.sync.retentionDays = 1;
-  const second = await runSync({ store, config: env.config, logger: env.logger, now: env.now });
-  assert.deepEqual(second.pruned.map((p) => path.basename(p)), ['2020-01-01.jsonl.gz']);
-  assert.ok(!fs.existsSync(shardPathOf(env.config, 'boye888', '2020-01-01')));
-
-  // ③ 关键：再同步一轮，**不许**因为"水位线被删了"就把它重新下载一遍
-  //    （真数据里桶不会清理老对象，所以这会变成每小时 55MB 的无限拉删循环）
-  const downloadsBefore = store.downloads.length;
-  const third = await runSync({ store, config: env.config, logger: env.logger, now: env.now });
-  assert.deepEqual(third.pulled, [], '被淘汰的对象不许重拉');
-  assert.equal(store.downloads.length, downloadsBefore, '一次下载都不该发生');
-  assert.equal(third.skipped, 2, '两份都该是 skip（老的那份理由 = pruned）');
-});
-
-test('★淘汰墓碑：ETag 变了（上传侧重算/补数）仍然要重拉 —— 但每次只多下一次，不进循环', async () => {
-  const env = makeEnv();
-  const oldKey = 'snapshot/boye888/2020-01-01.jsonl.gz';
-  const newKey = 'snapshot/boye888/2026-10-02.jsonl.gz';
-  const store = new FakeStore({
-    [oldKey]: shardBuffer('boye888', '2020-01-01', okEvents),
-    [newKey]: shardBuffer('boye888', '2026-10-02', okEvents),
-  });
-
-  env.config.sync.retentionDays = 3650;
-  await runSync({ store, config: env.config, logger: env.logger, now: env.now });
-
-  env.config.sync.retentionDays = 2; // 只淘汰 2020 那份（10-02 留着，兜住"至少留一份"底线）
-  const prunedRun = await runSync({ store, config: env.config, logger: env.logger, now: env.now });
-  assert.deepEqual(prunedRun.pruned.map((p) => path.basename(p)), ['2020-01-01.jsonl.gz'], '前提：这一轮真的写了墓碑');
-  assert.equal(loadState(statePathOf(env.config)).state.pruned[oldKey].etag, 'E1');
-
-  // 同 ETag：不许重拉
-  assert.deepEqual((await runSync({ store, config: env.config, logger: env.logger, now: env.now })).pulled, []);
-
-  // 上传侧补数/重算这一天（ETag 变了）⇒ 必须重新拉一次，不能因为"以前淘汰过"就永远忽略
-  store.metas.find((m) => m.key === oldKey).etag = 'E-CHANGED';
-  const after = await runSync({ store, config: env.config, logger: env.logger, now: env.now });
-  assert.deepEqual(after.pulled, [oldKey], '墓碑不能变成永久拉黑');
-  assert.match(after.recomputed.join(), /2020-01-01/, '要能被识别成"远端已变"');
-  // 同一轮里它又被淘汰了，墓碑换成新 ETag ⇒ 下一轮恢复 skip（不会每轮都下）
-  assert.deepEqual(after.pruned.map((p) => path.basename(p)), ['2020-01-01.jsonl.gz']);
-  assert.equal(loadState(statePathOf(env.config)).state.pruned[oldKey].etag, 'E-CHANGED');
-  assert.deepEqual((await runSync({ store, config: env.config, logger: env.logger, now: env.now })).pulled, [], '不会进循环');
-});
-
-test('★P5 Critical：淘汰时没有水位线（状态文件丢过）⇒ 墓碑 ETag 为空，也必须挡住重拉', async () => {
-  const env = makeEnv();
-  const key = 'snapshot/boye888/2020-01-01.jsonl.gz';
-  const store = new FakeStore({}); // 远端此刻没有这个对象（模拟"状态丢了、远端也查不到"）
-  env.config.sync.retentionDays = 2; // 2 天：2020 那份该淘汰，10-02 那份留着（"至少留一份"的底线不能兜住它）
-  for (const [inst, date] of [['boye888', '2020-01-01'], ['boye888', '2026-10-02']]) {
-    const p = shardPathOf(env.config, inst, date);
-    fs.mkdirSync(path.dirname(p), { recursive: true });
-    fs.writeFileSync(p, shardBuffer(inst, date, okEvents));
+  // 之前这里有"按保留期淘汰 + 墓碑"：删了水位线 ⇒ 老对象每轮被重新下载再删（循环）。
+  // 现在本地分片是源数据，永不自动删除；ETag 不变就永远 skip（不重下）。
+  for (let i = 0; i < 3; i++) {
+    const again = await runSync({ store, config: env.config, logger: env.logger, now: env.now });
+    assert.equal(again.pulled.length, 0, '第 ' + (i + 2) + ' 轮不该有任何下载');
+    assert.ok(fs.existsSync(oldPath), '老分片必须还在（消费端不删源数据）');
   }
-
-  const first = await runSync({ store, config: env.config, logger: env.logger, now: env.now });
-  assert.deepEqual(first.pruned.map((x) => path.basename(x)), ['2020-01-01.jsonl.gz']);
-  assert.equal(loadState(statePathOf(env.config)).state.pruned[key].etag, '', '淘汰时没有水位线 ⇒ 墓碑 ETag 为空');
-
-  // 远端对象后来出现了（又被上传/重算过）：**不许**重新下载再淘汰
-  store.contents[key] = shardBuffer('boye888', '2020-01-01', okEvents);
-  store.metas.push(store.metaOf(key, 'E-NEW'));
-  const second = await runSync({ store, config: env.config, logger: env.logger, now: env.now });
-  assert.deepEqual(second.pulled, [], '空 ETag 的墓碑也必须挡住重拉（否则就是"拉了又删"的循环）');
-  assert.equal(second.skipped, 1);
+  assert.equal(store.downloads.length, 2, '两轮之后总下载次数仍是最初那 2 次');
 });
-
-test('状态文件损坏时不崩：按空状态重拉，并带 warning 返回', async () => {
-  const env = makeEnv();
-  const key = 'snapshot/boye888/2026-10-02.jsonl.gz';
-  const store = new FakeStore({ [key]: shardBuffer('boye888', '2026-10-02', okEvents) });
-  fs.mkdirSync(env.config.runtime.stateDir, { recursive: true });
-  fs.writeFileSync(statePathOf(env.config), '{ 坏掉的 json');
-
-  const result = await runSync({ store, config: env.config, logger: env.logger, now: env.now });
-  assert.equal(result.pulled.length, 1);
-  assert.ok(result.warnings.some((w) => w.includes('状态文件')));
-  assert.equal(loadState(statePathOf(env.config)).state.objects[key].dataLines, 3);
-});
-
 test('空状态对象的形状（供调用方断言用）', () => {
-  assert.deepEqual(emptyState(), { version: 1, objects: {}, suspects: {}, pruned: {}, lastRun: null });
+  assert.deepEqual(emptyState(), { version: 1, objects: {}, suspects: {}, lastRun: null });
 });

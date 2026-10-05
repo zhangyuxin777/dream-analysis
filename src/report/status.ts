@@ -38,7 +38,7 @@ export function buildStatusText(config: AppConfig, opts: StatusOptions = {}): st
     const r = state.lastRun;
     const dur = Date.parse(r.finishedAt) - Date.parse(r.startedAt);
     lines.push(
-      `上次同步: ${r.finishedAt} 用时 ${formatDurationMs(dur)} | 列举 ${r.listed} / 拉取 ${r.pulled} / 跳过 ${r.skipped} / 忽略 ${r.ignored} / 失败 ${r.failed} / 淘汰 ${r.pruned ?? 0} (${formatBytes(r.bytes)})`,
+      `上次同步: ${r.finishedAt} 用时 ${formatDurationMs(dur)} | 列举 ${r.listed} / 拉取 ${r.pulled} / 跳过 ${r.skipped} / 忽略 ${r.ignored} / 失败 ${r.failed} (${formatBytes(r.bytes)})`,
     );
     if (r.refusedByLock) lines.push('  本轮因"已有同步在进行"被跳过（跨进程互斥）');
     if (r.deferred) lines.push(`  退避中: ${r.deferred} 个分片（同内容按 30min×2^n 退避，换内容立刻重试）`);
@@ -82,17 +82,11 @@ export function buildStatusText(config: AppConfig, opts: StatusOptions = {}): st
     for (const [k, s] of suspects.slice(0, 5)) lines.push(`  ⏸ ${k}（已失败 ${s.count} 次，最后失败于 ${s.lastErrorAt}）`);
   }
 
-  // 已淘汰（本地按保留期/磁盘上限删掉、但桶里还在）：显式列出来 ——
-  // 不然"淘汰"这件事在状态里完全不可见，而它正是"会不会被重复下载"的关键
-  const pruned = Object.entries(state.pruned ?? {}).sort((a, b) => a[1].prunedAt.localeCompare(b[1].prunedAt));
-  if (pruned.length > 0) {
-    const unknownEtag = pruned.filter(([, p]) => p.etag === '').length;
-    lines.push(
-      `已淘汰（不再重拉）: ${pruned.length} 个${unknownEtag > 0 ? `（其中 ${unknownEtag} 个淘汰时没有水位线）` : ''}` +
-        `，最近一次 ${pruned[pruned.length - 1][1].prunedAt}`,
-    );
-    for (const [k, p] of pruned.slice(-3)) lines.push(`  🗑 ${k}（淘汰于 ${p.prunedAt}）`);
-    lines.push('  说明: 改大 retentionDays **不会**自动找回已淘汰的历史；要找回用 sync --force（那会重新下载一遍）');
+  // 本地分片不再自动删除（见 puller.ts）：盘上就是全部历史，所以这里只报数量与体积
+  const shardsAll = listLocalShards(config.runtime.dataDir);
+  if (shardsAll.length > 0) {
+    const oldest = [...shardsAll].sort((a, b) => a.date.localeCompare(b.date))[0];
+    lines.push(`历史覆盖: ${oldest.date} ~ 最新（本地分片永不自动删除；盘满会响亮失败，不会静默丢数据）`);
   }
 
   // 锁是"此刻有没有同步在跑"的唯一准确来源（被拒轮次不写状态文件 —— 写了会和持有者互相覆盖）

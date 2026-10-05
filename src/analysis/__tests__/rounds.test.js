@@ -196,21 +196,33 @@ test('★真数据实测：roundId 只在 (实例,币种) 内唯一 —— 跨�
   assert.notEqual(eth[2], btc[2], '只按 roundId 建键时，后出现的轮会套用别人的首现时刻（两条时长会相同）');
 });
 
-test('★第三轮 P5 的 Critical：不带 -RCV 的"整串认不出"的完成事件，**不许**认领同计数器的另一轮', async () => {
+test('★身份 = R<计数器>：完成事件只要计数器相同就算同一轮（改名/换时间戳都不影响）', async () => {
   const events = [
     ev('2026-10-01T01:00:00.000Z', 'NEW_ROUND', 'ETHFDUSD', {}, 'R001-010000'),
-    // 空仓重启后开的另一轮，完成事件是它的（它自己的 NEW_ROUND 不在窗口里 / 或就是没采到）
     ev('2026-10-01T05:00:00.000Z', 'ROUND_COMPLETED', 'ETHFDUSD', { profit: 1, durationHours: 1 }, 'R001-050000'),
   ];
   const result = await run(events);
   const row = rowOf(result, 'ETHFDUSD');
-  assert.equal(row[2], '1', '完成数照记（但配不上开轮记录）');
-  assert.equal(row[3], '1', '未完成必须仍是 1：报告 note 的定义是"开了新轮但没看到 ROUND_COMPLETED"；'
-    + '宽松认领会把它报成已完成（静默假阴性，正是这张表最该避免的错）');
-  const aging = result.sections.find((s) => s.heading.startsWith('未完成轮'));
-  assert.match(aging.rows[0][1], /R001-010000/, 'aging 里显示的必须是**那条真没配上完成**的记录，而不是完成事件的名字');
+  assert.equal(row[1], '1');
+  assert.equal(row[2], '1', '同计数器 ⇒ 认得出这是同一轮完成了');
+  assert.equal(row[3], '0', '未完成 0');
 });
 
+test('★安全网：同一个计数器又开一轮（不该发生）⇒ 当作新的一轮重置，并告警', async () => {
+  const events = [
+    ev('2026-10-01T01:00:00.000Z', 'NEW_ROUND', 'ETHFDUSD', {}, 'R001-010000'),
+    ev('2026-10-01T02:00:00.000Z', 'BUY_FILLED', 'ETHFDUSD', { index: 0 }, 'R001-010000'),
+    ev('2026-10-01T05:00:00.000Z', 'NEW_ROUND', 'ETHFDUSD', {}, 'R001-050000'), // 同计数器又开
+  ];
+  const result = await run(events);
+  const row = rowOf(result, 'ETHFDUSD');
+  assert.equal(row[1], '2', '两条 NEW_ROUND 事件都算');
+  assert.equal(row[3], '1', '只有最新那一轮算未收口（上一轮已被顶掉）');
+  const aging = result.sections.find((s) => s.heading.startsWith('未完成轮'));
+  assert.match(aging.rows[0][1], /R001-050000/, '显示的是最新那轮的名字');
+  assert.equal(aging.rows[0][3], '否', '新的一轮还没成交 ⇒ 未建仓');
+  assert.match(result.warnings.join('\n'), /计数器被复用/, '必须告警：主仓说计数器能从本地缓存恢复，复用就是异常');
+});
 test('★主仓实证：空仓重启会复用计数器（R001 再来一次）—— 两轮绝不能被并成一轮', async () => {
   const events = [
     ev('2026-10-01T01:00:00.000Z', 'NEW_ROUND', 'ETHFDUSD', {}, 'R001-010000'),
@@ -242,39 +254,13 @@ test('改名兜底：只有完成事件带 -RCV、中间没有别的非开轮事
   assert.equal(row[3], '0', '未完成 0 —— 不带 -RCV 的"整串匹配不上"就不许认领，否则计数器复用会被误判');
 });
 
-test('counterOfRoundId / isRecoveredRoundId：改名标记与计数器的解析', () => {
-  const { counterOfRoundId, isRecoveredRoundId } = require('../../../dist/analysis/rounds');
-  assert.equal(counterOfRoundId('R596-190959'), 'R596');
-  assert.equal(counterOfRoundId('R596-191307-RCV'), 'R596');
-  assert.equal(counterOfRoundId('R000-ERR-RCV'), 'R000');
-  assert.equal(isRecoveredRoundId('R596-191307-RCV'), true);
-  assert.equal(isRecoveredRoundId('R596-190959'), false);
-  assert.equal(isRecoveredRoundId('R001'), false);
+test('roundCounterOf：取第一段中划线之前（-RCV 与时间戳后缀都只是显示名）', () => {
+  const { roundCounterOf } = require('../../../dist/analysis/roundsCore');
+  assert.equal(roundCounterOf('R596-190959'), 'R596');
+  assert.equal(roundCounterOf('R596-191307-RCV'), 'R596');
+  assert.equal(roundCounterOf('R000-ERR-RCV'), 'R000');
+  assert.equal(roundCounterOf('R001'), 'R001');
 });
-
-test('恢复错误态 id（R000-ERR-RCV）带 -RCV 但不是改名：不许认领，且要报出来', async () => {
-  const events = [
-    ev('2026-10-01T01:00:00.000Z', 'NEW_ROUND', 'ETHFDUSD', {}, 'R596-190959'),
-    ev('2026-10-01T02:00:00.000Z', 'ROUND_COMPLETED', 'ETHFDUSD', { profit: 1, durationHours: 1 }, 'R000-ERR-RCV'),
-  ];
-  const result = await run(events);
-  const row = rowOf(result, 'ETHFDUSD');
-  assert.equal(row[2], '1', '完成数照记（它是条完成事件）');
-  assert.equal(row[3], '1', '不许认领：错误态 id 的计数器信息已丢，归因不可靠');
-  const warning = result.warnings.join('\n');
-  assert.match(warning, /恢复错误态/);
-  assert.match(warning, /计数器信息已丢失/);
-});
-
-test('isRecoveredRoundId / isErrorRoundId：错误态 id 不算改名', () => {
-  const { isRecoveredRoundId, isErrorRoundId } = require('../../../dist/analysis/rounds');
-  assert.equal(isRecoveredRoundId('R596-191307-RCV'), true, '带仓重启的改名');
-  assert.equal(isRecoveredRoundId('R000-ERR-RCV'), false, '恢复抛异常落的常量 id，不是改名');
-  assert.equal(isRecoveredRoundId('R596-190959'), false);
-  assert.equal(isErrorRoundId('R000-ERR-RCV'), true);
-  assert.equal(isErrorRoundId('R596-191307-RCV'), false);
-});
-
 test('★真数据（R004 形态）：零成交、被偏离复位掐断的轮**不许**冒充"最卡"，且要标出真相', async () => {
   const ev2 = (ts, event, symbol, data, roundId) => ({ ts, event, symbol, roundId, instance: 'a', localDate: ts.slice(0, 10), seq: 1, data });
   const events = [
@@ -319,24 +305,25 @@ test('★存活取"先到者"：复位行排在下一轮开轮之后时，不能
   assert.match(r004[5], /复位掐断/, '结局仍按"确实被复位过"报（两件事都真）');
 });
 
-test('★开轮不在窗口内的轮：不假装"已建仓=否"，而是计数 + 出告警', async () => {
-  const ev2 = (ts, event, symbol, data, roundId) => ({ ts, event, symbol, roundId, instance: 'a', localDate: ts.slice(0, 10), seq: 1, data });
+test('★开轮不在窗口内的轮：存活标成 ≥（下界），并出告警——不假装知道起点', async () => {
   const events = [
-    // 这一轮的 NEW_ROUND 在窗口之前（短窗口把它切成了两半）
-    ev2('2026-10-01T05:00:00.000Z', 'BUY_FILLED', 'ETHFDUSD', { index: 0 }, 'R009-010000'),
-    ev2('2026-10-01T06:00:00.000Z', 'SELL_FILLED', 'ETHFDUSD', { profit: 1 }, 'R009-010000'),
-    // 窗口内的正常一轮，保证有内容可看
-    ev2('2026-10-01T08:00:00.000Z', 'NEW_ROUND', 'ETHFDUSD', {}, 'R010-080000'),
+    // 这一轮的 NEW_ROUND 在窗口之前（短窗口把它切成了两半），窗口内只有成交
+    ev('2026-10-01T05:00:00.000Z', 'BUY_FILLED', 'ETHFDUSD', { index: 0 }, 'R009-010000'),
+    ev('2026-10-01T06:00:00.000Z', 'SELL_FILLED', 'ETHFDUSD', { profit: 1 }, 'R009-010000'),
+    // 窗口内的正常一轮
+    ev('2026-10-01T08:00:00.000Z', 'NEW_ROUND', 'ETHFDUSD', {}, 'R010-080000'),
   ];
   const result = await run(events, {}, { window: '2026-10-01' });
   const warning = result.warnings.join('\n');
-  assert.match(warning, /2 条成交\/复位事件属于\*\*开轮不在本窗口\*\*的轮/);
-  assert.match(warning, /偏低甚至显示为否/);
-  // 不许因为这些孤儿事件改变窗口内的轮次计数
-  const row = rowOf(result, 'ETHFDUSD');
-  assert.equal(row[1], '1', '新轮只算窗口内的那一条');
-});
+  assert.match(warning, /1 轮的开轮事件不在本窗口内/);
+  assert.match(warning, /下界/);
 
+  const aging = result.sections.find((s) => s.heading.startsWith('未完成轮'));
+  const r009 = aging.rows.find((r) => r[1].includes('R009'));
+  assert.ok(r009, '这一轮必须列出来（它有成交、真在开着）：' + JSON.stringify(aging.rows));
+  assert.match(r009[2], /^≥/, '起点不在窗口内 ⇒ 存活只能给下界');
+  assert.equal(r009[3], '是', '窗口内有买入成交 ⇒ 已建仓');
+});
 test('★补仓时长：已结束的轮要能看出"慢在补仓还是慢在等"', async () => {
   const ev2 = (ts, event, symbol, data, roundId) => ({ ts, event, symbol, roundId, instance: 'a', localDate: ts.slice(0, 10), seq: 1, data });
   const events = [

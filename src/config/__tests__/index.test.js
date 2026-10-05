@@ -78,11 +78,15 @@ test('内网 endpoint 只告警不拦（同区机器合法用法）', () => {
   assert.ok(warnings.some((w) => w.includes('内网域名')));
 });
 
-test('intervalMinutes 太小 → 告警（当天分片会被反复全量重下）；非法区间 → 报错', () => {
+test('intervalMinutes 太小 → 告警；非法区间 → 报错；已废弃的淘汰配置 → 只告警不报错', () => {
   const tooFrequent = parseConfig(base({ sync: { intervalMinutes: 10 } }), { rootDir: ROOT });
   assert.ok(tooFrequent.warnings.some((w) => w.includes('反复全量重下')));
   assert.throws(() => parseConfig(base({ sync: { intervalMinutes: 0 } }), { rootDir: ROOT }), /intervalMinutes/);
-  assert.throws(() => parseConfig(base({ sync: { concurrency: 4, maxDiskGB: 0 } }), { rootDir: ROOT }), /maxDiskGB/);
+
+  // 老 env.json 里可能还留着 retentionDays / maxDiskGB：必须能起来，并明确告知已废弃
+  const legacy = parseConfig(base({ sync: { concurrency: 1, maxDiskGB: 5, retentionDays: 730 } }), { rootDir: ROOT });
+  assert.ok(legacy.warnings.some((w) => w.includes('已废弃并忽略')), legacy.warnings.join('|'));
+  assert.equal(legacy.config.sync.retentionDays, undefined, '废弃字段不该再进配置对象');
 });
 
 test('bot：全空 = 不配置；填一半 = 报错；填全 = 生效且空白名单给告警', () => {

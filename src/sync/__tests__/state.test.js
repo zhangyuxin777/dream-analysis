@@ -141,46 +141,37 @@ test('loadState：suspects 旧格式（裸数字）迁移成 SuspectState，并�
   assert.ok(warnings.some((w) => w.includes('旧格式')));
 });
 
-test('★淘汰墓碑：saveState/loadState 往返一致；老状态文件（没有 pruned 字段）读成空，不报错', () => {
-  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'state-tomb-')), 'state.json');
-  const state = emptyState();
-  state.pruned['snapshot/a/2020-01-01.jsonl.gz'] = { etag: 'E-OLD', prunedAt: '2026-10-04T00:00:00.000Z' };
-  saveState(file, state);
-  const back = loadState(file).state;
-  assert.deepEqual(back.pruned['snapshot/a/2020-01-01.jsonl.gz'], { etag: 'E-OLD', prunedAt: '2026-10-04T00:00:00.000Z' });
-
-  // 老版本写的状态文件里没有 pruned ⇒ 必须是空对象而不是 undefined（否则淘汰那一步会炸）
-  fs.writeFileSync(file, JSON.stringify({ version: 1, objects: {}, suspects: {}, lastRun: null }));
+test('状态里历史遗留的"淘汰墓碑"：读得进来、但直接忽略并给一条 warning（本地分片不再自动删除）', () => {
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'state-legacy-')), 'state.json');
+  fs.writeFileSync(file, JSON.stringify({
+    version: 1,
+    objects: {},
+    suspects: {},
+    pruned: { 'snapshot/a/2020-01-01.jsonl.gz': { etag: 'E-OLD', prunedAt: '2026-10-04T00:00:00.000Z' } },
+    lastRun: null,
+  }));
   const legacy = loadState(file);
-  assert.deepEqual(legacy.state.pruned, {});
-  assert.deepEqual(legacy.warnings, []);
+  assert.deepEqual(legacy.state.objects, {});
+  assert.ok(legacy.warnings.some((w) => w.includes('淘汰墓碑')), legacy.warnings.join('|'));
 
   // 空状态与保存后的形状必须一致（否则每次同步都会"发现"状态变了）
-  assert.deepEqual(emptyState(), { version: 1, objects: {}, suspects: {}, pruned: {}, lastRun: null });
+  assert.deepEqual(emptyState(), { version: 1, objects: {}, suspects: {}, lastRun: null });
 });
 
-test('★planPull：淘汰墓碑一律 skip（含"淘汰时没有水位线"的空 ETag 场景）；force 才放行', () => {
+test('planPull：本地分片不再自动删除 ⇒ "键不在水位线里"就正常拉，没有任何墓碑可以挡（也不会被永久拉黑）', () => {
   const state = emptyState();
   const key = 'snapshot/a/2020-01-01.jsonl.gz';
-  state.pruned[key] = { etag: '', prunedAt: '2026-10-04T00:00:00.000Z' }; // 状态文件丢过 ⇒ 淘汰时不知道 ETag
   const meta = [{ key, etag: 'E-ANY', size: 10, lastModified: '', lastModifiedMs: Date.parse('2020-01-01T00:00:00Z') }];
 
+  // 没有任何水位线（全新/状态丢过）⇒ 拉
   const plan = planPull(meta, state, { prefix: 'snapshot/', minAgeSeconds: 60, now: NOW });
-  assert.deepEqual(plan.toPull, [], '空 ETag 的墓碑放行 ⇒ 桶里那份老对象每轮都会被重下再淘汰（循环原地复活）');
-  assert.deepEqual(plan.skipped, [{ key, reason: 'pruned' }]);
+  assert.deepEqual(plan.toPull.map((m) => m.key), [key]);
 
-  const forced = planPull(meta, state, { prefix: 'snapshot/', minAgeSeconds: 60, now: NOW, force: true });
-  assert.deepEqual(forced.toPull.map((m) => m.key), [key], 'force 是找回历史（重新下载）的出口');
-
+  // ETag 相同 ⇒ skip（幂等），这是**唯一**的"不重拉"理由
   const known = emptyState();
-  known.pruned[key] = { etag: 'E-ANY', prunedAt: '2026-10-04T00:00:00.000Z' };
-  assert.deepEqual(planPull(meta, known, { prefix: 'snapshot/', minAgeSeconds: 60, now: NOW }).toPull, [], 'ETag 相同也 skip');
-
-  // 墓碑有 ETag 且远端翻新了 ⇒ 必须放行一次（否则"上传侧补数/重算这一天"会被永久忽略）
-  const metaChanged = [{ ...meta[0], etag: 'E-NEW' }];
-  const changed = planPull(metaChanged, known, { prefix: 'snapshot/', minAgeSeconds: 60, now: NOW });
-  assert.deepEqual(changed.toPull.map((m) => m.key), [key]);
-  assert.deepEqual(changed.recomputed, [key]);
+  known.objects[key] = { etag: 'E-ANY', size: 10, dataLines: 1, final: true, pulledAt: 'x', warnings: [] };
+  assert.deepEqual(planPull(meta, known, { prefix: 'snapshot/', minAgeSeconds: 60, now: NOW }).toPull, []);
+  assert.deepEqual(planPull(meta, known, { prefix: 'snapshot/', minAgeSeconds: 60, now: NOW }).skipped, [{ key, reason: 'etag-unchanged' }]);
 });
 
 test('loadState：文件缺失/损坏都不抛，按空状态处理并给 warning', () => {
@@ -212,30 +203,13 @@ test('listLocalShards：只认 <instance>/<date>.jsonl.gz，跳过 .tmp', () => 
   assert.deepEqual(shards.map((s) => `${s.instance}/${s.date}`), ['boye888/2026-10-02']);
 });
 
-test('selectShardsToPrune：按保留天数淘汰，且至少留一份', () => {
-  const shards = [
-    { instance: 'a', date: '2020-01-01', filePath: 'p1', size: 10 },
-    { instance: 'a', date: '2026-10-01', filePath: 'p2', size: 10 },
-    { instance: 'a', date: '2026-10-02', filePath: 'p3', size: 10 },
-  ];
-  const pruned = selectShardsToPrune(shards, { retentionDays: 30, maxDiskGB: 1, now: new Date('2026-10-02T12:00:00+08:00') });
-  assert.deepEqual(pruned.map((p) => p.filePath), ['p1']);
-
-  const allOld = shards.map((s) => ({ ...s, date: '2020-01-01' }));
-  const keepOne = selectShardsToPrune(allOld, { retentionDays: 1, maxDiskGB: 1, now: new Date('2026-10-02T12:00:00+08:00') });
-  assert.equal(keepOne.length, 2, '三份都过期也只删到剩一份');
-});
-
-test('selectShardsToPrune：磁盘超限时从最旧开始删，删到低于上限即停（最小删除）', () => {
-  const shards = [
-    { instance: 'a', date: '2026-09-01', filePath: 'old', size: 600 * 1024 * 1024 },
-    { instance: 'a', date: '2026-09-02', filePath: 'mid', size: 600 * 1024 * 1024 },
-    { instance: 'a', date: '2026-09-03', filePath: 'new', size: 100 * 1024 * 1024 },
-  ];
-  const pruned = selectShardsToPrune(shards, { retentionDays: 3650, maxDiskGB: 1, now: new Date('2026-10-02T12:00:00+08:00') });
-  // 总量 1300MB > 1024MB ⇒ 删最旧的 600MB 后剩 700MB 已达标 ⇒ 停手（不多删）
-  assert.deepEqual(pruned.map((p) => p.filePath), ['old']);
-
-  const tight = selectShardsToPrune(shards, { retentionDays: 3650, maxDiskGB: 0.5, now: new Date('2026-10-02T12:00:00+08:00') });
-  assert.deepEqual(tight.map((p) => p.filePath), ['old', 'mid'], '上限 0.5GB 时要一直删到只剩 100MB 那份');
+test('本地分片永不自动删除：listLocalShards 只列出来（旧分片不会因为"太老"被清掉）', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'state-keep-'));
+  for (const date of ['2020-01-01', '2026-10-02']) {
+    const d = path.join(dir, 'a');
+    fs.mkdirSync(d, { recursive: true });
+    fs.writeFileSync(path.join(d, `${date}.jsonl.gz`), 'x');
+  }
+  const shards = listLocalShards(dir);
+  assert.deepEqual(shards.map((s) => s.date), ['2020-01-01', '2026-10-02'], '2020 年那份必须还在（源数据不归消费端删）');
 });

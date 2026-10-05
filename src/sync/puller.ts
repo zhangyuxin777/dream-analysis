@@ -18,7 +18,7 @@ import { ObjectStore } from '../oss/store';
 import { readShard } from '../ndjson/shard';
 import { buildShardKey, parseShardKey } from '../ndjson/types';
 import { acquireLock, releaseLock } from './lock';
-import { DeferredShard, listLocalShards, loadState, planPull, saveState, selectShardsToPrune, SyncState } from './state';
+import { DeferredShard, loadState, planPull, saveState, SyncState } from './state';
 
 export interface PullDeps {
   store: ObjectStore;
@@ -37,7 +37,6 @@ export interface PullResult {
   ignored: number;
   failed: Array<{ key: string; error: string }>;
   bytes: number;
-  pruned: string[];
   warnings: string[];
   recomputed: string[];
   /** 因失败退避被推迟的分片（必须可见） */
@@ -47,6 +46,18 @@ export interface PullResult {
   /** 因为"已有同步在进行"而整体跳过 */
   refusedByLock: boolean;
 }
+
+/**
+ * **本地分片永不自动删除**（2026-10-04 定案）。
+ *
+ * 曾经有过"按保留期（默认 90 天）淘汰旧分片 + 磁盘上限兜底"，为此要维护
+ * "淘汰了哪些、ETag 是多少"的墓碑，免得删掉水位线后每轮又把老对象重新下载一遍。
+ * 那套机制自己长出了两轮 P5 缺陷（含 1 个 Critical），而收益≈0：
+ * 分片 ~200KB/天/实例 ⇒ 10 实例 5 年也就 ~3.6GB。
+ *
+ * 现在的原则（大哥原话的落点）：**消费端只做过滤与分析，不当数据的看门人**。
+ * 盘满时**响亮失败**（写入报错 + 日志），需要腾地方时用显式命令，而不是后台静默删源数据。
+ */
 
 /** 锁的过期时长：硬杀进程留下的锁最多挡 30 分钟（同步间隔 60 分钟 ⇒ 不会卡死） */
 export const LOCK_STALE_MS = 30 * 60_000;
@@ -81,7 +92,7 @@ export async function runSync(deps: PullDeps, opts: { force?: boolean } = {}): P
       holderSince: lock.holder?.acquiredAt ?? null,
     });
     return {
-      listed: 0, pulled: [], skipped: 0, ignored: 0, failed: [], bytes: 0, pruned: [],
+      listed: 0, pulled: [], skipped: 0, ignored: 0, failed: [], bytes: 0,
       warnings: [], recomputed: [], deferred: [], whitelistChanges: [], refusedByLock: true,
     };
   }
@@ -143,7 +154,6 @@ async function syncOnce(deps: PullDeps, opts: { force?: boolean }): Promise<Pull
     ignored: plan.ignored.length,
     failed: [],
     bytes: 0,
-    pruned: [],
     warnings,
     recomputed: plan.recomputed,
     deferred: plan.deferred,
@@ -194,7 +204,6 @@ async function syncOnce(deps: PullDeps, opts: { force?: boolean }): Promise<Pull
         whitelistVersion,
       };
       delete state.suspects[meta.key];
-      delete state.pruned[meta.key]; // 重新拉回来了 ⇒ 墓碑作废（ETag 变了才会走到这里）
       result.pulled.push(meta.key);
       result.bytes += meta.size;
       logger.info('已拉取分片', {
@@ -220,24 +229,8 @@ async function syncOnce(deps: PullDeps, opts: { force?: boolean }): Promise<Pull
     }
   }
 
-  // 淘汰：先按保留天数，再按磁盘上限（从最旧开始）
-  const doomed = selectShardsToPrune(listLocalShards(config.runtime.dataDir), {
-    retentionDays: config.sync.retentionDays,
-    maxDiskGB: config.sync.maxDiskGB,
-    now: now(),
-  });
-  for (const shard of doomed) {
-    safeUnlink(shard.filePath);
-    const key = buildShardKey(config.oss.prefix, shard.instance, shard.date);
-    // ★ 留墓碑再删水位线：桶里的老对象不会消失（上传侧没有生命周期清理），
-    //   没有墓碑就会"下一轮又当成本地没有 → 重新下载 → 再淘汰"，每小时循环一次。
-    //   ETag 变了（上传侧重算）时墓碑自动失效 ⇒ 不会变成永久拉黑。
-    state.pruned[key] = { etag: state.objects[key]?.etag ?? '', prunedAt: now().toISOString() };
-    delete state.objects[key];
-    delete state.suspects[key];
-    result.pruned.push(shard.filePath);
-  }
-  if (doomed.length > 0) logger.info('已淘汰本地旧分片', { count: doomed.length, sample: doomed.slice(0, 5).map((s) => `${s.instance}/${s.date}`) });
+  // 本地分片**不删**（见 PullResult 上方那段注释）：消费端只做过滤与分析，不当数据的看门人。
+  // 盘满时写入会直接报错（响亮失败），腾地方请用显式手段。
 
   state.lastRun = {
     startedAt,
@@ -250,7 +243,6 @@ async function syncOnce(deps: PullDeps, opts: { force?: boolean }): Promise<Pull
     bytes: result.bytes,
     errors: result.failed.map((f) => `${f.key}: ${f.error}`),
     deferred: result.deferred.length,
-    pruned: result.pruned.length,
     whitelistChanges: result.whitelistChanges,
   };
   saveState(statePath, state);
@@ -263,7 +255,6 @@ async function syncOnce(deps: PullDeps, opts: { force?: boolean }): Promise<Pull
     failed: result.failed.length,
     deferred: result.deferred.length,
     bytes: result.bytes,
-    pruned: result.pruned.length,
   });
   return result;
 }

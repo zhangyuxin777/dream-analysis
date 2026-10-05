@@ -37,16 +37,12 @@ export interface SuspectState {
 }
 
 /**
- * **淘汰墓碑**：本地按保留期/磁盘上限删掉的分片，记下删时的 ETag。
- *
- * 为什么必须有：淘汰曾经连水位线条目一起删 ⇒ 桶里仍在的老对象下一轮又变成"本地没有" ⇒
- * **重新下载 → 再淘汰 → 再下载**（每小时一轮、无限循环，日志看起来还完全正常）。
- * 上传侧的 OSS 没有生命周期清理，所以这个循环一旦开始就永不停止（实测：修之前一定会重拉）。
- *
- * 墓碑不是拉黑：**ETag 变了（上传侧重算/封存）照样重拉** ✓
+ * 淘汰墓碑：**已废弃**（2026-10-04 起本地分片永不自动删除，见 puller.ts 的说明）。
+ * 类型保留只为让**老状态文件**能被读进来而不炸；新状态不再写 `pruned`。
+ * 起因回顾：淘汰机制自己长出了两轮 P5 缺陷（含 1 个 Critical：删了水位线 ⇒ 老对象每轮重下再删），
+ * 而收益≈0（分片 ~200KB/天/实例）。消费端不该当数据的看门人。
  */
 export interface PrunedTombstone {
-  /** 淘汰那一刻该对象的 ETag（空串 = 当时不知道，退化为"总是允许重拉"） */
   etag: string;
   prunedAt: string;
 }
@@ -67,8 +63,6 @@ export interface RunSummary {
   whitelistChanges?: string[];
   /** 本轮是否因为"另一个同步正在进行"而整体跳过 */
   refusedByLock?: boolean;
-  /** 本轮淘汰掉的本地分片数（持久化下来，status 才看得出"最近还在不在淘汰"） */
-  pruned?: number;
 }
 
 export interface SyncState {
@@ -77,13 +71,13 @@ export interface SyncState {
   objects: Record<string, ObjectState>;
   /** key → 失败退避状态 */
   suspects: Record<string, SuspectState>;
-  /** key → 已淘汰墓碑（同 ETag 不再重拉） */
-  pruned: Record<string, PrunedTombstone>;
+  /** 历史遗留（早期版本淘汰过本地分片留下的墓碑）：读进来即忽略，不再写入 */
+  pruned?: Record<string, PrunedTombstone>;
   lastRun: RunSummary | null;
 }
 
 export function emptyState(): SyncState {
-  return { version: 1, objects: {}, suspects: {}, pruned: {}, lastRun: null };
+  return { version: 1, objects: {}, suspects: {}, lastRun: null };
 }
 
 /**
@@ -113,15 +107,11 @@ export function loadState(filePath: string): { state: SyncState; warnings: strin
         };
       }
     }
-    const pruned: Record<string, PrunedTombstone> = {};
-    for (const [key, value] of Object.entries((raw.pruned as Record<string, unknown>) ?? {})) {
-      if (value && typeof value === 'object') {
-        const p = value as Partial<PrunedTombstone>;
-        pruned[key] = { etag: String(p.etag ?? ''), prunedAt: String(p.prunedAt ?? new Date(0).toISOString()) };
-      }
-    }
+    // 老状态文件里可能留着"淘汰墓碑"（早期版本的功能）：读进来但**直接丢弃** —— 已不再淘汰本地分片
+    const legacyPruned = raw.pruned && Object.keys(raw.pruned).length > 0;
+    if (legacyPruned) warnings.push('状态文件里有历史遗留的"淘汰墓碑"（早期功能），已忽略');
     return {
-      state: { version: 1, objects: raw.objects as Record<string, ObjectState>, suspects, pruned, lastRun: raw.lastRun ?? null },
+      state: { version: 1, objects: raw.objects as Record<string, ObjectState>, suspects, lastRun: raw.lastRun ?? null },
       warnings,
     };
   } catch (err) {
@@ -133,10 +123,9 @@ export function loadState(filePath: string): { state: SyncState; warnings: strin
 /** 原子写（tmp + rename），键排序保证 diff 稳定；父目录自动建 */
 export function saveState(filePath: string, state: SyncState): void {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  const sorted: SyncState = { version: 1, objects: {}, suspects: {}, pruned: {}, lastRun: state.lastRun };
+  const sorted: SyncState = { version: 1, objects: {}, suspects: {}, lastRun: state.lastRun };
   for (const key of Object.keys(state.objects).sort()) sorted.objects[key] = state.objects[key];
   for (const key of Object.keys(state.suspects).sort()) sorted.suspects[key] = state.suspects[key];
-  for (const key of Object.keys(state.pruned ?? {}).sort()) sorted.pruned[key] = state.pruned[key];
   const tmp = `${filePath}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify(sorted, null, 2) + '\n', 'utf8');
   fs.renameSync(tmp, filePath);
@@ -150,7 +139,7 @@ export function suspectCooldownMs(count: number): number {
   return Math.min(base * Math.pow(2, exponent), cap);
 }
 
-export type SkipReason = 'etag-unchanged' | 'too-fresh' | 'suspect-cooldown' | 'pruned';
+export type SkipReason = 'etag-unchanged' | 'too-fresh' | 'suspect-cooldown';
 export type IgnoreReason = 'key-not-matching-contract';
 
 export interface DeferredShard {
@@ -206,21 +195,6 @@ export function planPull(metas: ObjectMeta[], state: SyncState, opts: PlanOption
     }
     if (known && known.etag !== meta.etag) plan.recomputed.push(meta.key);
 
-    // 已淘汰过的（本地按保留期删掉了、但桶里还在）：见 PrunedTombstone 注释。两种情形分开处理：
-    // ① 墓碑**没有** ETag（淘汰时水位线丢了/状态文件损坏过）：一律 skip。
-    //    若放行，桶里那老对象每轮都会被重下再淘汰 —— 正是本次要修的循环原地复活。
-    // ② 墓碑有 ETag：**只挡"内容没变"**。ETag 变了（上传侧重算/补数）⇒ 放行一次，
-    //    重下后同一轮又会被淘汰、墓碑用新 ETag 重建 ⇒ 每次远端变更最多多下一次，不会循环。
-    //    （不能一律 skip：那会让"上传侧补数了这一天"被永久忽略，且与本文件承诺的"ETag 变了就重拉"矛盾。）
-    const tombstone = state.pruned?.[meta.key];
-    if (tombstone && !opts.force) {
-      if (tombstone.etag === '' || tombstone.etag === meta.etag) {
-        plan.skipped.push({ key: meta.key, reason: 'pruned' });
-        continue;
-      }
-      plan.recomputed.push(meta.key); // 淘汰过但远端翻新了 ⇒ 再拉一次（随后会被重新淘汰）
-    }
-
     if (meta.lastModifiedMs !== null) {
       const ageSeconds = (opts.now.getTime() - meta.lastModifiedMs) / 1000;
       if (!opts.force && ageSeconds < opts.minAgeSeconds) {
@@ -254,7 +228,7 @@ export function planPull(metas: ObjectMeta[], state: SyncState, opts: PlanOption
   return plan;
 }
 
-/** 本地已落地的天分片（按日期升序） */
+/** 本地已落地的天分片（按日期升序）—— 只用于展示/统计（status、doctor），**没有任何自动删除逻辑** */
 export interface LocalShard {
   instance: string;
   date: string;
@@ -279,39 +253,3 @@ export function listLocalShards(dataDir: string): LocalShard[] {
   return out.sort((a, b) => (a.date === b.date ? a.instance.localeCompare(b.instance) : a.date.localeCompare(b.date)));
 }
 
-/**
- * 选出该淘汰的本地分片（纯函数）：先按保留天数，再按磁盘上限，**从最旧开始删**。
- * 两条规则都保留"至少留一份"的底线（全删光会让下次同步变成全量重拉，且删了就查不了历史）。
- */
-export function selectShardsToPrune(
-  shards: LocalShard[],
-  opts: { retentionDays: number; maxDiskGB: number; now: Date },
-): LocalShard[] {
-  // 显式 (日期, 实例)：同一天多实例时"先淘汰哪个实例"也必须确定，不依赖调用方给的顺序
-  const ascending = [...shards].sort((a, b) => (a.date === b.date ? a.instance.localeCompare(b.instance) : a.date.localeCompare(b.date)));
-  const doomed = new Set<string>();
-  const cutoffMs = opts.now.getTime() - opts.retentionDays * 24 * 3600 * 1000;
-
-  for (const s of ascending) {
-    const ts = Date.parse(`${s.date}T00:00:00+08:00`);
-    if (Number.isFinite(ts) && ts < cutoffMs) doomed.add(s.filePath);
-  }
-
-  const budget = opts.maxDiskGB * 1024 * 1024 * 1024;
-  let total = ascending.reduce((sum, s) => sum + (doomed.has(s.filePath) ? 0 : s.size), 0);
-  for (const s of ascending) {
-    if (total <= budget) break;
-    if (doomed.has(s.filePath)) continue;
-    doomed.add(s.filePath);
-    total -= s.size;
-  }
-
-  // 底线：至少留一份（留下的那份不算"被淘汰"）
-  const survivors = ascending.filter((s) => !doomed.has(s.filePath));
-  if (survivors.length === 0 && ascending.length > 0) {
-    const last = ascending[ascending.length - 1];
-    doomed.delete(last.filePath);
-  }
-
-  return ascending.filter((s) => doomed.has(s.filePath));
-}

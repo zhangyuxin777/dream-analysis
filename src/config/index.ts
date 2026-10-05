@@ -29,8 +29,6 @@ export interface SyncConfig {
   intervalMinutes: number;
   minAgeSeconds: number;
   countIncludesHeader: boolean;
-  maxDiskGB: number;
-  retentionDays: number;
   concurrency: number;
 }
 
@@ -132,16 +130,15 @@ export function parseConfig(raw: unknown, opts: { rootDir: string }): ParseResul
     intervalMinutes: num(syncRaw.intervalMinutes, 60),
     minAgeSeconds: num(syncRaw.minAgeSeconds, 60),
     countIncludesHeader: bool(syncRaw.countIncludesHeader, false),
-    maxDiskGB: num(syncRaw.maxDiskGB, 5),
-    // 730 天 = 两年。回测里最长卡住 165 天（≈ 3967h），保留期必须显著大于它，
-    // 否则"卡住轮"视图找不到轮次的起点。磁盘代价很小：~200KB/天/实例 ⇒ 两年 ≈ 150MB/实例。
-    retentionDays: num(syncRaw.retentionDays, 730),
+    // ⚠️ `retentionDays` / `maxDiskGB` 已废弃（2026-10-04）：本地分片**永不自动删除**。
+    // 盘上留着的都是源数据（~200KB/天/实例），消费端不当数据的看门人；盘满就响亮失败。
     concurrency: num(syncRaw.concurrency, 1),
   };
   if (sync.intervalMinutes < 1 || sync.intervalMinutes > 1440) problems.push('sync.intervalMinutes 应在 1~1440 之间');
   if (sync.minAgeSeconds < 0 || sync.minAgeSeconds > 3600) problems.push('sync.minAgeSeconds 应在 0~3600 之间');
-  if (sync.maxDiskGB <= 0) problems.push('sync.maxDiskGB 必须为正数');
-  if (sync.retentionDays < 1) problems.push('sync.retentionDays 至少 1 天');
+  if (num(syncRaw.retentionDays, 0) > 0 || num(syncRaw.maxDiskGB, 0) > 0) {
+    warnings.push('sync.retentionDays / sync.maxDiskGB 已废弃并忽略：本地分片不再自动删除（行为见 puller.ts 注释）');
+  }
   if (sync.concurrency !== 1) warnings.push('sync.concurrency 建议保持 1（002 上还有实盘，别抢 IO/CPU）');
   if (sync.intervalMinutes < 30) {
     warnings.push('sync.intervalMinutes 小于 30 分钟：当天分片每次重算 ETag 都会变，会反复全量重下（建议与产出同频 = 60）');

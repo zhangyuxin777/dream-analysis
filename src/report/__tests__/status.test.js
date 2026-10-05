@@ -66,24 +66,26 @@ test('有数据：封存状态 / 落后天数 / 退避 / 口径变更 / 失败�
   assert.match(text, /已失败 2 次/);
 });
 
-test('已淘汰（墓碑）：显式列出、说明"改大保留期不会自动找回"、并显示上一轮淘汰数', () => {
+test('status：报出"历史覆盖"起止（本地分片永不自动删除 ⇒ 盘上就是全部历史）', () => {
   const env = makeEnv();
   const state = emptyState();
   state.objects[`${env.config.oss.prefix}boye888/2026-10-01.jsonl.gz`] = { etag: 'E1', size: 1, dataLines: 1, final: true, pulledAt: 'x', warnings: [] };
-  state.pruned[`${env.config.oss.prefix}boye888/2020-01-01.jsonl.gz`] = { etag: 'E-OLD', prunedAt: '2026-10-04T01:00:00.000Z' };
-  state.pruned[`${env.config.oss.prefix}boye888/2020-01-02.jsonl.gz`] = { etag: '', prunedAt: '2026-10-04T02:00:00.000Z' }; // 状态丢过
   state.lastRun = {
     startedAt: '2026-10-04T02:00:00.000Z', finishedAt: '2026-10-04T02:00:00.100Z', listed: 5, pulled: 1, skipped: 3,
-    ignored: 0, failed: 0, bytes: 100, errors: [], deferred: 0, pruned: 2, whitelistChanges: [], refusedByLock: false,
+    ignored: 0, failed: 0, bytes: 100, errors: [], deferred: 0, whitelistChanges: [], refusedByLock: false,
   };
   saveState(statePathOf(env.config), state);
+  // 盘上放一份很老的 + 一份新的
+  for (const date of ['2020-01-01', '2026-10-01']) {
+    const d = path.join(env.config.runtime.dataDir, 'boye888');
+    fs.mkdirSync(d, { recursive: true });
+    fs.writeFileSync(path.join(d, `${date}.jsonl.gz`), 'x');
+  }
 
   const text = buildStatusText(env.config, { now: NOW });
-  assert.match(text, /淘汰 2/, '上次同步那行要能看出"最近还在不在淘汰"');
-  assert.match(text, /已淘汰（不再重拉）: 2 个（其中 1 个淘汰时没有水位线）/);
-  assert.match(text, /最近一次 2026-10-04T02:00:00\.000Z/, '明细必须按淘汰时间排序，不能按 key 序');
-  assert.match(text, /改大 retentionDays \*\*不会\*\*自动找回已淘汰的历史/);
-  assert.match(text, /sync --force/);
+  assert.match(text, /历史覆盖: 2020-01-01 ~ 最新/);
+  assert.match(text, /永不自动删除/);
+  assert.ok(!/淘汰/.test(text), '不该再出现任何"淘汰"字样');
 });
 
 test('落后超过 2 天要显式告警（这是"同步可能停了"的最直接信号）', () => {
