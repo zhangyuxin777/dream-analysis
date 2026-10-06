@@ -480,7 +480,9 @@ report [instance] [窗口]      M3：概览（health + rounds 摘要）——**�
 ### 待办
 
 0. **M4：`list` 失败的指数退避重试**（现在失败只记 error + 等下一轮，间隔 60 分钟）。要加就加在有注入 sleep 的地方，并补"退避期间不重复调用"的单测。
-1. **只读用户**（**本次要做**）：给分析侧单独一对 AK，**新增用户不动现有策略**。理由：分析服务挂着机器人/对外接收消息，是暴露面最大的一环，不宜持有"能写能删"的钥匙。
+1. ~~**只读用户**~~ ✅ **已完成（2026-10-05）**：RAM 用户 `dream-analysis-read`，策略 = `oss:GetObject`（对象级）+ `oss:ListObjects`（bucket 级 + `oss:Prefix` 条件），凭据已换进分析侧 `env.json`（上传侧那把写权限 AK 不动）。
+   实测通过：`doctor` / `doctor --deep`（列举 10、拉取 5、契约核对通过、本地 8 分片累计 123 条连接事件）/ `sync`。
+   **待办**：两个 Statement 都加 `Condition.IpAddress.acs:SourceIp`（只允许两台服务器）收口。
    **策略照官方示例**（"Allow listing objects using the CLI" —— ossutil + 指定前缀就是这个形态）：
    ```json
    {
