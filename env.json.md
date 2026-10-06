@@ -18,8 +18,15 @@
 | `prefix` | `snapshot/`（与上传侧约定，**不要改**） |
 | `configFile` | ossutil 配置文件路径（内含 AK/SK）。留空 = 用默认 `~/.ossutilconfig` |
 
-> **凭据只存在于 ossutil 自己的配置文件里**，本项目**不读 AK/SK、不打印**。
-> 该文件建议 `chmod 600`；将来可换成只读 RAM 用户的那一对（见 `DESIGN.md` §十三）。
+> **凭据的两种放法（代码两条路都支持）**：
+> - **A. 写进本文件**：`oss.accessKeyId` + `oss.accessKeySecret`（必须成对填；只填一个启动就报错）⇒
+>   程序启动时按 ossutil 格式落一个 **0600** 的配置文件（`storeFactory` → `writeOssutilCredentialFile`，段头 `[Credentials]` 不能省）。
+> - **B. 指向现成配置**：先在机器上 `ossutil config -e <endpoint> -i <AK> -k <SK>` 生成 `~/.ossutilconfig`（`chmod 600`），
+>   本文件只填 `configFile` 指向它，不写 AK。
+>
+> 无论哪种，程序**永不打印 AK/SK**（`redact` 覆盖 `accessKeySecret`），`-e` 每次显式传（本文件是 endpoint 唯一真源）。
+> **分析侧应该用只读 RAM 用户的那对 AK**（`GetObject` + `ListObjects`，见 `DESIGN.md` §十三 待办 1）——
+> 上传侧才需要写权限，两把钥匙分开。
 
 ## `sync`
 

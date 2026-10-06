@@ -421,7 +421,7 @@ report [instance] [窗口]      M3：概览（health + rounds 摘要）——**�
 | 目录 | `/root/dream_analysis`（与 `/root/dream_boye888` 等实盘目录彻底分开） |
 | Node | ≥22，`npm ci` |
 | 网络 | 服务器走**内网 endpoint**（免费 + 快）；本机开发走公网 |
-| 权限 | 前缀沿用 `snapshot/` ⇒ **现有严格策略不用改**（上传侧/拉取侧先共用同一对 AK）。**建议后续新增只读用户**（`GetObject`+`ListObjects`+`GetObjectMeta`，资源同 `snapshot/*`）给分析侧：**新增用户不动现有策略**，而分析服务挂着机器人、暴露面最大，不宜持有能写能删的钥匙。回传报告若走 OSS 需另配 `report/*` 写权限（P1 不做） |
+| 权限 | 前缀沿用 `snapshot/` ⇒ 上传侧那把严格策略不用改。**分析侧单独用只读 RAM 用户**（见下"只读策略"）：新增用户不影响现有策略，而分析服务对外收消息、暴露面最大，不该持有能写能删的钥匙。回传报告若走 OSS 需另配 `report/*` 写权限（P1 不做） |
 | 自检 | `node dist/bin/analysis.js doctor`：配置/OSS 连通/目录可写/机器人连通/数据新鲜度 |
 | 监控 | 落后 > 2 小时、同步连续失败、行数不符 → 走机器人 warn 群 |
 
@@ -480,7 +480,22 @@ report [instance] [窗口]      M3：概览（health + rounds 摘要）——**�
 ### 待办
 
 0. **M4：`list` 失败的指数退避重试**（现在失败只记 error + 等下一轮，间隔 60 分钟）。要加就加在有注入 sleep 的地方，并补"退避期间不重复调用"的单测。
-1. **只读用户**（建议，**不阻塞开工**）：给分析侧单独一对 AK（`GetObject` + `ListObjects` + `GetObjectMeta`，资源 `snapshot/*`）。**新增用户不动现有策略**。理由：分析服务挂着机器人、对外接收消息，是暴露面最大的一环，不宜持有"能写能删"的钥匙。
+1. **只读用户**（**本次要做**）：给分析侧单独一对 AK，**新增用户不动现有策略**。理由：分析服务挂着机器人/对外接收消息，是暴露面最大的一环，不宜持有"能写能删"的钥匙。
+   **策略照官方示例**（"Allow listing objects using the CLI" —— ossutil + 指定前缀就是这个形态）：
+   ```json
+   {
+     "Version": "1",
+     "Statement": [
+       { "Effect": "Allow", "Action": ["oss:GetObject"], "Resource": ["acs:oss:*:*:dream-ana/snapshot/*"] },
+       { "Effect": "Allow", "Action": ["oss:ListObjects"], "Resource": ["acs:oss:*:*:dream-ana"],
+         "Condition": { "StringLike": { "oss:Prefix": "snapshot/*" } } }
+     ]
+   }
+   ```
+   ⚠️ 三个易错点（我原先写错过，记下来）：
+   - **没有 `oss:GetObjectMeta` 这个 action** —— 取元信息（`HeadObject` / ossutil `stat`）用的就是 **`oss:GetObject`**（官方 HeadObject 文档的权限表）。多写一个不存在的 action 不报错、但也不生效。
+   - **`oss:ListObjects` 的资源是 bucket 级**（`acs:oss:*:*:dream-ana`，**不带 `/snapshot/*`**），前缀限制用**条件** `StringLike.oss:Prefix` 表达；`oss:GetObject` 才是对象级 `.../snapshot/*`。
+   - `oss:Prefix` 的值要与我们代码实际传的前缀一致（配置里 `oss.prefix = "snapshot/"`）⇒ 写 `snapshot/*`（`StringLike` 的 `*` 能匹配空，`snapshot/` 也命中）。
 2. **钉钉应用凭据**：AppKey/AppSecret 由大哥填进 002 的 `env.json`（不经我手）；随后在群里 @ 机器人一次，用 `whoami` 取 `staffId` / `conversationId` 回填白名单。
 3. **保留策略**：OSS 侧由上传侧决定（当前无生命周期清理）；**本地永不自动删除**（消费端只读源数据）。
 4. **M1 契约核对清单**（拿第一批真数据跑）：
