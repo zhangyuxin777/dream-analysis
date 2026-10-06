@@ -37,10 +37,9 @@ import { WindowParseError, WindowTooLongError } from '../common/time';
 import { buildStatusText } from '../report/status';
 import { DingTalkBot } from '../bot/dingtalk-bot';
 import { CommandRouter, buildHelpText } from '../bot/router';
+import { isConnection } from '../analysis/events';
 
 const ROOT_DIR = path.resolve(__dirname, '..', '..');
-/** 连接类稀疏事件的前缀：契约核对里要确认上传侧把它们放进来了（DESIGN §3.4-③） */
-const CONNECTION_EVENT_PREFIXES = ['UDS_', 'MARKET_STREAM_', 'WORKER_WS_', 'ORDER_CANCELED'];
 
 export interface CommandContext {
   config: AppConfig;
@@ -231,10 +230,10 @@ export async function cmdDoctor(ctx: CommandContext, deep: boolean): Promise<num
         try {
           await store.getTo(newest.key, tmp);
           const stats = await readShard(tmp, { countIncludesHeader: config.sync.countIncludesHeader });
-          const connEvents = Object.keys(stats.eventCounts).filter((e) => CONNECTION_EVENT_PREFIXES.some((p) => e === p || e.startsWith(p)));
+          const connEvents = Object.keys(stats.eventCounts).filter((e) => isConnection(e));
           checks.push({
             ok: stats.ok,
-            text: `契约核对 ${newest.key}: header=${stats.header ? `final=${stats.header.final} count=${stats.header.count ?? '未提供'} schema=${stats.header.schema}` : '缺失'}，数据行=${stats.dataLines}，坏行=${stats.badLines}，事件种类=${Object.keys(stats.eventCounts).length}，连接类事件=${connEvents.length > 0 ? connEvents.slice(0, 5).join(',') : '无（③ 未满足，断流分析将降级）'}`,
+            text: `契约核对 ${newest.key}: header=${stats.header ? `final=${stats.header.final} count=${stats.header.count ?? '未提供'} schema=${stats.header.schema}` : '缺失'}，数据行=${stats.dataLines}，坏行=${stats.badLines}，事件种类=${Object.keys(stats.eventCounts).length}，连接类事件=${connEvents.length > 0 ? connEvents.slice(0, 5).join(',') : '该分片里没有（连接事件本来就稀疏；白名单里它们在，不用降级 —— 看 stream 视图要跨窗口）'}`,
           });
           for (const w of stats.warnings.slice(0, 5)) checks.push({ ok: true, text: `   ⚠️ ${w}` });
           for (const e of stats.errors) checks.push({ ok: false, text: `   ❌ ${e}` });
@@ -295,7 +294,7 @@ export async function cmdVerify(ctx: CommandContext, key: string): Promise<numbe
   for (const [name, n] of top.slice(0, 15)) console.log(`  ${String(n).padStart(7)}  ${name}`);
   const symbols = Object.entries(stats.symbolCounts).sort((a, b) => b[1] - a[1]);
   console.log(`symbol 分布: ${symbols.slice(0, 10).map(([s, n]) => `${s}=${n}`).join(' ')}`);
-  const conn = top.filter(([name]) => CONNECTION_EVENT_PREFIXES.some((p) => name === p || name.startsWith(p)));
+  const conn = top.filter(([name]) => isConnection(name));
   console.log(`连接类事件（断流分析依赖）: ${conn.length > 0 ? conn.map(([n, c]) => `${n}=${c}`).join(' ') : '❌ 无 —— DESIGN §3.4-③ 未满足，断流分析只能降级'}`);
   for (const w of stats.warnings) console.log(`⚠️  ${w}`);
   for (const e of stats.errors) console.log(`❌ ${e}`);
@@ -425,4 +424,4 @@ if (require.main === module) {
     });
 }
 
-export { ROOT_DIR, CONNECTION_EVENT_PREFIXES };
+export { ROOT_DIR };
