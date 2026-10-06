@@ -41,6 +41,19 @@ import { isConnection } from '../analysis/events';
 
 const ROOT_DIR = path.resolve(__dirname, '..', '..');
 
+/**
+ * "这个/这些分片里有没有连接类事件"的**唯一判词**（doctor --deep 与 verify 共用）。
+ * 为什么要共用：曾经 doctor 改成"该分片里没有（稀疏，正常）"、verify 还留着"❌ 未满足，只能降级" ⇒
+ * 同一份真分片、同一次会话，两条命令结论互斥（P5 抓到）。
+ * ⚠️ 别把它当"契约是否满足"的判据：连接事件本来就稀疏，**absence 是常态** ⇒
+ * 单分片判不出来（doctor --deep 另有"本地全部分片累计"那条给基数）。
+ */
+function connectionEventsNote(events: readonly string[]): string {
+  return events.length > 0
+    ? events.slice(0, 5).join(',')
+    : '该分片里没有（连接事件本来就稀疏；白名单里它们在，不用降级 —— 要看 stream 得跨窗口）';
+}
+
 export interface CommandContext {
   config: AppConfig;
   logger: ILogger;
@@ -216,6 +229,30 @@ export async function cmdDoctor(ctx: CommandContext, deep: boolean): Promise<num
   const shards = listLocalShards(config.runtime.dataDir);
   checks.push({ ok: true, text: `本地分片: ${shards.length} 个，共 ${formatBytes(shards.reduce((s, x) => s + x.size, 0))}` });
 
+  // 连接类事件是**稀疏**的 ⇒ 拿单个分片判"上传侧有没有导出连接事件"没有检出力（absence 是常态，
+  // 会把真故障也说成"不用降级"）。这里改成看**本地全部分片**的累计出现情况，给一个有基数的事实。
+  if (deep && shards.length > 0) {
+    const connSeen = new Map<string, number>();
+    let scanned = 0;
+    for (const s of shards) {
+      try {
+        const st = await readShard(s.filePath, { countIncludesHeader: config.sync.countIncludesHeader });
+        scanned++;
+        for (const [name, n] of Object.entries(st.eventCounts)) if (isConnection(name)) connSeen.set(name, (connSeen.get(name) ?? 0) + n);
+      } catch {
+        // 个别分片读不出来时跳过：doctor 的主判据不是它，读失败本身会在其它检查里体现
+      }
+    }
+    const total = [...connSeen.values()].reduce((a, b) => a + b, 0);
+    checks.push({
+      ok: true,
+      text: `连接类事件（本地 ${scanned}/${shards.length} 个分片累计）: ${total} 条` +
+        (total === 0
+          ? ' —— 一个都没见着：**值得查**（白名单里它们本来就有；也可能是本地分片太少/实例太安静）'
+          : `（${[...connSeen.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([k, n]) => `${k}×${n}`).join('、')}）`),
+    });
+  }
+
   if (deep) {
     const newest = metas
       .filter((m) => parseShardKey(m.key, config.oss.prefix) !== null)
@@ -233,7 +270,7 @@ export async function cmdDoctor(ctx: CommandContext, deep: boolean): Promise<num
           const connEvents = Object.keys(stats.eventCounts).filter((e) => isConnection(e));
           checks.push({
             ok: stats.ok,
-            text: `契约核对 ${newest.key}: header=${stats.header ? `final=${stats.header.final} count=${stats.header.count ?? '未提供'} schema=${stats.header.schema}` : '缺失'}，数据行=${stats.dataLines}，坏行=${stats.badLines}，事件种类=${Object.keys(stats.eventCounts).length}，连接类事件=${connEvents.length > 0 ? connEvents.slice(0, 5).join(',') : '该分片里没有（连接事件本来就稀疏；白名单里它们在，不用降级 —— 看 stream 视图要跨窗口）'}`,
+            text: `契约核对 ${newest.key}: header=${stats.header ? `final=${stats.header.final} count=${stats.header.count ?? '未提供'} schema=${stats.header.schema}` : '缺失'}，数据行=${stats.dataLines}，坏行=${stats.badLines}，事件种类=${Object.keys(stats.eventCounts).length}，连接类事件=${connectionEventsNote(connEvents)}`,
           });
           for (const w of stats.warnings.slice(0, 5)) checks.push({ ok: true, text: `   ⚠️ ${w}` });
           for (const e of stats.errors) checks.push({ ok: false, text: `   ❌ ${e}` });
@@ -295,7 +332,8 @@ export async function cmdVerify(ctx: CommandContext, key: string): Promise<numbe
   const symbols = Object.entries(stats.symbolCounts).sort((a, b) => b[1] - a[1]);
   console.log(`symbol 分布: ${symbols.slice(0, 10).map(([s, n]) => `${s}=${n}`).join(' ')}`);
   const conn = top.filter(([name]) => isConnection(name));
-  console.log(`连接类事件（断流分析依赖）: ${conn.length > 0 ? conn.map(([n, c]) => `${n}=${c}`).join(' ') : '❌ 无 —— DESIGN §3.4-③ 未满足，断流分析只能降级'}`);
+  // 与 doctor --deep 用**同一句**判词（`connectionEventsNote`）：同一个分片在两个命令里必须给同一结论
+  console.log(`连接类事件（断流分析依赖）: ${conn.length > 0 ? conn.map(([n, c]) => `${n}=${c}`).join(' ') : connectionEventsNote([])}`);
   for (const w of stats.warnings) console.log(`⚠️  ${w}`);
   for (const e of stats.errors) console.log(`❌ ${e}`);
   console.log(stats.ok ? '结论: 校验通过' : '结论: 校验失败（该分片不会被入库）');

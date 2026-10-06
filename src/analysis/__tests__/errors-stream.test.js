@@ -62,6 +62,21 @@ test('★漂移检查：我引用的事件名必须都在主仓白名单里（�
   const mine = [...ATTENTION_EVENTS, ...CRITICAL_EVENTS, ...CONNECTION_EVENTS, ...STOP_EVENTS, ...TOPUP_EVENTS, ...CRASH_EVENTS];
   const missing = [...new Set(mine)].filter((name) => !whitelist.has(name));
   assert.deepEqual(missing, [], '这些事件名不在主仓白名单里 ⇒ 永远不会出现在分片里（清单漂移了，改回主仓的真名）');
+
+  // ⚠️ 只查导出数组是不够的：**函数里引用的名字**（配对表/判据）会漏检 ——
+  // 真事：`outageEndChannel` 里把 `WORKER_WS_SUBSCRIBED` 当恢复事件，而它**不在白名单**里（永不出现），
+  // 结果 worker-ws 的断流只能借下一次 `WS_RECONNECTED` 收尾，造出 9.53h 的假断流时长。
+  // ⇒ 直接扫**源码**里出现的所有事件名字面量（去掉注释，免得把说明文字里的引用算进去）。
+  const eventsSrc = path.join(__dirname, '..', 'events.ts');
+  const code = fs.readFileSync(eventsSrc, 'utf8')
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/\/\/.*$/gm, '');
+  const referenced = new Set(
+    [...code.matchAll(/'([A-Z][A-Z0-9_]{3,})'/g)].map((x) => x[1])
+      .filter((name) => !name.endsWith('_')), // `'UDS_'`/`'MARKET_STREAM_'` 这类是**前缀**（channelOf 用），不是事件名
+  );
+  const missingInCode = [...referenced].filter((name) => !whitelist.has(name));
+  assert.deepEqual(missingInCode, [], '源码里引用了白名单外的事件名（永远不会出现在分片里）—— 要么改回真名，要么明确标注"未导出"');
 });
 
 test('errors：只列"需要看"的事件，分档最严重的那批，并能按类别过滤', async () => {

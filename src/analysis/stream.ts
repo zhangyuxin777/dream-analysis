@@ -141,9 +141,11 @@ export function streamAnalysis(): Analysis {
             ['未恢复告警 / 连续失败告警', `${unrecovered} / ${failAlerts}`],
             ['窗口结束时仍在断流', stillOpen.length === 0 ? '否' : `是（${stillOpen.map((o) => o.instance).join('、')}）`],
           ],
-          note: '按**三条独立通道**分别配对：uds（`UDS_CONN_CLOSED`/`_CLOSED_STALE`/`_UNAVAILABLE` → `UDS_SUBSCRIBE_OK`/`UDS_RETRY_OK`）、'
-            + 'market（`MARKET_STREAM_REARM` → `MARKET_STREAM_REARM_OK`/`MARKET_STREAM_RECOVERED`；币安路径不发 `UDS_CONN_CLOSED` 表示行情断流，rearm 才是权威起点）、'
-            + 'worker-ws（`WORKER_WS_CLOSE`/`WORKER_WS_STALE_RECONNECT` → `WS_RECONNECTED`/`WORKER_WS_SUBSCRIBED`）。'
+          note: '按**独立通道**分别配对：uds（`UDS_CONN_CLOSED`/`_CLOSED_STALE`/`_UNAVAILABLE` → `UDS_SUBSCRIBE_OK`/`UDS_RETRY_OK`）、'
+            + 'market（`MARKET_STREAM_REARM` → `MARKET_STREAM_REARM_OK`/`MARKET_STREAM_RECOVERED`；币安路径不发 `UDS_CONN_CLOSED` 表示行情断流，rearm 才是权威起点）。'
+            + '**worker-ws 只计数、不算时长**：断开事件（`WORKER_WS_CLOSE`/`WORKER_WS_STALE_RECONNECT`）在白名单里，'
+            + '但恢复事件 `WORKER_WS_SUBSCRIBED` **没进白名单**（永远不会出现在分片里）⇒ 硬配对只能借下一次 `WS_RECONNECTED` 收尾、'
+            + '造出假时长（真数据上出现过 9.53h 的幻影断流，而那个实例当时一直在正常成交）。'
             + '`UDS_CONN_ERROR` 只算报错、不算断开（瞬时错误当断流会把时长虚高）。',
         },
       ];

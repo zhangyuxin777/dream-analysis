@@ -87,7 +87,13 @@ export const CONNECTION_EVENTS: readonly string[] = [
   'WORKER_WS_CLOSE', 'WORKER_WS_ERROR', 'WORKER_WS_SUBSCRIBE_FAILED', 'WORKER_WS_STALE_RECONNECT',
 ];
 
-function channelOf(event: string): ConnChannel | null {
+const CONNECTION_SET = new Set(CONNECTION_EVENTS);
+
+/**
+ * 通道归属（只用于**说明/分组**，不用来判"是不是连接事件" —— 那是 `CONNECTION_SET` 的事，
+ * 前缀猜会把不在白名单里的名字也算成连接事件）。
+ */
+export function channelOf(event: string): ConnChannel | null {
   if (event.startsWith('UDS_')) return 'uds';
   if (event.startsWith('MARKET_STREAM_')) return 'market';
   if (event.startsWith('WORKER_WS_') || event.startsWith('WS_')) return 'worker-ws';
@@ -106,9 +112,10 @@ export function outageStartChannel(event: string): ConnChannel | null {
     case 'MARKET_STREAM_REARM_FAILED':
     case 'MARKET_STREAM_UNRECOVERED':
       return 'market';
-    case 'WORKER_WS_CLOSE':
-    case 'WORKER_WS_STALE_RECONNECT':
-      return 'worker-ws';
+    // ⚠️ worker-ws 的断开事件（`WORKER_WS_CLOSE`/`WORKER_WS_STALE_RECONNECT`）在白名单里，
+    // 但**恢复事件 `WORKER_WS_SUBSCRIBED` 不在**（永远不会出现在分片里）⇒ 硬配对只能"借"下一次
+    // `WS_RECONNECTED` 收尾，会造出**虚假的断流时长**（真数据上出现过：报"最长断流 9.53h"，
+    // 而那个实例当时一直在正常成交）。所以 worker-ws **不参与时长配对**，只在报表里计数并说明。
     default:
       return null;
   }
@@ -123,9 +130,7 @@ export function outageEndChannel(event: string): ConnChannel | null {
     case 'MARKET_STREAM_REARM_OK':
     case 'MARKET_STREAM_RECOVERED':
       return 'market';
-    case 'WS_RECONNECTED':
-    case 'WORKER_WS_SUBSCRIBED':
-      return 'worker-ws';
+    // 见 outageStartChannel 的说明：worker-ws 不配对
     default:
       return null;
   }
@@ -158,7 +163,10 @@ export function isCritical(e: string): boolean {
 }
 
 export function isConnection(e: string): boolean {
-  return channelOf(e) !== null;
+  // ⚠️ 必须用**这张收窄过的名单**（对照上传白名单逐个核过），不能用前缀猜：
+  // 前缀猜会把"名字长得像连接事件、其实不在白名单里（拼错/已废弃/将来新增未导出）"也算成"连接事件已导出" ⇒
+  // 又是一种假通过（`WORKER_WS_SUBSCRIBED` 就是这么漏进来的）。
+  return CONNECTION_SET.has(e);
 }
 
 /** 事件分类（用于分组展示；认不出的归 other） */
