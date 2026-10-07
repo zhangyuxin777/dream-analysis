@@ -36,6 +36,9 @@ node dist/bin/analysis.js status
   - 在**服务器**上跑 `lp triggers` 会把当前异常标记为"已通知"，真实推送就不会再发。
   - 想在服务器上安全试跑：先 `cp runtime/lp-reporter-state.json /tmp/` 备份，试完恢复。
 - `env.json` 含 OSS 与钉钉凭据，**绝不进 git**（已 gitignore）。
+- ⚠️ `env.json` 是**每台机器一份**：`oss.binary` 路径各平台不同（Mac arm64 / Linux amd64）。
+  **禁止用 rsync/scp 把整份 env.json 从一台机器覆盖到另一台**——改配置只手动改目标机器上需要的字段。
+  （踩过坑：改日报时间时整文件同步，把 Mac 的 ossutil 路径带到服务器，同步静默失败 16 小时。）
 
 ## 更新部署流程（zyb 分支）
 
