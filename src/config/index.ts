@@ -43,6 +43,25 @@ export interface BotConfig {
   notify: { warn: string };
 }
 
+/** LP 报告账户（一个实例 = 一个 LP 账户） */
+export interface LpAccountConfig {
+  /** 事件流实例名（OSS snapshot/<instance>/） */
+  instance: string;
+  /** LP 看到的账户称呼（如"你的账户（10 万 U）"） */
+  label: string;
+  /** 本金（U），算收益率用 */
+  principal: number;
+  /** LP 群 openConversationId（whoami 取）；为空 = 只渲染不推送 */
+  conversationId: string;
+  /** A 节奏：每天发送时刻（北京时区） */
+  dailyHour: number;
+  dailyMinute: number;
+  /** B 触发：单日已实现收益 ≥ 本金×该值(%) 时发快报 */
+  dayProfitAlertPct: number;
+  /** B 触发：未收口轮末笔买入后超过该小时数发通知 */
+  stuckAlertHours: number;
+}
+
 export interface AppConfig {
   name: string;
   oss: OssConfig;
@@ -52,6 +71,8 @@ export interface AppConfig {
   report: { inlineMaxChars: number; signTtlHours: number };
   /** null = 未配置（M1/M2 不需要机器人，允许为空） */
   bot: BotConfig | null;
+  /** null = 未配置 LP 报告（不写 lp 段 = 功能关闭） */
+  lp: { accounts: LpAccountConfig[] } | null;
   rootDir: string;
 }
 
@@ -207,6 +228,47 @@ export function parseConfig(raw: unknown, opts: { rootDir: string }): ParseResul
     }
   }
 
+  // ---- lp（可选；LP 报告。不写 lp 段 = 功能关闭）----
+  let lp: AppConfig['lp'] = null;
+  const lpRaw = isObject(raw.lp) ? raw.lp : null;
+  if (lpRaw) {
+    const accountsRaw = Array.isArray(lpRaw.accounts) ? lpRaw.accounts : null;
+    if (!accountsRaw) {
+      problems.push('lp 段写了但 lp.accounts 不是数组');
+    } else {
+      const accounts: LpAccountConfig[] = [];
+      accountsRaw.forEach((a, i) => {
+        const field = `lp.accounts[${i}]`;
+        if (!isObject(a)) { problems.push(`${field} 必须是对象`); return; }
+        const instance = str(a.instance, '');
+        const label = str(a.label, '');
+        const principal = num(a.principal, 0);
+        const conversationId = str(a.conversationId, '');
+        if (!instance) problems.push(`${field}.instance 必填（OSS 实例名）`);
+        if (!label) problems.push(`${field}.label 必填（LP 看到的账户称呼）`);
+        if (!(principal > 0)) problems.push(`${field}.principal 必须 > 0（本金，U）`);
+        if (!conversationId) {
+          warnings.push(`${field}.conversationId 为空 ⇒ 该账户只渲染不推送（先 whoami 取群 ID 回填）`);
+        }
+        const dailyHour = num(a.dailyHour, 21);
+        const dailyMinute = num(a.dailyMinute, 7);
+        if (dailyHour < 0 || dailyHour > 23 || dailyMinute < 0 || dailyMinute > 59) {
+          problems.push(`${field} 的 dailyHour/dailyMinute 非法（北京时区 0~23 : 0~59）`);
+        }
+        const dayProfitAlertPct = num(a.dayProfitAlertPct, 0.3);
+        const stuckAlertHours = num(a.stuckAlertHours, 24);
+        if (!(dayProfitAlertPct > 0)) problems.push(`${field}.dayProfitAlertPct 必须 > 0`);
+        if (!(stuckAlertHours > 0)) problems.push(`${field}.stuckAlertHours 必须 > 0`);
+        accounts.push({
+          instance, label, principal, conversationId,
+          dailyHour, dailyMinute, dayProfitAlertPct, stuckAlertHours,
+        });
+      });
+      if (accounts.length > 0) lp = { accounts };
+      else if (accountsRaw.length === 0) lp = { accounts: [] };
+    }
+  }
+
   if (problems.length > 0) throw new ConfigError(problems);
 
   return {
@@ -222,6 +284,7 @@ export function parseConfig(raw: unknown, opts: { rootDir: string }): ParseResul
       },
       report,
       bot,
+      lp,
       rootDir: opts.rootDir,
     },
     warnings,

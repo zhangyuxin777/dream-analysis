@@ -38,6 +38,8 @@ import { buildStatusText } from '../report/status';
 import { DingTalkBot } from '../bot/dingtalk-bot';
 import { CommandRouter, buildHelpText } from '../bot/router';
 import { isConnection } from '../analysis/events';
+import { LocalEventSource } from '../store/eventSource';
+import { LpReporter } from '../lp/lpReporter';
 
 const ROOT_DIR = path.resolve(__dirname, '..', '..');
 
@@ -121,6 +123,41 @@ export function startBotIfConfigured(config: AppConfig, logger: ILogger): DingTa
   return bot;
 }
 
+/**
+ * 配了 `lp` 段才启 LP 报告；推送走企业机器人（sendGroupMessage），
+ * 机器人后启动（botRef 后绑定），未配置 bot 时只渲染不推送并 warn。
+ */
+export function startLpIfConfigured(
+  config: AppConfig,
+  logger: ILogger,
+  botRef: { bot: DingTalkBot | null },
+): LpReporter | null {
+  if (!config.lp || config.lp.accounts.length === 0) return null;
+  const { state } = loadState(statePathOf(config));
+  const source = new LocalEventSource({
+    dataDir: config.runtime.dataDir,
+    prefix: config.oss.prefix,
+    state,
+    countIncludesHeader: config.sync.countIncludesHeader,
+  });
+  const lpLogger = logger.child('lp');
+  lpLogger.info('LP 报告已配置', { accounts: config.lp.accounts.map((a) => a.instance) });
+  return new LpReporter({
+    configLp: config.lp,
+    source,
+    stateDir: config.runtime.stateDir,
+    send: (conversationId, text) => {
+      const bot = botRef.bot;
+      if (!bot) {
+        lpLogger.warn('机器人未启动，LP 消息无法推送（先配 bot 段）');
+        return Promise.resolve(false);
+      }
+      return bot.sendGroupMessage(conversationId, text);
+    },
+    logger: lpLogger,
+  });
+}
+
 export async function cmdRun(config: AppConfig, logger: ILogger, store: ObjectStore = buildStore(config)): Promise<number> {
   applyNice(config, logger);
   logger.info('启动常驻服务', {
@@ -135,15 +172,27 @@ export async function cmdRun(config: AppConfig, logger: ILogger, store: ObjectSt
   });
 
   const syncLogger = logger.child('sync');
+  // LP 报告（A 节奏 + B 触发）：B 触发挂在每次同步之后；botRef 后绑定（机器人下面才启动）
+  const botRef: { bot: DingTalkBot | null } = { bot: null };
+  const lpReporter = startLpIfConfigured(config, logger, botRef);
   const scheduler = createScheduler({
     intervalMinutes: config.sync.intervalMinutes,
     logger: syncLogger,
-    run: () => runSync({ store, config, logger: syncLogger }),
+    run: async () => {
+      await runSync({ store, config, logger: syncLogger });
+      if (lpReporter) {
+        await lpReporter.runTriggers().catch((err) => {
+          logger.error('LP 触发判定异常（不影响同步）', { detail: err instanceof Error ? err.message : String(err) });
+        });
+      }
+    },
   });
   scheduler.start();
 
   // 先起机器人再跑首次同步：这样同步期间也能回 whoami/status（配置期最常用）
   const bot = startBotIfConfigured(config, logger);
+  if (bot) botRef.bot = bot;
+  lpReporter?.start();
   await scheduler.triggerNow();
 
   // 保活：调度器的定时器是 unref 的（它不该单独决定进程生死），这里显式持有一个常驻句柄
@@ -151,6 +200,7 @@ export async function cmdRun(config: AppConfig, logger: ILogger, store: ObjectSt
   const shutdown = (signal: string): void => {
     logger.info('收到退出信号，正在停止', { signal });
     scheduler.stop();
+    lpReporter?.stop();
     bot?.close?.();
     clearInterval(keepAlive);
     process.exit(0);
@@ -340,6 +390,68 @@ export async function cmdVerify(ctx: CommandContext, key: string): Promise<numbe
   return stats.ok ? 0 : 1;
 }
 
+/** LP 报告调试：daily 渲染日报 / triggers 跑触发判定。只打印不推送（send 桩返回 false）。 */
+export async function cmdLp(config: AppConfig, logger: ILogger, sub: string, args: string[]): Promise<number> {
+  if (!config.lp || config.lp.accounts.length === 0) {
+    console.error('未配置 lp 段（env.json 里加 lp.accounts 再试）');
+    return 1;
+  }
+  const instanceArg = args[0];
+  const sendFlag = args.includes('--send');
+  const { state } = loadState(statePathOf(config));
+  const source = new LocalEventSource({
+    dataDir: config.runtime.dataDir,
+    prefix: config.oss.prefix,
+    state,
+    countIncludesHeader: config.sync.countIncludesHeader,
+  });
+  const sentLog: Array<{ cid: string; text: string }> = [];
+  // --send：真发（走企业机器人 sendGroupMessage）；不带则只渲染
+  let bot: DingTalkBot | null = null;
+  if (sendFlag) {
+    if (!config.bot || config.bot.type !== 'dingtalk') {
+      console.error('--send 需要配置 bot 段（dingtalk clientId/clientSecret）');
+      return 1;
+    }
+    bot = new DingTalkBot(
+      { clientId: config.bot.appId, clientSecret: config.bot.appSecret, allowedStaffIds: config.bot.allowedStaffIds },
+      logger.child('bot'),
+    );
+  }
+  const reporter = new LpReporter({
+    configLp: config.lp,
+    source,
+    stateDir: config.runtime.stateDir,
+    send: async (cid, text) => {
+      if (!bot) { sentLog.push({ cid, text }); return false; }
+      return bot.sendGroupMessage(cid, text);
+    },
+    logger,
+  });
+  if (sub === 'daily') {
+    const results = await reporter.runDaily(instanceArg);
+    if (results.length === 0) { console.log('（没有可生成的日报：检查实例名与本地数据）'); return 1; }
+    for (const r of results) {
+      console.log(`========== LP 日报（${r.sent ? '已发送' : '未发送'}） ==========`);
+      console.log(r.text);
+    }
+    return 0;
+  }
+  if (sub === 'triggers') {
+    const results = await reporter.runTriggers();
+    if (results.length === 0) { console.log('（无新触发；已触发的记录在 stateDir/lp-reporter-state.json，不重复推送）'); return 0; }
+    for (const r of results) {
+      for (const h of r.hits) {
+        console.log(`========== 触发 ${r.account} / ${h.kind}（未发送） ==========`);
+        console.log(h.message);
+      }
+    }
+    return 0;
+  }
+  console.error(`未知 lp 子命令: ${sub}（支持 daily / triggers）`);
+  return 1;
+}
+
 export function cmdAnalyses(): number {
   const registry = createAnalysisRegistry();
   console.log(registry.helpText());
@@ -434,6 +546,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
       return cmdVerify(buildContext(config, logger), argv[1] ?? '');
     case 'analyses':
       return cmdAnalyses();
+    case 'lp':
+      return cmdLp(config, logger, argv[1] ?? 'daily', argv.slice(2));
     case 'analyze': {
       // tokens[0] = 分析器名；位置参数顺序按该分析器自己声明的 params 决定
       const parsed = parseAnalyzeCommand(argv.slice(1), (n) => createAnalysisRegistry().get(n));
