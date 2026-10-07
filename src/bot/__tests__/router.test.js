@@ -1,6 +1,6 @@
 /**
- * 指令路由单测（`src/bot/router.ts`）—— **不碰网络**：假 store/假同步/假回复。
- * 覆盖：鉴权顺序、whoami、status、sync（管理员）、analyze（真分片算真数）、并发闸门、二次回复、截断落盘。
+ * 指令路由单测（极简版路由器）—— 不碰网络：真分片 + 临时目录。
+ * 覆盖：bot 未配置抛错、群/人白名单、未知指令提示、`r` 随时报告的绑定与渲染。
  */
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -8,17 +8,13 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const zlib = require('zlib');
-const { CommandRouter, buildHelpText, formatAnalysisError } = require('../../../dist/bot/router');
-const { AnalysisRegistry } = require('../../../dist/analysis/types');
-const { createDefaultRegistry } = require('../../../dist/analysis/types');
+const { CommandRouter, REPORT_HINT } = require('../../../dist/bot/router');
 const { parseConfig } = require('../../../dist/config/index');
 const { createLogger } = require('../../../dist/common/logger');
 const { emptyState, saveState, loadState } = require('../../../dist/sync/state');
 const { statePathOf } = require('../../../dist/sync/puller');
-const { healthAnalysis } = require('../../../dist/analysis/health');
-const { roundsAnalysis } = require('../../../dist/analysis/rounds');
 
-function makeEnv(botOver = {}, reportOver = {}) {
+function makeEnv(botOver = {}, lpOver = { extraAccounts: [] }) {
   const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'router-test-'));
   const { config } = parseConfig(
     {
@@ -27,16 +23,31 @@ function makeEnv(botOver = {}, reportOver = {}) {
       sync: { intervalMinutes: 60, minAgeSeconds: 60, countIncludesHeader: false, maxDiskGB: 1, retentionDays: 90, concurrency: 1 },
       process: { nice: 0 },
       runtime: { dataDir: 'data', stateDir: 'runtime', logDir: 'logs' },
-      report: { inlineMaxChars: 3500, signTtlHours: 24, ...reportOver },
+      report: { inlineMaxChars: 3500, signTtlHours: 24 },
       bot: {
         type: 'dingtalk',
         appId: 'ding-app',
         appSecret: 'ding-secret',
-        allowedStaffIds: ['staff-1'],
-        allowedConversationIds: ['cid-1'],
-        adminStaffIds: ['staff-1'],
+        allowedStaffIds: [],
+        allowedConversationIds: [],
+        adminStaffIds: [],
         notify: { warn: 'cid-1' },
         ...botOver,
+      },
+      lp: {
+        accounts: [
+          {
+            instance: 'boye888', label: '你的账户（10 万 U）', principal: 100000,
+            conversationId: 'cid-1', dailyHour: 21, dailyMinute: 7,
+            dayProfitAlertPct: 0.3, stuckAlertHours: 24,
+          },
+          {
+            instance: 'other000', label: '另一个账户', principal: 50000,
+            conversationId: 'cid-other', dailyHour: 21, dailyMinute: 7,
+            dayProfitAlertPct: 0.3, stuckAlertHours: 24,
+          },
+          ...lpOver.extraAccounts,
+        ],
       },
     },
     { rootDir },
@@ -45,14 +56,14 @@ function makeEnv(botOver = {}, reportOver = {}) {
   return { rootDir, config, logger };
 }
 
-/** 装一天真分片（含水位线）；append=true 时追加为第二个实例 */
-function installShard(config, instance, date, events, headerOver = {}, opts = {}) {
+/** 装一天真分片（含水位线） */
+function installShard(config, instance, date, events, headerOver = {}) {
   const dir = path.join(config.runtime.dataDir, instance);
   fs.mkdirSync(dir, { recursive: true });
   const header = JSON.stringify({ type: 'meta', schema: 2, instance, date, final: headerOver.final ?? true, count: events.length });
   const body = [header, ...events.map((e) => JSON.stringify(e))].join('\n') + '\n';
   fs.writeFileSync(path.join(dir, `${date}.jsonl.gz`), zlib.gzipSync(Buffer.from(body, 'utf8')));
-  const state = opts.append ? loadState(statePathOf(config)).state : emptyState();
+  const state = loadState(statePathOf(config)).state;
   state.objects[`${config.oss.prefix}${instance}/${date}.jsonl.gz`] = {
     etag: 'E1', size: 100, dataLines: events.length, final: headerOver.final ?? true, pulledAt: new Date().toISOString(), warnings: [],
   };
@@ -66,22 +77,21 @@ const msg = (text, over = {}) => ({
   conversationId: 'cid-1',
   conversationType: '2',
   platform: 'dingtalk',
-  sessionWebhook: 'https://example.invalid/hook',
   ...over,
 });
 
 const ROUND_EVENTS = [
   { ts: '2026-10-01T01:00:00.000Z', event: 'NEW_ROUND', symbol: 'ETHFDUSD', roundId: 'R001', localDate: '2026-10-01', seq: 1, data: {} },
-  { ts: '2026-10-01T02:00:00.000Z', event: 'SELL_FILLED', symbol: 'ETHFDUSD', roundId: 'R001', localDate: '2026-10-01', seq: 2, data: { profit: 1.5 } },
-  { ts: '2026-10-01T03:00:00.000Z', event: 'ROUND_COMPLETED', symbol: 'ETHFDUSD', roundId: 'R001', localDate: '2026-10-01', seq: 3, data: { profit: 1.6, durationHours: 2 } },
+  { ts: '2026-10-01T02:00:00.000Z', event: 'BUY_FILLED', symbol: 'ETHFDUSD', roundId: 'R001', localDate: '2026-10-01', seq: 2, data: { buyPrice: 2700, accCost: 500 } },
+  { ts: '2026-10-01T03:00:00.000Z', event: 'SELL_FILLED', symbol: 'ETHFDUSD', roundId: 'R001', localDate: '2026-10-01', seq: 3, data: { profit: 1.5 } },
+  { ts: '2026-10-01T04:00:00.000Z', event: 'ROUND_COMPLETED', symbol: 'ETHFDUSD', roundId: 'R001', localDate: '2026-10-01', seq: 4, data: { profit: 1.6, durationHours: 3 } },
 ];
 
 function makeRouter(env, over = {}) {
   return new CommandRouter({
     config: env.config,
     logger: env.logger,
-    now: () => new Date('2026-10-02T12:00:00.000Z'),
-    runSyncFn: async () => ({ listed: 2, pulled: ['a'], skipped: 0, ignored: 1, failed: [], bytes: 1234, pruned: [], warnings: [], recomputed: [], deferred: [], whitelistChanges: [], refusedByLock: false }),
+    now: () => new Date('2026-10-02T12:00:00.000Z'), // 北京 20:00
     ...over,
   });
 }
@@ -92,238 +102,61 @@ test('未配置 bot 时构造 router 直接抛（防止"配了却没启"的静�
   assert.throws(() => new CommandRouter({ config: noBot, logger: env.logger }), /未配置 bot/);
 });
 
-test('whoami 在权限检查之前（否则配白名单时拿不到 ID）', async () => {
-  const env = makeEnv({ allowedStaffIds: ['someone-else'], allowedConversationIds: ['other-group'] });
-  const router = makeRouter(env);
-  const out = await router.handle(msg('whoami'));
-  assert.match(out, /平台: dingtalk/);
-  assert.match(out, /staffId: staff-1/);
-  assert.match(out, /conversationId: cid-1/);
-  assert.match(out, /nick: 大哥/);
-});
-
-test('群白名单与人员白名单分别拦截（文案要说清怎么办）', async () => {
-  const groupDenied = makeRouter(makeEnv({ allowedConversationIds: ['other-group'] }));
-  assert.match(await groupDenied.handle(msg('status')), /该群未授权/);
-
-  const staffDenied = makeRouter(makeEnv({ allowedStaffIds: ['someone-else'] }));
-  assert.match(await staffDenied.handle(msg('status')), /无权限操作/);
-
-  const open = makeRouter(makeEnv({ allowedStaffIds: [], allowedConversationIds: [] }));
-  assert.match(await open.handle(msg('status', { senderId: 'anyone' })), /同步状态/, '白名单为空 = 不拦（启动时会 warn）');
-});
-
-test('help / 空消息 / 未知指令', async () => {
+test('空消息 / 未知指令 → 提示发 r（不泄露任何技术指令）', async () => {
   const env = makeEnv();
   const router = makeRouter(env);
-  const help = await router.handle(msg('h'));
-  assert.match(help, /📋 指令列表/);
-  assert.match(help, /whoami/);
-  assert.match(help, /rounds \(r\)/);
-  assert.match(help, /health \(hc\)/);
-
-  assert.match(await router.handle(msg('')), /📋 指令列表/);
-  const unknown = await router.handle(msg('foobar'));
-  assert.match(unknown, /未知指令: foobar/);
+  assert.equal(await router.handle(msg('')), REPORT_HINT);
+  assert.equal(await router.handle(msg('status')), REPORT_HINT);
+  assert.equal(await router.handle(msg('whoami')), REPORT_HINT);
+  assert.equal(await router.handle(msg('analyze rounds')), REPORT_HINT);
+  assert.equal(await router.handle(msg('随便说说')), REPORT_HINT);
 });
 
-test('status：返回与 CLI 同一份状态文本', async () => {
+test('群白名单 / 人员白名单分别拦截', async () => {
+  const env = makeEnv({
+    allowedConversationIds: ['cid-1'],
+    allowedStaffIds: ['staff-1'],
+  });
+  const router = makeRouter(env);
+  assert.match(await router.handle(msg('r', { conversationId: 'cid- outsider' })), /未授权/);
+  assert.match(await router.handle(msg('r', { senderId: 'staff-999' })), /无权限/);
+});
+
+test('r：该群未绑定 LP 账户 → 提示找管理员（不渲染别的账户）', async () => {
   const env = makeEnv();
   installShard(env.config, 'boye888', '2026-10-01', ROUND_EVENTS);
-  const out = await makeRouter(env).handle(msg('status'));
-  assert.match(out, /=== 同步状态 ===/);
-  assert.match(out, /本地分片: 1 个/);
-  assert.match(out, /boye888\s+2026-10-01\s+已封存/);
+  installShard(env.config, 'other000', '2026-10-01', ROUND_EVENTS);
+  const router = makeRouter(env);
+  const text = await router.handle(msg('r', { conversationId: 'cid-unbound' }));
+  assert.match(text, /还没绑定账户/);
 });
 
-test('sync：管理员限制 + 成功摘要 + 被锁/失败两种文案', async () => {
-  const env = makeEnv({ adminStaffIds: ['staff-1'] });
-  const ok = await makeRouter(env).handle(msg('sync'));
-  assert.match(ok, /同步完成：列举 2 \/ 拉取 1 \/ 跳过 0 \/ 忽略 1 \/ 失败 0 \/ 退避 0/);
-
-  const notAdmin = await makeRouter(makeEnv({ adminStaffIds: ['other'] })).handle(msg('sync'));
-  assert.match(notAdmin, /只有管理员能触发同步/);
-
-  const locked = await makeRouter(env, { runSyncFn: async () => ({ refusedByLock: true, listed: 0, pulled: [], skipped: 0, ignored: 0, failed: [], bytes: 0, pruned: [], warnings: [], recomputed: [], deferred: [], whitelistChanges: [] }) }).handle(msg('sync'));
-  assert.match(locked, /已有同步在进行/);
-
-  const failed = await makeRouter(env, { runSyncFn: async () => { throw new Error('AccessDenied'); } }).handle(msg('sync'));
-  assert.match(failed, /同步失败：AccessDenied/);
-});
-
-test('analyze 快捷指令：真分片算出真数（r eth 2026-10-01）', async () => {
+test('r：绑定群渲染 LP 报告（日报同款格式，LP 视角无术语）', async () => {
   const env = makeEnv();
   installShard(env.config, 'boye888', '2026-10-01', ROUND_EVENTS);
-  const out = await makeRouter(env).handle(msg('r eth 2026-10-01'));
-  assert.match(out, /## 轮次与成交 · 2026-10-01/);
-  assert.match(out, /\| ETHFDUSD \| 1 \| 1 \| 0 \|/);
-  assert.match(out, /止盈利润合计 1\.50/);
+  installShard(env.config, 'other000', '2026-10-01', ROUND_EVENTS);
+  const router = makeRouter(env);
+  const text = await router.handle(msg('r'));
+  assert.ok(text.includes('【日报】你的账户（10 万 U）'));
+  assert.ok(text.includes('今日收益：+$0.00'));
+  assert.ok(text.includes('累计收益：+$1.60（+0.00%）'));
+  assert.ok(text.includes('正常运作中') || text.includes('持仓等待中'));
+  assert.ok(text.includes('数据时间：'));
+  // LP 视角：不出现技术指令/术语的残留
+  assert.ok(!text.includes('无需任何操作'));
+  assert.ok(!text.includes('ATR'));
 });
 
-test('analyze：a/analyze 形式、未知分析器、非法窗口、没有本地数据', async () => {
+test('r：中文"报告"也算（老人记不住字母时可用）', async () => {
   const env = makeEnv();
   installShard(env.config, 'boye888', '2026-10-01', ROUND_EVENTS);
   const router = makeRouter(env);
-
-  const viaAnalyze = await router.handle(msg('analyze rounds symbol=eth window=2026-10-01'));
-  assert.match(viaAnalyze, /## 轮次与成交/);
-
-  const unknown = await router.handle(msg('analyze nope'));
-  assert.match(unknown, /未知分析器: nope/);
-  assert.match(unknown, /rounds \(r\)/, '未知分析器要顺手给出可用清单');
-
-  const badWindow = await router.handle(msg('r eth 上周'));
-  assert.match(badWindow, /无法解析的窗口写法/);
-
-  const noArgs = await router.handle(msg('analyze'));
-  assert.match(noArgs, /用法: analyze <名字>/);
-
-  const empty = makeEnv();
-  const noData = await makeRouter(empty).handle(msg('r'));
-  assert.match(noData, /本地还没有任何分片/);
+  const text = await router.handle(msg('报告'));
+  assert.ok(text.includes('【日报】'));
 });
 
-test('同一会话单并发：慢任务在跑时，第二条指令被拒（不排队）', async () => {
-  let release;
-  const gate = new Promise((r) => {
-    release = r;
-  });
-  const registry = createDefaultRegistry([
-    { name: 'slow', aliases: [], help: '慢分析（测试用）', run: async () => { await gate; return { title: 'slow', summary: 'done', warnings: [] }; } },
-  ]);
+test('r：还没有数据 → 友好提示', async () => {
   const env = makeEnv();
-  installShard(env.config, 'boye888', '2026-10-01', ROUND_EVENTS);
-  const router = makeRouter(env, { registry, syncReplyBudgetMs: 0 });
-
-  const first = router.handle(msg('analyze slow'));
-  const second = await router.handle(msg('analyze slow'));
-  assert.match(second, /上一个任务还在跑/);
-
-  release();
-  assert.match(await first, /## slow/);
-  // 释放后应能再次执行
-  release = () => undefined;
-  assert.match(await router.handle(msg('analyze slow')), /## slow/);
-});
-
-test('慢任务走二次回复：先回"正在分析"，结果稍后单独发（钉钉 SDK 自己 ack，没有 3 秒硬限制）', async () => {
-  let release;
-  const gate = new Promise((r) => {
-    release = r;
-  });
-  const registry = createDefaultRegistry([
-    { name: 'slow', aliases: [], help: '慢分析（测试用）', run: async () => { await gate; return { title: 'slow-report', summary: '结果好了', warnings: [] }; } },
-  ]);
-  const env = makeEnv();
-  installShard(env.config, 'boye888', '2026-10-01', ROUND_EVENTS);
-  const sent = [];
-  let followedUp;
-  const followUpDone = new Promise((r) => {
-    followedUp = r;
-  });
-  const router = makeRouter(env, {
-    registry,
-    syncReplyBudgetMs: 5,
-    reply: async (webhook, text) => {
-      sent.push({ webhook, text });
-      followedUp();
-    },
-  });
-
-  const immediate = await router.handle(msg('analyze slow'));
-  assert.match(immediate, /⏳ 正在分析 slow/);
-  assert.match(immediate, /结果稍后单独发/);
-  assert.equal(sent.length, 0, '结果还没出来，不该提前发');
-
-  release();
-  await followUpDone;
-  assert.equal(sent.length, 1);
-  assert.equal(sent[0].webhook, 'https://example.invalid/hook');
-  assert.match(sent[0].text, /## slow-report/);
-
-  // 二次回复完成后闸门必须释放（否则这个会话永远不能再发指令）；
-  // 此时 gate 已 settled ⇒ 这一轮会直接出结果（不再走"正在分析"）
-  const after = await router.handle(msg('analyze slow'));
-  assert.ok(!/上一个任务还在跑/.test(after), '闸门没释放：' + after);
-  assert.match(after, /## slow-report/);
-});
-
-test('报告被截断时：落盘完整报告并给出路径（群里只发摘要）', async () => {
-  const env = makeEnv({}, { inlineMaxChars: 200 });
-  const events = Array.from({ length: 40 }, (_, i) => ({ ts: `2026-10-01T${String(i % 24).padStart(2, '0')}:00:00.000Z`, event: `EVT_${i}`, symbol: 'ETHFDUSD', localDate: '2026-10-01', seq: i, data: {} }));
-  installShard(env.config, 'boye888', '2026-10-01', events);
-
-  const out = await makeRouter(env).handle(msg('hc 2026-10-01'));
-  assert.match(out, /已截断/);
-  assert.match(out, /完整报告已落盘：logs[\\/]reports[\\/]/);
-
-  const dir = path.join(env.config.runtime.logDir, 'reports');
-  const files = fs.readdirSync(dir);
-  assert.equal(files.length, 1);
-  const full = fs.readFileSync(path.join(dir, files[0]), 'utf8');
-  assert.ok(full.length > out.length, '落盘的是完整报告，不是截断后的文本');
-});
-
-test('formatAnalysisError：错误 → 群里能看懂的一句话', () => {
-  const registry = createDefaultRegistry([healthAnalysis(), roundsAnalysis()]);
-  const { AnalysisRunError } = require('../../../dist/analysis/runner');
-  const { WindowTooLongError } = require('../../../dist/common/time');
-  assert.match(formatAnalysisError(new AnalysisRunError('未知分析器: x', 'unknown-analysis'), 'x', registry), /未知分析器: x[\s\S]*rounds \(r\)/);
-  assert.match(formatAnalysisError(new AnalysisRunError('本地还没有任何分片', 'no-data'), 'r', registry), /本地还没有任何分片/);
-  assert.match(formatAnalysisError(new WindowTooLongError(1000, 720), 'r', registry), /窗口太长/);
-  assert.match(formatAnalysisError(new Error('boom'), 'rounds', registry), /分析 rounds 失败：boom/);
-});
-
-test('★回归钉子（M3 Critical）：快捷指令不吃掉第一个参数 —— r eth … 的币种过滤必须生效', async () => {
-  const env = makeEnv();
-  installShard(env.config, 'boye888', '2026-10-01', [
-    { ts: '2026-10-01T01:00:00.000Z', event: 'SELL_FILLED', symbol: 'ETHFDUSD', localDate: '2026-10-01', seq: 1, data: { profit: 1 } },
-    { ts: '2026-10-01T02:00:00.000Z', event: 'SELL_FILLED', symbol: 'BTCFDUSD', localDate: '2026-10-01', seq: 2, data: { profit: 2 } },
-  ]);
-  const out = await makeRouter(env).handle(msg('r eth 2026-10-01'));
-  assert.match(out, /ETHFDUSD/);
-  assert.ok(!out.includes('BTCFDUSD'), '币种过滤失效会把别的币种一起算进来：' + out);
-  assert.match(out, /止盈利润合计 1\.00/, '只算 ETH 那 1.00');
-});
-
-test('★回归钉子：hc 的第一个裸参数是 instance（health 不声明 symbol）', async () => {
-  const env = makeEnv();
-  installShard(env.config, 'a1', '2026-10-01', [{ ts: '2026-10-01T01:00:00.000Z', event: 'SELL_FILLED', symbol: 'ETHFDUSD', localDate: '2026-10-01', seq: 1, data: {} }]);
-  installShard(env.config, 'a2', '2026-10-01', [{ ts: '2026-10-01T02:00:00.000Z', event: 'SELL_FILLED', symbol: 'ETHFDUSD', localDate: '2026-10-01', seq: 1, data: {} }], {}, { append: true });
-
-  const all = await makeRouter(env).handle(msg('hc 2026-10-01'));
-  assert.match(all, /\| 分片 \/ 事件 \| 2 \/ 2 \|/);
-
-  const one = await makeRouter(env).handle(msg('hc a1 2026-10-01'));
-  assert.match(one, /\| 分片 \/ 事件 \| 1 \/ 1 \|/, '实例过滤失效会把别的实例也算进来：' + one);
-});
-
-test('进程级并发上限：不同会话也不能同时跑分析（这台机器还要让着实盘）', async () => {
-  let release;
-  const gate = new Promise((r) => {
-    release = r;
-  });
-  const registry = createDefaultRegistry([
-    { name: 'slow', aliases: [], help: '慢分析', run: async () => { await gate; return { title: 'slow', summary: 'done', warnings: [] }; } },
-  ]);
-  const env = makeEnv({ allowedConversationIds: [] }); // 放开群白名单：本用例测的是并发闸门，不是鉴权
-  installShard(env.config, 'boye888', '2026-10-01', ROUND_EVENTS);
-  const router = makeRouter(env, { registry, syncReplyBudgetMs: 0, maxConcurrentAnalyses: 1 });
-
-  const first = router.handle(msg('analyze slow', { conversationId: 'cid-1' }));
-  const second = await router.handle(msg('analyze slow', { conversationId: 'cid-2' }));
-  assert.match(second, /并发上限 1/);
-
-  release();
-  assert.match(await first, /## slow/);
-  release = () => undefined;
-  assert.match(await router.handle(msg('analyze slow', { conversationId: 'cid-2' })), /## slow/, '释放后要能继续服务');
-});
-
-test('cmdAnalyses/机器人共用的 help：由注册表生成，不手写两份', async () => {
-  const text = buildHelpText(createDefaultRegistry([healthAnalysis(), roundsAnalysis()]));
-  assert.match(text, /hc \/ health/);
-  assert.match(text, /r \/ rounds/);
-  assert.match(text, /health \(hc\)/);
-  assert.match(text, /symbol → instance → top/);
+  const router = makeRouter(env);
+  assert.match(await router.handle(msg('r')), /还没有数据/);
 });

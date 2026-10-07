@@ -36,7 +36,7 @@ import { AnalysisRunError, runAnalysis } from '../analysis/runner';
 import { WindowParseError, WindowTooLongError } from '../common/time';
 import { buildStatusText } from '../report/status';
 import { DingTalkBot } from '../bot/dingtalk-bot';
-import { CommandRouter, buildHelpText } from '../bot/router';
+import { CommandRouter } from '../bot/router';
 import { isConnection } from '../analysis/events';
 import { LocalEventSource } from '../store/eventSource';
 import { LpReporter } from '../lp/lpReporter';
@@ -114,7 +114,6 @@ export function startBotIfConfigured(config: AppConfig, logger: ILogger): DingTa
   const router = new CommandRouter({
     config,
     logger: botLogger,
-    reply: (webhook, text) => bot.replyText(webhook, text),
   });
   bot.setHandler((msg) => router.handle(msg));
   void bot.start().catch((err) => {
@@ -460,7 +459,6 @@ export function cmdAnalyses(): number {
   console.log('      其余裸参数按 symbol → instance → top 的顺序填，多出来的忽略。key=value 写法永远优先。');
   console.log('例:   node dist/bin/analysis.js analyze r eth 昨天');
   console.log('      node dist/bin/analysis.js analyze health instance=boye888 window=近24h');
-  void buildHelpText; // 机器人指令表由同一个注册表生成（这里不重复打印）
   return 0;
 }
 
