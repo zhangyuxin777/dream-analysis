@@ -10,6 +10,10 @@ data/
 
 # 配置（含 OSS 凭据，绝不进 git）
 env.json
+weekly-report.config.json
+
+# 本机工具（ossutil 二进制，体积大且可从官方下载）
+tools/
 
 # 编辑器 / 系统
 .DS_Store
