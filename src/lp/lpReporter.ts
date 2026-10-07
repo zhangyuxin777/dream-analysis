@@ -77,7 +77,7 @@ export async function collectFacts(
   const rounds = new Map<string, {
     symbol: string; openedAt: string; lastBuyAt: string | null; buyCount: number; completed: boolean;
     prevAccCost: number | null; costSum: number; spendSum: number;
-    lastBuyPrice: number | null; topups: number;
+    lastBuyPrice: number | null; topups: number; lastActivityAt: string;
   }>();
   let totalProfit = 0;
   let todayProfit = 0;
@@ -86,11 +86,22 @@ export async function collectFacts(
   let latestObs: AccountFacts['latestObs'] = null;
   const crashes = new Map<string, CrashInfo>();
   let topupCount = 0;
+  // 所有出现过的 roundId（不论是否建仓）按轮号记活动时间 —— 恢复接管的 -RCV 轮可能没有 BUY_FILLED，
+  // 但 ORDER_FILLED/SELL_FILLED/ORDER_CANCELED 等事件足够证明"同轮号的旧 id 已被接管"
+  const prefixActivity = new Map<string, string>();
 
   const window = { label: '全部', fromMs: 0, toMs: Number.MAX_SAFE_INTEGER, days };
   await source.scan({ window, instance: account.instance }, (e: LoadedEventLike) => {
     const ev = e.event;
     const rid = typeof e.roundId === 'string' ? e.roundId : null;
+    // 任何带 roundId 的事件都算"该轮的活动"（重启恢复会产生新 roundId 接管同轮 ⇒ 旧 id 活动停止）
+    if (rid) {
+      const prefix = rid.split('-')[0];
+      const prev = prefixActivity.get(prefix);
+      if (prev == null || e.ts > prev) prefixActivity.set(prefix, e.ts);
+      const touched = rounds.get(rid);
+      if (touched && e.ts > touched.lastActivityAt) touched.lastActivityAt = e.ts;
+    }
     if (ev === 'ROUND_COMPLETED' && rid) {
       const p = Number(e.data?.profit ?? 0);
       totalProfit += p;
@@ -102,13 +113,14 @@ export async function collectFacts(
     } else if (ev === 'NEW_ROUND' && rid) {
       if (!rounds.has(rid)) rounds.set(rid, {
         symbol: e.symbol ?? '?', openedAt: e.ts, lastBuyAt: null, buyCount: 0, completed: false,
-        prevAccCost: null, costSum: 0, spendSum: 0, lastBuyPrice: null, topups: 0,
+        prevAccCost: null, costSum: 0, spendSum: 0, lastBuyPrice: null, topups: 0, lastActivityAt: e.ts,
       });
     } else if (ev === 'BUY_FILLED' && rid) {
       const r = rounds.get(rid) ?? {
         symbol: e.symbol ?? '?', openedAt: e.ts, lastBuyAt: null, buyCount: 0, completed: false,
-        prevAccCost: null, costSum: 0, spendSum: 0, lastBuyPrice: null, topups: 0,
+        prevAccCost: null, costSum: 0, spendSum: 0, lastBuyPrice: null, topups: 0, lastActivityAt: e.ts,
       };
+      if (e.ts > r.lastActivityAt) r.lastActivityAt = e.ts;
       r.buyCount += 1;
       r.lastBuyAt = e.ts;
       const buyPrice = Number(e.data?.buyPrice ?? NaN);
@@ -160,8 +172,11 @@ export async function collectFacts(
     }
   });
 
+  // 重启恢复（RECOVERY_APPLIED）会把同轮仓位接管到新 roundId（如 R009-xxx-RCV），
+  // 旧 roundId 从此再没事件 —— 它是"残影"，不是真持仓。同一轮号（R009）里只有活动最新的才是活轮。
   const openRounds: OpenRound[] = [...rounds.entries()]
     .filter(([, r]) => !r.completed && r.buyCount > 0)
+    .filter(([rid, r]) => prefixActivity.get(rid.split('-')[0]) === r.lastActivityAt)
     .map(([rid, r]) => ({
       roundId: rid,
       symbol: r.symbol,

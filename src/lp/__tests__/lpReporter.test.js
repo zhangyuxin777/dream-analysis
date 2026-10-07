@@ -143,6 +143,37 @@ test('触发：单日超额收益每天最多一次', () => {
   assert.equal(low.hits.length, 0);
 });
 
+test('collectFacts：重启恢复的残影轮不算未平仓（只认同轮号里活动最新的）', async () => {
+  const evs = [
+    // R009 原始轮：买入后 81 秒被重启恢复接管
+    { ts: '2026-10-02T04:50:34Z', event: 'NEW_ROUND', symbol: 'BTCFDUSD', roundId: 'R009-125034', data: {} },
+    { ts: '2026-10-02T04:54:28Z', event: 'BUY_FILLED', symbol: 'BTCFDUSD', roundId: 'R009-125034', data: { buyPrice: 86688.95, accCost: 224.52 } },
+    { ts: '2026-10-02T04:55:47Z', event: 'RECOVERY_APPLIED', symbol: 'BTCFDUSD', roundId: 'R009-125547-RCV', data: {} },
+    // 接管后的 -RCV 轮继续买入并完成（仓位其实当天就卖了）
+    { ts: '2026-10-02T05:17:28Z', event: 'BUY_FILLED', symbol: 'BTCFDUSD', roundId: 'R009-125547-RCV', data: { buyPrice: 86552.6, accCost: 471.2 } },
+    { ts: '2026-10-02T06:00:00Z', event: 'ROUND_COMPLETED', symbol: 'BTCFDUSD', roundId: 'R009-125547-RCV', data: { profit: 2.5 } },
+    // 另一个轮：恢复接管后没有新买入（仓位直接 carried over 卖出），残影同样要排除
+    { ts: '2026-10-06T08:08:10Z', event: 'NEW_ROUND', symbol: 'BTCFDUSD', roundId: 'R062-160810', data: {} },
+    { ts: '2026-10-06T08:10:00Z', event: 'BUY_FILLED', symbol: 'BTCFDUSD', roundId: 'R062-160810', data: { buyPrice: 86000, accCost: 224.27 } },
+    { ts: '2026-10-06T08:23:59Z', event: 'RECOVERY_APPLIED', symbol: 'BTCFDUSD', roundId: 'R062-162358-RCV', data: {} },
+    { ts: '2026-10-06T08:47:39Z', event: 'SELL_FILLED', symbol: 'BTCFDUSD', roundId: 'R062-162358-RCV', data: {} },
+    { ts: '2026-10-06T08:47:39Z', event: 'ROUND_COMPLETED', symbol: 'BTCFDUSD', roundId: 'R062-162358-RCV', data: { profit: 1.5 } },
+    { ts: '2026-10-06T08:47:40Z', event: 'ORDER_CANCELED', symbol: 'BTCFDUSD', roundId: 'R062-162358-RCV', data: {} },
+    // 真实未平仓轮：没有任何恢复事件
+    { ts: '2026-10-07T02:00:00Z', event: 'NEW_ROUND', symbol: 'BTCFDUSD', roundId: 'R073-230148', data: {} },
+    { ts: '2026-10-07T02:01:16Z', event: 'BUY_FILLED', symbol: 'BTCFDUSD', roundId: 'R073-230148', data: { buyPrice: 85000, accCost: 18517.78 } },
+  ];
+  const fakeSource = {
+    availableDays: () => ['2026-10-02', '2026-10-06'],
+    scan: async (_f, onEvent) => { for (const e of evs) onEvent({ ...e, instance: 'boye888', date: e.ts.slice(0, 10), lineNo: 1 }); },
+  };
+  const f = await collectFacts(fakeSource, ACCOUNT, NOW);
+  const ids = f.openRounds.map((r) => r.roundId).sort();
+  assert.deepEqual(ids, ['R073-230148']); // 两个残影轮（含无新买入的接管轮）都被排除
+  assert.equal(f.openRounds[0].buyCount, 1);
+  assert.equal(f.totalProfit, 4.0);
+});
+
 test('collectFacts：从假事件源聚合（总利润/今天/未收口轮/最新估值）', async () => {
   const evs = [
     { ts: '2026-10-06T10:00:00.000Z', event: 'NEW_ROUND', symbol: 'ETHFDUSD', roundId: 'R1', data: {} },
