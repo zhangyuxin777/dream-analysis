@@ -242,8 +242,42 @@ export function renderDaily(facts: AccountFacts, account: LpAccountConfig, now: 
     `账户估值：$${money(valuation)} ｜ 运行：${dayLabel}`,
     '━━━━━━━━━━━━━━━',
   ];
-  if (facts.zeroToday) {
-    lines.push('状态：今天市场平淡，持仓等待中，属正常节奏');
+
+  // 状态行：区分"深跌防守中"（防守态≠市场平淡，浮亏是接货中的正常波动）/ 今日急跌已退出 / 持仓等待 / 正常
+  const nowMs = now.getTime();
+  const todayStr = now.toLocaleDateString('en-CA', { timeZone: TZ });
+  const activeCrashes = facts.crashes.filter(
+    (c) => !c.exitedAt && Date.parse(c.enteredAt) >= nowMs - 48 * 3600_000,
+  );
+  const exitedToday = facts.crashes.filter((c) => c.exitedAt && beijingDayOf(c.exitedAt) === todayStr);
+
+  if (activeCrashes.length > 0) {
+    const syms = [...new Set(activeCrashes.map((c) => shortSymbol(c.symbol)))].join('、');
+    lines.push(`状态：市场急跌中（${syms} 短时跌幅超 4%），程序已自动进入防守状态——放慢买入节奏、拉宽间距保护你的本金。`);
+    // 持仓与备用金一行：LP 最需要知道"钱在哪、安全垫动没动"
+    const bySym = new Map<string, number>();
+    for (const r of facts.openRounds) {
+      if (r.totalCost != null && Number.isFinite(r.totalCost)) {
+        bySym.set(r.symbol, (bySym.get(r.symbol) ?? 0) + r.totalCost);
+      }
+    }
+    const posParts = [...bySym.entries()].map(([sym, v]) => `${shortSymbol(sym)} $${money(v)}`);
+    const posLine = posParts.length > 0 ? `当前持仓：${posParts.join(' + ')}` : null;
+    const topupLine = facts.topupCount > 0
+      ? `备用资金已动用 ${facts.topupCount} 次（策略内置的安全机制）`
+      : '备用资金未动用';
+    if (posLine) lines.push(posLine);
+    lines.push(topupLine);
+    lines.push('当前的浮动盈亏是下跌中按计划接货的正常状态，仓位安全。');
+  } else if (exitedToday.length > 0) {
+    const usedCost = exitedToday.some((c) => (c.totalCost ?? 0) > 0);
+    lines.push(`状态：今天市场出现过急跌，程序自动防守后已恢复正常，${usedCost ? '期间按计划在低位接货。' : '没有动用你的备用资金。'}`);
+  } else if (facts.zeroToday) {
+    if (facts.openRounds.length > 0) {
+      lines.push('状态：今天还没有完成卖出，持仓等待中，属正常节奏');
+    } else {
+      lines.push('状态：今天市场平淡，持仓等待中，属正常节奏');
+    }
   } else {
     lines.push(`状态：正常运作中，今天完成 ${facts.todayRounds} 轮买卖`);
   }

@@ -70,6 +70,43 @@ test('触发：超过 48 小时的深跌是旧闻，首次部署不当新闻推'
   assert.equal(r.hits.length, 0);
 });
 
+test('日报：深跌防守中 —— 状态行必须是防守口径（不是"市场平淡"），含持仓与备用金', () => {
+  const text = renderDaily(facts({
+    crashes: [
+      { enteredAt: '2026-10-07T13:38:54Z', symbol: 'BTCFDUSD', exitedAt: null, durationSec: null, totalCost: null, dropPercent: 0.04 },
+      { enteredAt: '2026-10-07T02:01:17Z', symbol: 'ETHFDUSD', exitedAt: null, durationSec: null, totalCost: null, dropPercent: 0.04 },
+    ],
+    openRounds: [
+      { roundId: 'R1', symbol: 'BTCFDUSD', lastBuyAt: '2026-10-08T01:00:00Z', sellPrice: null, buyCount: 3, totalCost: 18245.17, avgBuyPrice: 83500, lastBuyPrice: 83000, topupCount: 0 },
+      { roundId: 'R2', symbol: 'ETHFDUSD', lastBuyAt: '2026-10-08T01:00:00Z', sellPrice: null, buyCount: 2, totalCost: 23522.09, avgBuyPrice: 2600, lastBuyPrice: 2580, topupCount: 0 },
+    ],
+  }), ACCOUNT, NOW);
+  assert.ok(text.includes('市场急跌中（'));
+  assert.ok(text.includes('短时跌幅超 4%）'));
+  assert.ok(text.includes('ETH') && text.includes('BTC'));
+  assert.ok(text.includes('防守状态'));
+  assert.ok(text.includes('当前持仓：BTC $18,245.17 + ETH $23,522.09'));
+  assert.ok(text.includes('备用资金未动用'));
+  assert.ok(!text.includes('市场平淡'));
+});
+
+test('日报：今日急跌已退出 —— 报告防守结果', () => {
+  const text = renderDaily(facts({
+    crashes: [{ enteredAt: '2026-10-07T13:38:54Z', symbol: 'BTCFDUSD', exitedAt: '2026-10-07T13:00:00Z', durationSec: 1800, totalCost: 0, dropPercent: 0.04 }],
+  }), ACCOUNT, NOW);
+  assert.ok(text.includes('今天市场出现过急跌，程序自动防守后已恢复正常'));
+  assert.ok(text.includes('没有动用你的备用资金'));
+});
+
+test('日报：零盈利但有持仓 —— 不说"市场平淡"', () => {
+  const text = renderDaily(facts({
+    todayProfit: 0, todayRounds: 0, zeroToday: true,
+    openRounds: [{ roundId: 'R1', symbol: 'ETHFDUSD', lastBuyAt: '2026-10-07T06:00:00Z', sellPrice: 2700, buyCount: 1, totalCost: 500, avgBuyPrice: 2700, lastBuyPrice: 2700, topupCount: 0 }],
+  }), ACCOUNT, NOW);
+  assert.ok(text.includes('持仓等待中'));
+  assert.ok(!text.includes('市场平淡'));
+});
+
 test('触发：深跌退出后报一次，有状态记录后不再报', () => {
   const f = facts({
     crashes: [{ enteredAt: '2026-10-07T01:00:00.000Z', symbol: 'ETHFDUSD', exitedAt: '2026-10-07T07:00:00.000Z', durationSec: 21600, totalCost: 0 }],
