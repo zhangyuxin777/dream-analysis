@@ -82,11 +82,21 @@ export async function collectFacts(
   const days = source.availableDays(account.instance);
   const todayStr = now.toLocaleDateString('en-CA', { timeZone: TZ });
 
-  const rounds = new Map<string, {
+  interface RoundState {
     symbol: string; openedAt: string; lastBuyAt: string | null; buyCount: number; completed: boolean;
-    prevAccCost: number | null; costSum: number; spendSum: number;
+    costSum: number; spendSum: number; lastAccCost: number | null;
     lastBuyPrice: number | null; topups: number; lastActivityAt: string;
-  }>();
+  }
+  const newRoundState = (symbol: string, ts: string): RoundState => ({
+    symbol, openedAt: ts, lastBuyAt: null, buyCount: 0, completed: false,
+    costSum: 0, spendSum: 0, lastAccCost: null, lastBuyPrice: null, topups: 0, lastActivityAt: ts,
+  });
+  // 按 roundId（如 R059-231427 / R059-161716-RCV）分别跟踪；
+  // 轮号（第一段）会重号（实盘观测：R059 在 10-06 和 10-07 各开过一次），不能当唯一键
+  const rounds = new Map<string, RoundState>();
+  // accCost（累计投入）跨恢复链连续（恢复时接管原值）：按 币种:轮号 记链上最后一次 accCost，
+  // 用差额算每笔实际花费 —— 否则恢复后的第一笔会把链上已投入部分重复计入均价
+  const lastAccCost = new Map<string, number>();
   let totalProfit = 0;
   let todayProfit = 0;
   let todayRounds = 0;
@@ -100,36 +110,30 @@ export async function collectFacts(
   const placeByRound = new Map<string, { price: number; qty: number | null; ts: string }>();
   // 每轮最近一次"卖单被撤销"的时间（ORDER_CANCELED 且 side=SELL；撤销后未重挂 = 卖单不在市）
   const sellCancelByRound = new Map<string, string>();
-  // 所有出现过的 roundId（不论是否建仓）按轮号记活动时间 —— 恢复接管的 -RCV 轮可能没有 BUY_FILLED，
-  // 但 ORDER_FILLED/SELL_FILLED/ORDER_CANCELED 等事件足够证明"同轮号的旧 id 已被接管"
-  // 轮按**轮号**（roundId 第一段，如 R059）合并跟踪：重启恢复会把同轮仓位接管到新 roundId
-  // （R059-xxx-RCV），逻辑上仍是同一轮。2026-10-09 实盘踩坑：恢复后的 -RCV 轮没有 BUY_FILLED，
-  // 旧 id 又被"残影过滤"排除 ⇒ 持仓凭空消失（o 命令误报"没有持仓"）。
-  const keyOf = (rid: string): string => rid.split('-')[0];
 
   const window = { label: '全部', fromMs: 0, toMs: Number.MAX_SAFE_INTEGER, days };
   await source.scan({ window, instance: account.instance }, (e: LoadedEventLike) => {
     const ev = e.event;
     const rid = typeof e.roundId === 'string' ? e.roundId : null;
-    const rkey = rid ? keyOf(rid) : null;
-    if (ev === 'ROUND_COMPLETED' && rkey) {
+    const prefix = rid ? rid.split('-')[0] : null;
+    const chainKey = rid ? `${e.symbol ?? '?'}:${prefix}` : null;
+    if (ev === 'ROUND_COMPLETED' && rid && chainKey) {
       const p = Number(e.data?.profit ?? 0);
       totalProfit += p;
       completedRounds += 1;
       const d = beijingDayOf(e.ts);
       if (d === todayStr) { todayProfit += p; todayRounds += 1; }
-      const r = rounds.get(rkey);
-      if (r) r.completed = true;
-    } else if (ev === 'NEW_ROUND' && rkey) {
-      if (!rounds.has(rkey)) rounds.set(rkey, {
-        symbol: e.symbol ?? '?', openedAt: e.ts, lastBuyAt: null, buyCount: 0, completed: false,
-        prevAccCost: null, costSum: 0, spendSum: 0, lastBuyPrice: null, topups: 0, lastActivityAt: e.ts,
-      });
-    } else if (ev === 'BUY_FILLED' && rkey) {
-      const r = rounds.get(rkey) ?? {
-        symbol: e.symbol ?? '?', openedAt: e.ts, lastBuyAt: null, buyCount: 0, completed: false,
-        prevAccCost: null, costSum: 0, spendSum: 0, lastBuyPrice: null, topups: 0, lastActivityAt: e.ts,
-      };
+      // 未知 rid 也建桩：轮号重号切段的"关闭点"可能落在数据窗口之前
+      const r = rounds.get(rid) ?? newRoundState(e.symbol ?? '?', e.ts);
+      r.completed = true;
+      if (e.ts > r.lastActivityAt) r.lastActivityAt = e.ts;
+      rounds.set(rid, r);
+    } else if (ev === 'NEW_ROUND' && rid && chainKey) {
+      if (!rounds.has(rid)) rounds.set(rid, newRoundState(e.symbol ?? '?', e.ts));
+      // 同轮号新开 = 新逻辑轮（重号），accCost 链重新开始
+      lastAccCost.delete(chainKey);
+    } else if (ev === 'BUY_FILLED' && rid && chainKey) {
+      const r = rounds.get(rid) ?? newRoundState(e.symbol ?? '?', e.ts);
       if (e.ts > r.lastActivityAt) r.lastActivityAt = e.ts;
       r.buyCount += 1;
       r.lastBuyAt = e.ts;
@@ -137,15 +141,16 @@ export async function collectFacts(
       const accCost = Number(e.data?.accCost ?? NaN);
       if (Number.isFinite(buyPrice)) r.lastBuyPrice = buyPrice;
       if (Number.isFinite(accCost)) {
-        // accCost 是跨重启连续的（恢复时接管原值），按轮号合并后差额累加仍然正确
-        const spend = r.prevAccCost == null ? accCost : accCost - r.prevAccCost;
+        const prev = lastAccCost.get(chainKey);
+        const spend = prev == null ? accCost : accCost - prev;
         if (Number.isFinite(buyPrice) && spend > 0) {
           r.costSum += buyPrice * spend;
           r.spendSum += spend;
         }
-        r.prevAccCost = accCost;
+        r.lastAccCost = accCost;
+        lastAccCost.set(chainKey, accCost);
       }
-      rounds.set(rkey, r);
+      rounds.set(rid, r);
     } else if (ev === 'ACCOUNT_OBSERVED') {
       const total = Number(e.data?.totalValue ?? NaN);
       const balances = Array.isArray(e.data?.balances) ? e.data.balances as Array<{ asset: string; qtyFree?: number }> : [];
@@ -161,7 +166,7 @@ export async function collectFacts(
           latestPrices[b.asset] = value / qty;
         }
       }
-    } else if (ev === 'PROFIT_PLACE_PARAMS' && rkey) {
+    } else if (ev === 'PROFIT_PLACE_PARAMS' && rid) {
       // 新格式：price/quantity 直接在 data 上；老格式：data.params 是 JSON 字符串
       let price = Number(e.data?.price ?? NaN);
       let qty = Number(e.data?.quantity ?? NaN);
@@ -173,14 +178,14 @@ export async function collectFacts(
         if (mq) qty = Number(mq[1]);
       }
       if (Number.isFinite(price)) {
-        placeByRound.set(rkey, { price, qty: Number.isFinite(qty) ? qty : null, ts: e.ts });
+        placeByRound.set(rid, { price, qty: Number.isFinite(qty) ? qty : null, ts: e.ts });
       }
-    } else if (ev === 'ORDER_CANCELED' && rkey) {
+    } else if (ev === 'ORDER_CANCELED' && rid) {
       // 只认卖单撤销（orderInfo 里 "S":"SELL"）；解析不了就不影响卖单存活判断
       const info = typeof e.data?.orderInfo === 'string' ? e.data.orderInfo : '';
       try {
         const parsed = JSON.parse(info) as { S?: string } | null;
-        if (parsed && parsed.S === 'SELL') sellCancelByRound.set(rkey, e.ts);
+        if (parsed && parsed.S === 'SELL') sellCancelByRound.set(rid, e.ts);
       } catch { /* 非 JSON 的 orderInfo：忽略 */ }
     } else if (ev === 'CRASH_ENTERED') {
       crashes.set(`${e.ts}:${e.symbol}`, {
@@ -198,35 +203,72 @@ export async function collectFacts(
       }
     } else if (ev.startsWith('TOPUP_')) {
       topupCount += 1;
-      const r = rkey ? rounds.get(rkey) : undefined;
-      if (r) r.topups += 1;
+      if (rid) {
+        const r = rounds.get(rid) ?? newRoundState(e.symbol ?? '?', e.ts);
+        r.topups += 1;
+        rounds.set(rid, r);
+      }
+    } else if ((ev === 'RECOVERY_APPLIED' || ev.startsWith('STARTUP_RECOVERY')) && rid) {
+      // 恢复接管事件：建桩让"恢复链"参与未平仓拼装（-RCV 轮自身没有 BUY_FILLED，但仓位是真的）
+      const r = rounds.get(rid) ?? newRoundState(e.symbol ?? '?', e.ts);
+      if (e.ts > r.lastActivityAt) r.lastActivityAt = e.ts;
+      rounds.set(rid, r);
     }
   });
 
-  // 未平仓轮 = 轮号合并后：未完成且建过仓。恢复接管（-RCV）天然被合并进同一轮号，无需残影过滤
-  // （2026-10-09 之前用"同轮号里活动最新的 roundId 才算活轮"的过滤法，恢复接管后的持仓会凭空消失）
-  const openRounds: OpenRound[] = [...rounds.entries()]
-    .filter(([, r]) => !r.completed && r.buyCount > 0)
-    .map(([rkey, r]) => {
-      const place = placeByRound.get(rkey);
-      const cancelTs = sellCancelByRound.get(rkey);
-      const sellLive = place != null && (cancelTs == null || cancelTs <= place.ts);
-      return {
-        roundId: rkey,
-        symbol: r.symbol,
-        lastBuyAt: r.lastBuyAt ?? r.openedAt,
-        sellPrice: place?.price ?? null,
-        sellQty: place?.qty ?? null,
-        sellPlacedAt: place?.ts ?? null,
-        sellLive,
-        buyCount: r.buyCount,
-        totalCost: r.prevAccCost,
-        avgBuyPrice: r.spendSum > 0 ? r.costSum / r.spendSum : null,
-        lastBuyPrice: r.lastBuyPrice,
-        topupCount: r.topups,
-      };
-    })
-    .sort((a, b) => a.lastBuyAt.localeCompare(b.lastBuyAt));
+  // 未平仓轮拼装（2026-10-09 实盘踩坑后重写，两条硬约束同时满足）：
+  // 1) 恢复接管（-RCV）的轮没有 BUY_FILLED，但仓位是真的 —— 必须与同链旧 id 合并；
+  // 2) 轮号会重号（实盘：R059 在 10-06 和 10-07 各开过一次）—— 不能无脑按轮号合并，
+  //    要在"已完成"处切段：同 币种:轮号 的 roundId 按活动时间排序，遇 completed 切段，
+  //    最后一个未完成的段 = 活轮（段内多个 id = 恢复接管链：买入合并、卖单取段内最新）。
+  const byChain = new Map<string, Array<[string, RoundState]>>();
+  for (const [rid, r] of rounds) {
+    const ck = `${r.symbol}:${rid.split('-')[0]}`;
+    const arr = byChain.get(ck) ?? [];
+    arr.push([rid, r]);
+    byChain.set(ck, arr);
+  }
+
+  const openRounds: OpenRound[] = [];
+  for (const [ck, ids] of byChain) {
+    ids.sort((a, b) => a[1].lastActivityAt.localeCompare(b[1].lastActivityAt));
+    let seg: Array<[string, RoundState]> = [];
+    for (const item of ids) {
+      if (item[1].completed) { seg = []; continue; } // 完成 = 这段逻辑轮已结束，之后同号 = 新轮（重号）
+      seg.push(item);
+    }
+    const buyCount = seg.reduce((s, [, r]) => s + r.buyCount, 0);
+    if (buyCount === 0) continue;
+    const lastBuyR = seg.filter(([, r]) => r.lastBuyAt != null)
+      .sort((a, b) => a[1].lastBuyAt!.localeCompare(b[1].lastBuyAt!)).pop()![1];
+    // 卖单/撤销取段内时间最新的一份（恢复后重挂的卖单挂在 -RCV id 下）
+    let place: { price: number; qty: number | null; ts: string } | null = null;
+    let cancelTs: string | null = null;
+    for (const [rid2] of seg) {
+      const p = placeByRound.get(rid2);
+      if (p && (place == null || p.ts > place.ts)) place = p;
+      const c = sellCancelByRound.get(rid2);
+      if (c && (cancelTs == null || c > cancelTs)) cancelTs = c;
+    }
+    const costSum = seg.reduce((s, [, r]) => s + r.costSum, 0);
+    const spendSum = seg.reduce((s, [, r]) => s + r.spendSum, 0);
+    const [, live] = seg[seg.length - 1];
+    openRounds.push({
+      roundId: ck.split(':')[1],
+      symbol: live.symbol,
+      lastBuyAt: lastBuyR.lastBuyAt!,
+      sellPrice: place?.price ?? null,
+      sellQty: place?.qty ?? null,
+      sellPlacedAt: place?.ts ?? null,
+      sellLive: place != null && (cancelTs == null || cancelTs <= place.ts),
+      buyCount,
+      totalCost: seg.reduce<number | null>((s, [, r]) => r.lastAccCost ?? s, null),
+      avgBuyPrice: spendSum > 0 ? costSum / spendSum : null,
+      lastBuyPrice: lastBuyR.lastBuyPrice,
+      topupCount: seg.reduce((s, [, r]) => s + r.topups, 0),
+    });
+  }
+  openRounds.sort((a, b) => a.lastBuyAt.localeCompare(b.lastBuyAt));
 
   return {
     days, totalProfit, todayProfit, todayRounds, completedRounds,
@@ -444,7 +486,7 @@ export function evaluateTriggers(
   for (const r of facts.openRounds) {
     const hours = (nowMs - Date.parse(r.lastBuyAt)) / 3600_000;
     if (hours < account.stuckAlertHours) continue;
-    const key = `stuck:${r.roundId}`;
+    const key = `stuck:${r.symbol}:${r.roundId}`;
     if (fired.has(key)) continue;
     const sym = shortSymbol(r.symbol);
     const h = Math.floor(hours);

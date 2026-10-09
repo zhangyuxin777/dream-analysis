@@ -310,6 +310,29 @@ test('collectFacts：重启恢复接管后仍未平仓 —— 仓位必须还在
   assert.equal(f.openRounds[0].sellLive, true);
 });
 
+test('collectFacts：轮号重号 —— 上一段已完成后再开的同号轮是全新逻辑轮，不与旧段合并', async () => {
+  const evs = [
+    // 第一段 R059：10-06 开仓、买入、完成（实盘 10-06 真实发生过）
+    { ts: '2026-10-06T05:08:16Z', event: 'NEW_ROUND', symbol: 'ETHFDUSD', roundId: 'R059-130816', data: {} },
+    { ts: '2026-10-06T05:42:59Z', event: 'BUY_FILLED', symbol: 'ETHFDUSD', roundId: 'R059-130816', data: { buyPrice: 2700, accCost: 500 } },
+    { ts: '2026-10-06T07:46:53Z', event: 'ROUND_COMPLETED', symbol: 'ETHFDUSD', roundId: 'R059-130816', data: { profit: 2.0 } },
+    // 第二段 R059：10-07 重号新开（实盘同样真实发生过），未平仓
+    { ts: '2026-10-06T23:14:27Z', event: 'NEW_ROUND', symbol: 'ETHFDUSD', roundId: 'R059-231427', data: {} },
+    { ts: '2026-10-07T02:01:16Z', event: 'BUY_FILLED', symbol: 'ETHFDUSD', roundId: 'R059-231427', data: { buyPrice: 2609.1, accCost: 24189.95 } },
+    { ts: '2026-10-07T02:02:00Z', event: 'PROFIT_PLACE_PARAMS', symbol: 'ETHFDUSD', roundId: 'R059-231427', data: { price: 2652.4, quantity: 9.1248, side: 'SELL' } },
+  ];
+  const fakeSource = {
+    availableDays: () => ['2026-10-06', '2026-10-07'],
+    scan: async (_f, onEvent) => { for (const e of evs) onEvent({ ...e, instance: 'boye888', date: e.ts.slice(0, 10), lineNo: 1 }); },
+  };
+  const f = await collectFacts(fakeSource, ACCOUNT, NOW);
+  assert.equal(f.openRounds.length, 1); // 只有第二段是活轮；若按轮号无脑合并会 0 个
+  assert.equal(f.openRounds[0].roundId, 'R059');
+  assert.equal(f.openRounds[0].totalCost, 24189.95); // 第二段 accCost 独立（NEW_ROUND 重置链，未被旧段 500 污染）
+  assert.equal(f.openRounds[0].buyCount, 1);
+  assert.equal(f.totalProfit, 2.0);
+});
+
 test('collectFacts：从假事件源聚合（总利润/今天/未收口轮/最新估值）', async () => {
   const evs = [
     { ts: '2026-10-06T10:00:00.000Z', event: 'NEW_ROUND', symbol: 'ETHFDUSD', roundId: 'R1', data: {} },
