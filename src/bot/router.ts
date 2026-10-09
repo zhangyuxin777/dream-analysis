@@ -4,7 +4,7 @@
  * 机器人只保留三个 LP -facing 能力：
  *   1. 定时报告：LP 日报（每天北京时间 dailyHour）+ 异常实时通知 —— 由 lpReporter 负责，不在本文件
  *   2. 随时报告：群里发 `r`（@机器人），立即渲染一份 LP 视角的账户报告
- *   3. 挂单详情：群里发 `g`，看当前持仓的卖单价 / 预计收益 / 距离成交还差多少（缓解卡单焦虑）
+ *   3. 挂单详情：群里发 `o`（orders），看当前持仓的卖单价 / 预计收益 / 距离成交还差多少（缓解卡单焦虑）
  *
  * 取舍记录（相比 M1 的分析器路由）：
  * - 删掉 status / sync / analyze / health / rounds / stuck / errors / stream / topup 全套技术指令：
@@ -23,7 +23,7 @@ import { statePathOf } from '../sync/puller';
 import { collectFacts, renderDaily, renderOpenOrders } from '../lp/lpReporter';
 import { IncomingMessage } from './types';
 
-export const REPORT_HINT = '发 r 看账户报告，发 g 看挂单详情 📊';
+export const REPORT_HINT = '发 r 看账户报告，发 o 看挂单详情 📊';
 
 export interface RouterDeps {
   config: AppConfig;
@@ -73,7 +73,7 @@ export class CommandRouter {
     if (command === 'r' || command === 'rounds' || command === '报告') {
       return this.handleReport(msg);
     }
-    if (command === 'g' || command === 'orders' || command === '挂单') {
+    if (command === 'o' || command === 'orders' || command === '挂单') {
       return this.handleOrders(msg);
     }
     return REPORT_HINT;

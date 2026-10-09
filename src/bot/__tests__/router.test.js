@@ -168,11 +168,11 @@ const OPEN_EVENTS = [
   { ts: '2026-10-01T03:00:02.000Z', event: 'ACCOUNT_OBSERVED', symbol: '__account__', localDate: '2026-10-01', seq: 4, data: { totalValue: 99999, balances: [{ asset: 'ETH', qtyFree: 0, qtyLocked: 0.38, value: 960.5 }, { asset: 'FDUSD', qtyFree: 97000 }] } },
 ];
 
-test('g：挂单详情 —— 卖单价/预计收益/距离成交', async () => {
+test('o：挂单详情 —— 卖单价/预计收益/距离成交', async () => {
   const env = makeEnv();
   installShard(env.config, 'boye888', '2026-10-01', OPEN_EVENTS);
   const router = makeRouter(env);
-  for (const cmd of ['g', 'orders', '挂单']) {
+  for (const cmd of ['o', 'orders', '挂单']) {
     const text = await router.handle(msg(cmd));
     assert.ok(text.includes('【挂单详情】你的账户（10 万 U）'), `cmd=${cmd}`);
     assert.ok(text.includes('挂卖价：$2,650.50（0.38 个）'), `cmd=${cmd}`);
@@ -181,19 +181,19 @@ test('g：挂单详情 —— 卖单价/预计收益/距离成交', async () => 
   }
 });
 
-test('g：无持仓 —— 待命口径', async () => {
+test('o：无持仓 —— 待命口径', async () => {
   const env = makeEnv();
   installShard(env.config, 'boye888', '2026-10-01', ROUND_EVENTS); // R001 已完成
   const router = makeRouter(env);
-  const text = await router.handle(msg('g'));
+  const text = await router.handle(msg('o'));
   assert.ok(text.includes('当前没有持仓'));
 });
 
-test('g：未绑定群同样拦截', async () => {
+test('o：未绑定群同样拦截', async () => {
   const env = makeEnv();
   installShard(env.config, 'boye888', '2026-10-01', OPEN_EVENTS);
   const router = makeRouter(env);
-  assert.match(await router.handle(msg('g', { conversationId: 'cid-unbound' })), /还没绑定账户/);
+  assert.match(await router.handle(msg('o', { conversationId: 'cid-unbound' })), /还没绑定账户/);
 });
 
 test('提示语：未知指令提示 r + g 两个入口', async () => {
@@ -201,5 +201,5 @@ test('提示语：未知指令提示 r + g 两个入口', async () => {
   const router = makeRouter(env);
   assert.equal(await router.handle(msg('h')), REPORT_HINT);
   assert.ok(REPORT_HINT.includes('r'));
-  assert.ok(REPORT_HINT.includes('g'));
+  assert.ok(REPORT_HINT.includes('o'));
 });

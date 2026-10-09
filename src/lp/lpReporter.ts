@@ -327,7 +327,7 @@ export function renderDaily(facts: AccountFacts, account: LpAccountConfig, now: 
   return lines.join('\n');
 }
 
-// ============ 挂单详情（g 命令）============
+// ============ 挂单详情（o 命令）============
 
 /** 持仓数量：大数量取整、中等两位小数、小数量四位小数（BTC 0.2733 / ETH 9.12），去掉尾零 */
 function fmtQty(n: number): string {
