@@ -28,6 +28,12 @@ export interface OssConfig {
 export interface SyncConfig {
   intervalMinutes: number;
   minAgeSeconds: number;
+  /**
+   * 对齐整点后的第 N 分钟首次触发（0~59，可选）。
+   * 用途：策略侧导出在整点 X:00:02 运行，同步对齐到 X:07 之类就能把数据时滞压到 ~1 小时；
+   * 不配置则保持旧行为（从进程启动时刻起每隔 intervalMinutes，部署重启会漂移）。
+   */
+  alignMinute?: number;
   countIncludesHeader: boolean;
   concurrency: number;
 }
@@ -155,6 +161,10 @@ export function parseConfig(raw: unknown, opts: { rootDir: string }): ParseResul
     // 盘上留着的都是源数据（~200KB/天/实例），消费端不当数据的看门人；盘满就响亮失败。
     concurrency: num(syncRaw.concurrency, 1),
   };
+  if (syncRaw.alignMinute !== undefined) {
+    sync.alignMinute = num(syncRaw.alignMinute, -1);
+    if (sync.alignMinute < 0 || sync.alignMinute > 59) problems.push('sync.alignMinute 应在 0~59 之间（整点后的第 N 分钟首次触发）');
+  }
   if (sync.intervalMinutes < 1 || sync.intervalMinutes > 1440) problems.push('sync.intervalMinutes 应在 1~1440 之间');
   if (sync.minAgeSeconds < 0 || sync.minAgeSeconds > 3600) problems.push('sync.minAgeSeconds 应在 0~3600 之间');
   if (num(syncRaw.retentionDays, 0) > 0 || num(syncRaw.maxDiskGB, 0) > 0) {

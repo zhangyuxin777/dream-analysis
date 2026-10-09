@@ -13,6 +13,12 @@ export interface SchedulerDeps {
   logger: ILogger;
   run: () => Promise<unknown>;
   now?: () => Date;
+  /**
+   * 对齐整点后的第 N 分钟首次触发（0~59，可选）。
+   * 策略侧导出在整点 X:00:02 运行，同步对齐到 X+N 就能把数据时滞压到约 1 小时；
+   * 不配置则保持旧行为（从启动时刻起每 intervalMinutes，部署重启后触发分钟会漂移）。
+   */
+  alignMinute?: number;
 }
 
 export interface Scheduler {
@@ -24,9 +30,16 @@ export interface Scheduler {
   lastRunAt(): Date | null;
 }
 
+/** 距下一个"整区间边界 + alignMinute"的毫秒数（interval=60 时即整点后第 N 分钟） */
+export function alignedDelayMs(fromMs: number, alignMinute: number, intervalMinutes: number): number {
+  const coeff = Math.max(1, intervalMinutes) * 60_000;
+  const aligned = Math.floor(fromMs / coeff) * coeff + alignMinute * 60_000;
+  return (aligned <= fromMs ? aligned + coeff : aligned) - fromMs;
+}
+
 export function createScheduler(deps: SchedulerDeps): Scheduler {
   const now = deps.now ?? (() => new Date());
-  let timer: ReturnType<typeof setInterval> | null = null;
+  let timer: ReturnType<typeof setInterval> | ReturnType<typeof setTimeout> | null = null;
   let inflight: Promise<void> | null = null;
   let lastRun: Date | null = null;
 
@@ -55,6 +68,19 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
     start(): void {
       if (timer) return;
       const periodMs = Math.max(1, deps.intervalMinutes) * 60_000;
+      if (deps.alignMinute != null) {
+        // 对齐整点后第 N 分钟：首次用 setTimeout 到位，之后按周期 setInterval，重启/部署不再漂移
+        const firstDelayMs = alignedDelayMs(now().getTime(), deps.alignMinute, deps.intervalMinutes);
+        const boot = setTimeout(() => {
+          void triggerNow();
+          timer = setInterval(() => void triggerNow(), periodMs);
+          if (typeof timer.unref === 'function') timer.unref();
+        }, firstDelayMs);
+        if (typeof boot.unref === 'function') boot.unref();
+        timer = boot;
+        deps.logger.info('定时同步已启动（整点对齐）', { intervalMinutes: deps.intervalMinutes, alignMinute: deps.alignMinute, firstDelayMs });
+        return;
+      }
       // 故意 unref：定时器不该单独决定进程生死（进程还有别的常驻职责时更明显）
       timer = setInterval(() => void triggerNow(), periodMs);
       if (typeof timer.unref === 'function') timer.unref();
@@ -62,6 +88,7 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
     },
     stop(): void {
       if (timer) {
+        clearTimeout(timer);
         clearInterval(timer);
         timer = null;
         deps.logger.info('定时同步已停止');

@@ -75,3 +75,48 @@ test('定时触发按间隔发生，stop 之后不再触发（假时钟）', asy
   assert.equal(calls, 2, 'stop 之后绝不该再触发');
   t.mock.timers.reset();
 });
+
+test('alignedDelayMs：整点对齐的毫秒数（纯函数，跨边界正确）', () => {
+  const { alignedDelayMs } = require('../../../dist/sync/scheduler');
+  const H = 3_600_000;
+  const base = Date.parse('2026-10-09T12:00:00+08:00'); // 整点
+  assert.equal(alignedDelayMs(base, 7, 60), 7 * 60_000, '整点时刻 → 7 分钟后');
+  assert.equal(alignedDelayMs(base + 5 * 60_000, 7, 60), 2 * 60_000, '12:05 → 12:07');
+  assert.equal(alignedDelayMs(base + 7 * 60_000, 7, 60), 60 * 60_000, '恰好 12:07 → 下一轮 13:07（不零延迟自爆）');
+  assert.equal(alignedDelayMs(base + 59 * 60_000, 7, 60), 8 * 60_000, '12:59 → 13:07');
+  assert.equal(alignedDelayMs(base + H + 30 * 60_000, 7, 60), 37 * 60_000, '跨小时边界 13:30 → 14:07');
+});
+
+test('alignMinute：首次触发对齐整点后第 N 分钟，之后按周期走（假时钟）', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
+  // now 固定在 12:05:00，alignMinute=7 → 首次延迟 2 分钟，之后每 60 分钟
+  const now = () => new Date(Date.parse('2026-10-09T12:05:00+08:00'));
+  let calls = 0;
+  const scheduler = createScheduler({
+    intervalMinutes: 60,
+    alignMinute: 7,
+    now,
+    logger: quietLogger(),
+    run: async () => {
+      calls++;
+    },
+  });
+  scheduler.start();
+  t.mock.timers.tick(60_000); // 12:06：还没到
+  await new Promise((r) => setImmediate(r));
+  assert.equal(calls, 0);
+  t.mock.timers.tick(60_000); // 12:07：首次触发
+  await new Promise((r) => setImmediate(r));
+  assert.equal(calls, 1);
+  t.mock.timers.tick(59 * 60_000); // 13:06：周期未到
+  await new Promise((r) => setImmediate(r));
+  assert.equal(calls, 1);
+  t.mock.timers.tick(60_000); // 13:07：第二次
+  await new Promise((r) => setImmediate(r));
+  assert.equal(calls, 2);
+  scheduler.stop();
+  t.mock.timers.tick(120 * 60_000);
+  await new Promise((r) => setImmediate(r));
+  assert.equal(calls, 2, 'stop 之后绝不该再触发');
+  t.mock.timers.reset();
+});

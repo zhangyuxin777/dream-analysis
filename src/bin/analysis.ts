@@ -176,6 +176,7 @@ export async function cmdRun(config: AppConfig, logger: ILogger, store: ObjectSt
   const lpReporter = startLpIfConfigured(config, logger, botRef);
   const scheduler = createScheduler({
     intervalMinutes: config.sync.intervalMinutes,
+    alignMinute: config.sync.alignMinute,
     logger: syncLogger,
     run: async () => {
       await runSync({ store, config, logger: syncLogger });
