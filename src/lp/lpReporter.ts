@@ -102,35 +102,31 @@ export async function collectFacts(
   const sellCancelByRound = new Map<string, string>();
   // 所有出现过的 roundId（不论是否建仓）按轮号记活动时间 —— 恢复接管的 -RCV 轮可能没有 BUY_FILLED，
   // 但 ORDER_FILLED/SELL_FILLED/ORDER_CANCELED 等事件足够证明"同轮号的旧 id 已被接管"
-  const prefixActivity = new Map<string, string>();
+  // 轮按**轮号**（roundId 第一段，如 R059）合并跟踪：重启恢复会把同轮仓位接管到新 roundId
+  // （R059-xxx-RCV），逻辑上仍是同一轮。2026-10-09 实盘踩坑：恢复后的 -RCV 轮没有 BUY_FILLED，
+  // 旧 id 又被"残影过滤"排除 ⇒ 持仓凭空消失（o 命令误报"没有持仓"）。
+  const keyOf = (rid: string): string => rid.split('-')[0];
 
   const window = { label: '全部', fromMs: 0, toMs: Number.MAX_SAFE_INTEGER, days };
   await source.scan({ window, instance: account.instance }, (e: LoadedEventLike) => {
     const ev = e.event;
     const rid = typeof e.roundId === 'string' ? e.roundId : null;
-    // 任何带 roundId 的事件都算"该轮的活动"（重启恢复会产生新 roundId 接管同轮 ⇒ 旧 id 活动停止）
-    if (rid) {
-      const prefix = rid.split('-')[0];
-      const prev = prefixActivity.get(prefix);
-      if (prev == null || e.ts > prev) prefixActivity.set(prefix, e.ts);
-      const touched = rounds.get(rid);
-      if (touched && e.ts > touched.lastActivityAt) touched.lastActivityAt = e.ts;
-    }
-    if (ev === 'ROUND_COMPLETED' && rid) {
+    const rkey = rid ? keyOf(rid) : null;
+    if (ev === 'ROUND_COMPLETED' && rkey) {
       const p = Number(e.data?.profit ?? 0);
       totalProfit += p;
       completedRounds += 1;
       const d = beijingDayOf(e.ts);
       if (d === todayStr) { todayProfit += p; todayRounds += 1; }
-      const r = rounds.get(rid);
+      const r = rounds.get(rkey);
       if (r) r.completed = true;
-    } else if (ev === 'NEW_ROUND' && rid) {
-      if (!rounds.has(rid)) rounds.set(rid, {
+    } else if (ev === 'NEW_ROUND' && rkey) {
+      if (!rounds.has(rkey)) rounds.set(rkey, {
         symbol: e.symbol ?? '?', openedAt: e.ts, lastBuyAt: null, buyCount: 0, completed: false,
         prevAccCost: null, costSum: 0, spendSum: 0, lastBuyPrice: null, topups: 0, lastActivityAt: e.ts,
       });
-    } else if (ev === 'BUY_FILLED' && rid) {
-      const r = rounds.get(rid) ?? {
+    } else if (ev === 'BUY_FILLED' && rkey) {
+      const r = rounds.get(rkey) ?? {
         symbol: e.symbol ?? '?', openedAt: e.ts, lastBuyAt: null, buyCount: 0, completed: false,
         prevAccCost: null, costSum: 0, spendSum: 0, lastBuyPrice: null, topups: 0, lastActivityAt: e.ts,
       };
@@ -141,6 +137,7 @@ export async function collectFacts(
       const accCost = Number(e.data?.accCost ?? NaN);
       if (Number.isFinite(buyPrice)) r.lastBuyPrice = buyPrice;
       if (Number.isFinite(accCost)) {
+        // accCost 是跨重启连续的（恢复时接管原值），按轮号合并后差额累加仍然正确
         const spend = r.prevAccCost == null ? accCost : accCost - r.prevAccCost;
         if (Number.isFinite(buyPrice) && spend > 0) {
           r.costSum += buyPrice * spend;
@@ -148,7 +145,7 @@ export async function collectFacts(
         }
         r.prevAccCost = accCost;
       }
-      rounds.set(rid, r);
+      rounds.set(rkey, r);
     } else if (ev === 'ACCOUNT_OBSERVED') {
       const total = Number(e.data?.totalValue ?? NaN);
       const balances = Array.isArray(e.data?.balances) ? e.data.balances as Array<{ asset: string; qtyFree?: number }> : [];
@@ -164,7 +161,7 @@ export async function collectFacts(
           latestPrices[b.asset] = value / qty;
         }
       }
-    } else if (ev === 'PROFIT_PLACE_PARAMS' && rid) {
+    } else if (ev === 'PROFIT_PLACE_PARAMS' && rkey) {
       // 新格式：price/quantity 直接在 data 上；老格式：data.params 是 JSON 字符串
       let price = Number(e.data?.price ?? NaN);
       let qty = Number(e.data?.quantity ?? NaN);
@@ -176,14 +173,14 @@ export async function collectFacts(
         if (mq) qty = Number(mq[1]);
       }
       if (Number.isFinite(price)) {
-        placeByRound.set(rid, { price, qty: Number.isFinite(qty) ? qty : null, ts: e.ts });
+        placeByRound.set(rkey, { price, qty: Number.isFinite(qty) ? qty : null, ts: e.ts });
       }
-    } else if (ev === 'ORDER_CANCELED' && rid) {
+    } else if (ev === 'ORDER_CANCELED' && rkey) {
       // 只认卖单撤销（orderInfo 里 "S":"SELL"）；解析不了就不影响卖单存活判断
       const info = typeof e.data?.orderInfo === 'string' ? e.data.orderInfo : '';
       try {
         const parsed = JSON.parse(info) as { S?: string } | null;
-        if (parsed && parsed.S === 'SELL') sellCancelByRound.set(rid, e.ts);
+        if (parsed && parsed.S === 'SELL') sellCancelByRound.set(rkey, e.ts);
       } catch { /* 非 JSON 的 orderInfo：忽略 */ }
     } else if (ev === 'CRASH_ENTERED') {
       crashes.set(`${e.ts}:${e.symbol}`, {
@@ -201,22 +198,21 @@ export async function collectFacts(
       }
     } else if (ev.startsWith('TOPUP_')) {
       topupCount += 1;
-      const r = rid ? rounds.get(rid) : undefined;
+      const r = rkey ? rounds.get(rkey) : undefined;
       if (r) r.topups += 1;
     }
   });
 
-  // 重启恢复（RECOVERY_APPLIED）会把同轮仓位接管到新 roundId（如 R009-xxx-RCV），
-  // 旧 roundId 从此再没事件 —— 它是"残影"，不是真持仓。同一轮号（R009）里只有活动最新的才是活轮。
+  // 未平仓轮 = 轮号合并后：未完成且建过仓。恢复接管（-RCV）天然被合并进同一轮号，无需残影过滤
+  // （2026-10-09 之前用"同轮号里活动最新的 roundId 才算活轮"的过滤法，恢复接管后的持仓会凭空消失）
   const openRounds: OpenRound[] = [...rounds.entries()]
     .filter(([, r]) => !r.completed && r.buyCount > 0)
-    .filter(([rid, r]) => prefixActivity.get(rid.split('-')[0]) === r.lastActivityAt)
-    .map(([rid, r]) => {
-      const place = placeByRound.get(rid);
-      const cancelTs = sellCancelByRound.get(rid);
+    .map(([rkey, r]) => {
+      const place = placeByRound.get(rkey);
+      const cancelTs = sellCancelByRound.get(rkey);
       const sellLive = place != null && (cancelTs == null || cancelTs <= place.ts);
       return {
-        roundId: rid,
+        roundId: rkey,
         symbol: r.symbol,
         lastBuyAt: r.lastBuyAt ?? r.openedAt,
         sellPrice: place?.price ?? null,
