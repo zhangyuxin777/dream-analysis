@@ -160,3 +160,46 @@ test('r：还没有数据 → 友好提示', async () => {
   const router = makeRouter(env);
   assert.match(await router.handle(msg('r')), /还没有数据/);
 });
+
+const OPEN_EVENTS = [
+  { ts: '2026-10-01T01:00:00.000Z', event: 'NEW_ROUND', symbol: 'ETHFDUSD', roundId: 'R001', localDate: '2026-10-01', seq: 1, data: {} },
+  { ts: '2026-10-01T02:00:00.000Z', event: 'BUY_FILLED', symbol: 'ETHFDUSD', roundId: 'R001', localDate: '2026-10-01', seq: 2, data: { buyPrice: 2600, accCost: 1000 } },
+  { ts: '2026-10-01T02:01:00.000Z', event: 'PROFIT_PLACE_PARAMS', symbol: 'ETHFDUSD', roundId: 'R001', localDate: '2026-10-01', seq: 3, data: { price: 2650.5, quantity: 0.38, side: 'SELL' } },
+  { ts: '2026-10-01T03:00:02.000Z', event: 'ACCOUNT_OBSERVED', symbol: '__account__', localDate: '2026-10-01', seq: 4, data: { totalValue: 99999, balances: [{ asset: 'ETH', qtyFree: 0, qtyLocked: 0.38, value: 960.5 }, { asset: 'FDUSD', qtyFree: 97000 }] } },
+];
+
+test('g：挂单详情 —— 卖单价/预计收益/距离成交', async () => {
+  const env = makeEnv();
+  installShard(env.config, 'boye888', '2026-10-01', OPEN_EVENTS);
+  const router = makeRouter(env);
+  for (const cmd of ['g', 'orders', '挂单']) {
+    const text = await router.handle(msg(cmd));
+    assert.ok(text.includes('【挂单详情】你的账户（10 万 U）'), `cmd=${cmd}`);
+    assert.ok(text.includes('挂卖价：$2,650.50（0.38 个）'), `cmd=${cmd}`);
+    assert.ok(text.includes('成交后预计赚：+$7.19'), `cmd=${cmd}`); // 2650.5×0.38 − 1000
+    assert.ok(text.includes('再涨'), `cmd=${cmd}`);
+  }
+});
+
+test('g：无持仓 —— 待命口径', async () => {
+  const env = makeEnv();
+  installShard(env.config, 'boye888', '2026-10-01', ROUND_EVENTS); // R001 已完成
+  const router = makeRouter(env);
+  const text = await router.handle(msg('g'));
+  assert.ok(text.includes('当前没有持仓'));
+});
+
+test('g：未绑定群同样拦截', async () => {
+  const env = makeEnv();
+  installShard(env.config, 'boye888', '2026-10-01', OPEN_EVENTS);
+  const router = makeRouter(env);
+  assert.match(await router.handle(msg('g', { conversationId: 'cid-unbound' })), /还没绑定账户/);
+});
+
+test('提示语：未知指令提示 r + g 两个入口', async () => {
+  const env = makeEnv();
+  const router = makeRouter(env);
+  assert.equal(await router.handle(msg('h')), REPORT_HINT);
+  assert.ok(REPORT_HINT.includes('r'));
+  assert.ok(REPORT_HINT.includes('g'));
+});

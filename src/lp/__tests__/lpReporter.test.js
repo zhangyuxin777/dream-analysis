@@ -5,7 +5,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { renderDaily, evaluateTriggers, collectFacts } = require('../../../dist/lp/lpReporter');
+const { renderDaily, renderOpenOrders, evaluateTriggers, collectFacts } = require('../../../dist/lp/lpReporter');
 
 const ACCOUNT = {
   instance: 'boye888',
@@ -28,6 +28,7 @@ function facts(over = {}) {
     todayRounds: 25,
     completedRounds: 25,
     latestObs: { t: '2026-10-07T12:00:00.000Z', total: 100137.02, fdusdFree: 94444 },
+    latestPrices: {},
     openRounds: [],
     crashes: [],
     topupCount: 0,
@@ -209,6 +210,77 @@ test('collectFacts：重启恢复的残影轮不算未平仓（只认同轮号�
   assert.deepEqual(ids, ['R073-230148']); // 两个残影轮（含无新买入的接管轮）都被排除
   assert.equal(f.openRounds[0].buyCount, 1);
   assert.equal(f.totalProfit, 4.0);
+});
+
+test('挂单详情：正常持仓 —— 卖单价/数量/距离/预计收益齐全', () => {
+  const f = facts({
+    latestObs: { t: '2026-10-08T22:00:02Z', total: 97994.07, fdusdFree: 49340 },
+    latestPrices: { ETH: 2485.1, BTC: 81886.3 },
+    openRounds: [{
+      roundId: 'R059-231427', symbol: 'ETHFDUSD', lastBuyAt: '2026-10-07T02:01:18Z',
+      sellPrice: 2655.09, sellQty: 9.1248, sellPlacedAt: '2026-10-08T02:02:16Z', sellLive: true,
+      buyCount: 30, totalCost: 24189.95, avgBuyPrice: 2652.1, lastBuyPrice: 2609.1, topupCount: 0,
+    }],
+  });
+  const text = renderOpenOrders(f, ACCOUNT, NOW);
+  assert.ok(text.includes('【挂单详情】你的账户（10 万 U）'));
+  assert.ok(text.includes('◆ ETH 持仓'));
+  assert.ok(text.includes('挂卖价：$2,655.09（9.12 个）'));
+  assert.ok(text.includes('已投入 $24,189.95，分 30 笔买入，均价 $2,652.10'));
+  assert.ok(text.includes('最新价 $2,485.10，再涨 6.8% 自动成交'));
+  assert.ok(text.includes('成交后预计赚：+$37.22')); // 2655.09×9.1248 − 24189.95 ≈ 37.22
+  assert.ok(text.includes('数据时间：'));
+});
+
+test('挂单详情：无持仓 —— 资金待命口径', () => {
+  const text = renderOpenOrders(facts({ openRounds: [] }), ACCOUNT, NOW);
+  assert.ok(text.includes('当前没有持仓，全部资金在场外待命'));
+  assert.ok(!text.includes('◆'));
+});
+
+test('挂单详情：卖单被撤未重挂 —— 说"调整中"不报预计收益', () => {
+  const f = facts({
+    openRounds: [{
+      roundId: 'R1', symbol: 'BTCFDUSD', lastBuyAt: '2026-10-08T04:00:00Z',
+      sellPrice: 84385.07, sellQty: 0.27328, sellPlacedAt: '2026-10-08T15:37:57Z', sellLive: false,
+      buyCount: 5, totalCost: 22300, avgBuyPrice: 81500, lastBuyPrice: 81000, topupCount: 0,
+    }],
+  });
+  const text = renderOpenOrders(f, ACCOUNT, NOW);
+  assert.ok(text.includes('程序正在调整中（暂时撤下）'));
+  assert.ok(!text.includes('成交后预计赚'));
+  assert.ok(!text.includes('再涨'));
+});
+
+test('collectFacts：挂单详情 —— 两种 PROFIT 格式都认，撤销后未重挂 = 卖单不在市', async () => {
+  const evs = [
+    { ts: '2026-10-07T02:00:00Z', event: 'NEW_ROUND', symbol: 'ETHFDUSD', roundId: 'R1', data: {} },
+    { ts: '2026-10-07T02:01:00Z', event: 'BUY_FILLED', symbol: 'ETHFDUSD', roundId: 'R1', data: { buyPrice: 2600, accCost: 1000 } },
+    // 老格式：params 是 JSON 字符串
+    { ts: '2026-10-07T02:02:00Z', event: 'PROFIT_PLACE_PARAMS', symbol: 'ETHFDUSD', roundId: 'R1', data: { params: '{"price":2650.5,"quantity":0.38,"side":"SELL"}' } },
+    { ts: '2026-10-07T03:00:00Z', event: 'NEW_ROUND', symbol: 'BTCFDUSD', roundId: 'R2', data: {} },
+    { ts: '2026-10-07T03:01:00Z', event: 'BUY_FILLED', symbol: 'BTCFDUSD', roundId: 'R2', data: { buyPrice: 84000, accCost: 2000 } },
+    // 新格式：price/quantity 直接在 data 上
+    { ts: '2026-10-07T03:02:00Z', event: 'PROFIT_PLACE_PARAMS', symbol: 'BTCFDUSD', roundId: 'R2', data: { price: 84500.1, quantity: 0.0238, side: 'SELL' } },
+    // 新挂的卖单 1 秒后被撤（side=SELL 的 ORDER_CANCELED），且没有重挂
+    { ts: '2026-10-07T03:02:01Z', event: 'ORDER_CANCELED', symbol: 'BTCFDUSD', roundId: 'R2', data: { orderInfo: '{"c":"x","S":"SELL","q":"0.02380000","p":"84500.10000000"}' } },
+    // 快照给市价
+    { ts: '2026-10-07T04:00:02Z', event: 'ACCOUNT_OBSERVED', symbol: '__account__', data: { totalValue: 99000, balances: [{ asset: 'ETH', qtyFree: 0, qtyLocked: 0.38, value: 944.06 }, { asset: 'FDUSD', qtyFree: 97000 }] } },
+  ];
+  const fakeSource = {
+    availableDays: () => ['2026-10-07'],
+    scan: async (_f, onEvent) => { for (const e of evs) onEvent({ ...e, instance: 'boye888', date: e.ts.slice(0, 10), lineNo: 1 }); },
+  };
+  const f = await collectFacts(fakeSource, ACCOUNT, NOW);
+  assert.equal(f.openRounds.length, 2);
+  const eth = f.openRounds.find((r) => r.symbol === 'ETHFDUSD');
+  assert.equal(eth.sellPrice, 2650.5); // 老格式 params 字符串解析
+  assert.equal(eth.sellQty, 0.38);
+  assert.equal(eth.sellLive, true);
+  const btc = f.openRounds.find((r) => r.symbol === 'BTCFDUSD');
+  assert.equal(btc.sellPrice, 84500.1); // 新格式直接字段
+  assert.equal(btc.sellLive, false); // 撤销晚于挂出 → 不在市
+  assert.ok(Math.abs(f.latestPrices.ETH - 944.06 / 0.38) < 0.01);
 });
 
 test('collectFacts：从假事件源聚合（总利润/今天/未收口轮/最新估值）', async () => {

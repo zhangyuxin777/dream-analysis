@@ -28,6 +28,8 @@ export interface AccountFacts {
   completedRounds: number;
   /** 最新账户估值快照 */
   latestObs: { t: string; total: number; fdusdFree: number } | null;
+  /** 各币种最新市价（由最新 ACCOUNT_OBSERVED 的 balances value/qty 推算） */
+  latestPrices: Record<string, number>;
   /** 未收口且已建仓的轮（可能跨多天） */
   openRounds: OpenRound[];
   /** 深跌事件（含退出信息，若窗口内有） */
@@ -42,6 +44,12 @@ export interface OpenRound {
   symbol: string;
   lastBuyAt: string;
   sellPrice: number | null;
+  /** 当前挂卖单数量（最新 PROFIT_PLACE_PARAMS 的 quantity） */
+  sellQty: number | null;
+  /** 当前挂卖单的挂出时间 */
+  sellPlacedAt: string | null;
+  /** 卖单是否仍在挂单中（挂出后未被撤销；撤销未重挂 = 程序在调整） */
+  sellLive: boolean;
   /** 本轮买入笔数 */
   buyCount: number;
   /** 本轮累计投入（最后一笔的 accCost） */
@@ -84,8 +92,14 @@ export async function collectFacts(
   let todayRounds = 0;
   let completedRounds = 0;
   let latestObs: AccountFacts['latestObs'] = null;
+  const latestPrices: Record<string, number> = {};
   const crashes = new Map<string, CrashInfo>();
   let topupCount = 0;
+  // 当前挂卖单：每轮取最新一次 PROFIT_PLACE_PARAMS（日志里出现过两种格式：
+  // 老格式 data.params 是 JSON 字符串，新格式 price/quantity 直接在 data 上 —— 两种都要认）
+  const placeByRound = new Map<string, { price: number; qty: number | null; ts: string }>();
+  // 每轮最近一次"卖单被撤销"的时间（ORDER_CANCELED 且 side=SELL；撤销后未重挂 = 卖单不在市）
+  const sellCancelByRound = new Map<string, string>();
   // 所有出现过的 roundId（不论是否建仓）按轮号记活动时间 —— 恢复接管的 -RCV 轮可能没有 BUY_FILLED，
   // 但 ORDER_FILLED/SELL_FILLED/ORDER_CANCELED 等事件足够证明"同轮号的旧 id 已被接管"
   const prefixActivity = new Map<string, string>();
@@ -142,6 +156,35 @@ export async function collectFacts(
       if (Number.isFinite(total) && Number.isFinite(fdusdFree)) {
         latestObs = { t: e.ts, total, fdusdFree };
       }
+      // 顺手从快照余额推算各币种市价（value / 总持仓量），给挂单详情的"还差多少"用
+      for (const b of balances) {
+        const qty = Number((b as { qtyFree?: number; qtyLocked?: number }).qtyFree ?? 0) + Number((b as { qtyLocked?: number }).qtyLocked ?? 0);
+        const value = Number((b as { value?: number }).value ?? NaN);
+        if (Number.isFinite(qty) && qty > 0 && Number.isFinite(value) && value > 0) {
+          latestPrices[b.asset] = value / qty;
+        }
+      }
+    } else if (ev === 'PROFIT_PLACE_PARAMS' && rid) {
+      // 新格式：price/quantity 直接在 data 上；老格式：data.params 是 JSON 字符串
+      let price = Number(e.data?.price ?? NaN);
+      let qty = Number(e.data?.quantity ?? NaN);
+      if (!Number.isFinite(price)) {
+        const raw = typeof e.data?.params === 'string' ? e.data.params : '';
+        const m = /"price":([\d.]+)/.exec(raw);
+        if (m) price = Number(m[1]);
+        const mq = /"quantity":([\d.]+)/.exec(raw);
+        if (mq) qty = Number(mq[1]);
+      }
+      if (Number.isFinite(price)) {
+        placeByRound.set(rid, { price, qty: Number.isFinite(qty) ? qty : null, ts: e.ts });
+      }
+    } else if (ev === 'ORDER_CANCELED' && rid) {
+      // 只认卖单撤销（orderInfo 里 "S":"SELL"）；解析不了就不影响卖单存活判断
+      const info = typeof e.data?.orderInfo === 'string' ? e.data.orderInfo : '';
+      try {
+        const parsed = JSON.parse(info) as { S?: string } | null;
+        if (parsed && parsed.S === 'SELL') sellCancelByRound.set(rid, e.ts);
+      } catch { /* 非 JSON 的 orderInfo：忽略 */ }
     } else if (ev === 'CRASH_ENTERED') {
       crashes.set(`${e.ts}:${e.symbol}`, {
         enteredAt: e.ts, symbol: e.symbol ?? '?',
@@ -163,36 +206,35 @@ export async function collectFacts(
     }
   });
 
-  const sellByRound = new Map<string, number>();
-  await source.scan({ window, instance: account.instance }, (e: LoadedEventLike) => {
-    if (e.event === 'PROFIT_PLACE_PARAMS' && typeof e.roundId === 'string') {
-      const raw = typeof e.data?.params === 'string' ? e.data.params : '';
-      const m = /"price":([\d.]+)/.exec(raw);
-      if (m) sellByRound.set(e.roundId, Number(m[1]));
-    }
-  });
-
   // 重启恢复（RECOVERY_APPLIED）会把同轮仓位接管到新 roundId（如 R009-xxx-RCV），
   // 旧 roundId 从此再没事件 —— 它是"残影"，不是真持仓。同一轮号（R009）里只有活动最新的才是活轮。
   const openRounds: OpenRound[] = [...rounds.entries()]
     .filter(([, r]) => !r.completed && r.buyCount > 0)
     .filter(([rid, r]) => prefixActivity.get(rid.split('-')[0]) === r.lastActivityAt)
-    .map(([rid, r]) => ({
-      roundId: rid,
-      symbol: r.symbol,
-      lastBuyAt: r.lastBuyAt ?? r.openedAt,
-      sellPrice: sellByRound.get(rid) ?? null,
-      buyCount: r.buyCount,
-      totalCost: r.prevAccCost,
-      avgBuyPrice: r.spendSum > 0 ? r.costSum / r.spendSum : null,
-      lastBuyPrice: r.lastBuyPrice,
-      topupCount: r.topups,
-    }))
+    .map(([rid, r]) => {
+      const place = placeByRound.get(rid);
+      const cancelTs = sellCancelByRound.get(rid);
+      const sellLive = place != null && (cancelTs == null || cancelTs <= place.ts);
+      return {
+        roundId: rid,
+        symbol: r.symbol,
+        lastBuyAt: r.lastBuyAt ?? r.openedAt,
+        sellPrice: place?.price ?? null,
+        sellQty: place?.qty ?? null,
+        sellPlacedAt: place?.ts ?? null,
+        sellLive,
+        buyCount: r.buyCount,
+        totalCost: r.prevAccCost,
+        avgBuyPrice: r.spendSum > 0 ? r.costSum / r.spendSum : null,
+        lastBuyPrice: r.lastBuyPrice,
+        topupCount: r.topups,
+      };
+    })
     .sort((a, b) => a.lastBuyAt.localeCompare(b.lastBuyAt));
 
   return {
     days, totalProfit, todayProfit, todayRounds, completedRounds,
-    latestObs, openRounds, crashes: [...crashes.values()], topupCount,
+    latestObs, latestPrices, openRounds, crashes: [...crashes.values()], topupCount,
     zeroToday: todayProfit === 0,
   };
 }
@@ -281,6 +323,68 @@ export function renderDaily(facts: AccountFacts, account: LpAccountConfig, now: 
   } else {
     lines.push(`状态：正常运作中，今天完成 ${facts.todayRounds} 轮买卖`);
   }
+  lines.push(`数据时间：${obsTime}`);
+  return lines.join('\n');
+}
+
+// ============ 挂单详情（g 命令）============
+
+/** 持仓数量：大数量取整、中等两位小数、小数量四位小数（BTC 0.2733 / ETH 9.12），去掉尾零 */
+function fmtQty(n: number): string {
+  const s = n >= 100 ? n.toFixed(0) : n >= 1 ? n.toFixed(2) : n.toFixed(4);
+  return s.replace(/\.?0+$/, '');
+}
+
+/**
+ * 挂单详情：LP 视角的当前持仓与卖单一览 —— 卖单价、预计收益、距离成交还差多少。
+ * 设计目标：缓解"卡单焦虑"——让 LP 看到"挂着单、等着价、成交能赚多少"。
+ */
+export function renderOpenOrders(facts: AccountFacts, account: LpAccountConfig, now: Date): string {
+  const lines = [
+    `【挂单详情】${account.label}`,
+    '━━━━━━━━━━━━━━━',
+  ];
+
+  if (facts.openRounds.length === 0) {
+    lines.push('当前没有持仓，全部资金在场外待命');
+    lines.push('下一波回调程序会自动开始接货。');
+  }
+
+  for (const r of facts.openRounds) {
+    const sym = shortSymbol(r.symbol);
+    lines.push(`◆ ${sym} 持仓`);
+    if (r.sellPrice != null && r.sellLive) {
+      const qtyPart = r.sellQty != null ? `（${fmtQty(r.sellQty)} 个）` : '';
+      lines.push(`· 挂卖价：$${money(r.sellPrice)}${qtyPart}`);
+    } else if (r.sellPrice != null && !r.sellLive) {
+      lines.push('· 卖单：程序正在调整中（暂时撤下），会尽快重新挂出');
+    }
+    const costParts: string[] = [];
+    if (r.totalCost != null && Number.isFinite(r.totalCost)) costParts.push(`已投入 $${money(r.totalCost)}`);
+    costParts.push(`分 ${r.buyCount} 笔买入`);
+    if (r.avgBuyPrice != null) costParts.push(`均价 $${money(r.avgBuyPrice)}`);
+    lines.push(`· ${costParts.join('，')}`);
+
+    // 距离成交：用最新快照推算的市价对比挂卖价
+    const price = facts.latestPrices[sym];
+    if (r.sellPrice != null && r.sellLive && price != null && price > 0) {
+      const gapPct = ((r.sellPrice - price) / price) * 100;
+      if (gapPct <= 0.05) {
+        lines.push('· 价格已到成交区间，正在排队成交');
+      } else {
+        lines.push(`· 最新价 $${money(price)}，再涨 ${gapPct.toFixed(1)}% 自动成交`);
+      }
+    }
+    // 成交后预计收益 = 卖单总额 - 已投入（不含手续费，属估算）；只在卖单确实挂着时才报
+    if (r.sellPrice != null && r.sellQty != null && r.sellLive && r.totalCost != null && Number.isFinite(r.totalCost)) {
+      const est = r.sellPrice * r.sellQty - r.totalCost;
+      if (est > 0) lines.push(`· 成交后预计赚：+$${money(est)}`);
+    }
+    if (r.topupCount > 0) lines.push(`· 已动用备用金 ${r.topupCount} 次（策略允许的安全机制）`);
+    lines.push('━━━━━━━━━━━━━━━');
+  }
+
+  const obsTime = facts.latestObs ? beijingTimeOf(facts.latestObs.t).slice(5) : beijingTimeOf(now.toISOString()).slice(5);
   lines.push(`数据时间：${obsTime}`);
   return lines.join('\n');
 }
