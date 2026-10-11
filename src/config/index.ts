@@ -79,7 +79,19 @@ export interface AppConfig {
   bot: BotConfig | null;
   /** null = 未配置 LP 报告（不写 lp 段 = 功能关闭） */
   lp: { accounts: LpAccountConfig[] } | null;
+  /** null = 未配置 web 看板（不写 web 段 = 功能关闭：不聚合 summary.json、不起静态服务） */
+  web: WebConfig | null;
   rootDir: string;
+}
+
+/** web 看板：聚合 summary.json + 内置只读静态服务（`web/` 子工程构建产物） */
+export interface WebConfig {
+  enabled: boolean;
+  /** 静态服务监听地址（看板含账户权益数据，公网暴露请自行评估风险） */
+  host: string;
+  port: number;
+  /** 聚合产物路径（默认 web/dist/data/summary.json，正好被静态服务挂在 /data/ 下） */
+  summaryOut: string;
 }
 
 export class ConfigError extends Error {
@@ -279,6 +291,25 @@ export function parseConfig(raw: unknown, opts: { rootDir: string }): ParseResul
     }
   }
 
+  // ---- web（可选；不写 web 段 = 看板功能关闭）----
+  let web: WebConfig | null = null;
+  const webRaw = isObject(raw.web) ? raw.web : null;
+  if (webRaw && bool(webRaw.enabled, true)) {
+    const host = str(webRaw.host, '127.0.0.1');
+    const port = num(webRaw.port, 0);
+    const summaryOut = str(webRaw.summaryOut, 'web/dist/data/summary.json');
+    if (!/^[\d.]+$/.test(host) && host !== 'localhost') {
+      problems.push('web.host 必须是 IP 或 localhost');
+    }
+    if (!(port >= 1 && port <= 65535)) problems.push('web.port 必须在 1~65535 之间');
+    web = {
+      enabled: true,
+      host,
+      port,
+      summaryOut: path.resolve(opts.rootDir, summaryOut),
+    };
+  }
+
   if (problems.length > 0) throw new ConfigError(problems);
 
   return {
@@ -295,6 +326,7 @@ export function parseConfig(raw: unknown, opts: { rootDir: string }): ParseResul
       report,
       bot,
       lp,
+      web,
       rootDir: opts.rootDir,
     },
     warnings,

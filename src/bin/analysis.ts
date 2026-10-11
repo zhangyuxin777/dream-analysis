@@ -31,6 +31,7 @@ import { loadState, listLocalShards } from '../sync/state';
 import { readShard } from '../ndjson/shard';
 import { parseShardKey } from '../ndjson/types';
 import { createAnalysisRegistry } from '../analysis';
+import { EventSourceLike } from '../analysis/types';
 import { parseAnalyzeCommand } from '../analysis/args';
 import { AnalysisRunError, runAnalysis } from '../analysis/runner';
 import { WindowParseError, WindowTooLongError } from '../common/time';
@@ -40,6 +41,8 @@ import { CommandRouter } from '../bot/router';
 import { isConnection } from '../analysis/events';
 import { LocalEventSource } from '../store/eventSource';
 import { LpReporter } from '../lp/lpReporter';
+import { aggregateDashboard } from '../dashboard/aggregator';
+import { createStaticServer, StaticServer } from '../web/staticServer';
 
 const ROOT_DIR = path.resolve(__dirname, '..', '..');
 
@@ -64,6 +67,42 @@ export interface CommandContext {
 
 export function buildContext(config: AppConfig, logger: ILogger): CommandContext {
   return { config, logger, store: buildStore(config) };
+}
+
+/**
+ * 事件源工厂：每次调用都拿**当时最新**水位线（分片清单是 sync-state.json 的快照，
+ * 冻结一次之后新拉的天分片就永远不可见 —— 2026-10-11 实盘踩坑同款）。
+ * lp 调试、dashboard 聚合、机器人指令共用这一个工厂，谁也不许自建冻结副本。
+ */
+export function createEventSourceOf(config: AppConfig): EventSourceLike {
+  const { state } = loadState(statePathOf(config));
+  return new LocalEventSource({
+    dataDir: config.runtime.dataDir,
+    prefix: config.oss.prefix,
+    state,
+    countIncludesHeader: config.sync.countIncludesHeader,
+  });
+}
+
+/**
+ * dashboard 聚合：全量事件 → summary.json。只写文件、不推送（无任何推送副作用，比 lp 调试还安全）。
+ * 常驻进程在每次 sync 后调用；失败只记日志 —— 看板不该有停掉同步/机器人的权力。
+ */
+export async function writeDashboardSummary(config: AppConfig, logger: ILogger, nowMs: number): Promise<boolean> {
+  if (!config.web) return false;
+  try {
+    const summary = await aggregateDashboard(createEventSourceOf(config), nowMs);
+    fs.mkdirSync(path.dirname(config.web.summaryOut), { recursive: true });
+    fs.writeFileSync(config.web.summaryOut, JSON.stringify(summary, null, 1), 'utf8');
+    logger.info('dashboard summary.json 已刷新', {
+      out: path.relative(config.rootDir, config.web.summaryOut),
+      instances: Object.keys(summary.instances).join(','),
+    });
+    return true;
+  } catch (err) {
+    logger.error('dashboard 聚合失败（不影响同步与机器人）', { detail: err instanceof Error ? err.message : String(err) });
+    return false;
+  }
 }
 
 function buildLogger(config: AppConfig): ILogger {
@@ -133,15 +172,7 @@ export function startLpIfConfigured(
 ): LpReporter | null {
   if (!config.lp || config.lp.accounts.length === 0) return null;
   // 工厂而非实例：常驻进程里事件源必须每次都拿到最新水位线（分片清单是快照，冻结即丢新分片）
-  const createSource = () => {
-    const { state } = loadState(statePathOf(config));
-    return new LocalEventSource({
-      dataDir: config.runtime.dataDir,
-      prefix: config.oss.prefix,
-      state,
-      countIncludesHeader: config.sync.countIncludesHeader,
-    });
-  };
+  const createSource = () => createEventSourceOf(config);
   const lpLogger = logger.child('lp');
   lpLogger.info('LP 报告已配置', { accounts: config.lp.accounts.map((a) => a.instance) });
   return new LpReporter({
@@ -177,6 +208,21 @@ export async function cmdRun(config: AppConfig, logger: ILogger, store: ObjectSt
   // LP 报告（A 节奏 + B 触发）：B 触发挂在每次同步之后；botRef 后绑定（机器人下面才启动）
   const botRef: { bot: DingTalkBot | null } = { bot: null };
   const lpReporter = startLpIfConfigured(config, logger, botRef);
+
+  // web 看板：内置只读静态服务（web/dist）+ 每轮 sync 后刷新 summary.json
+  const webCfg = config.web;
+  const webLogger = logger.child('web');
+  let webServer: StaticServer | null = null;
+  if (webCfg) {
+    const webRoot = path.join(config.rootDir, 'web', 'dist');
+    if (fs.existsSync(path.join(webRoot, 'index.html'))) {
+      webServer = createStaticServer({ rootDir: webRoot, host: webCfg.host, port: webCfg.port, logger: webLogger });
+      webLogger.info('看板静态服务已启动', { address: webServer.address() });
+    } else {
+      webLogger.warn('web/dist 不存在（部署时在 web/ 下 npm run build 并同步到服务器），静态服务未启动');
+    }
+  }
+
   const scheduler = createScheduler({
     intervalMinutes: config.sync.intervalMinutes,
     alignMinute: config.sync.alignMinute,
@@ -188,6 +234,9 @@ export async function cmdRun(config: AppConfig, logger: ILogger, store: ObjectSt
           logger.error('LP 触发判定异常（不影响同步）', { detail: err instanceof Error ? err.message : String(err) });
         });
       }
+      if (webCfg) {
+        await writeDashboardSummary(config, webLogger, Date.now());
+      }
     },
   });
   scheduler.start();
@@ -196,6 +245,11 @@ export async function cmdRun(config: AppConfig, logger: ILogger, store: ObjectSt
   const bot = startBotIfConfigured(config, logger);
   if (bot) botRef.bot = bot;
   lpReporter?.start();
+  if (webCfg && webServer) {
+    // dist 里的样例/旧数据尽快用真实分片覆盖一次（错开启动高峰）
+    const t = setTimeout(() => { void writeDashboardSummary(config, webLogger, Date.now()); }, 15_000);
+    if (typeof t.unref === 'function') t.unref();
+  }
   await scheduler.triggerNow();
 
   // 保活：调度器的定时器是 unref 的（它不该单独决定进程生死），这里显式持有一个常驻句柄
@@ -205,6 +259,7 @@ export async function cmdRun(config: AppConfig, logger: ILogger, store: ObjectSt
     scheduler.stop();
     lpReporter?.stop();
     bot?.close?.();
+    void webServer?.close();
     clearInterval(keepAlive);
     process.exit(0);
   };
@@ -401,15 +456,7 @@ export async function cmdLp(config: AppConfig, logger: ILogger, sub: string, arg
   }
   const instanceArg = args[0];
   const sendFlag = args.includes('--send');
-  const createSource = () => {
-    const { state } = loadState(statePathOf(config));
-    return new LocalEventSource({
-      dataDir: config.runtime.dataDir,
-      prefix: config.oss.prefix,
-      state,
-      countIncludesHeader: config.sync.countIncludesHeader,
-    });
-  };
+  const createSource = () => createEventSourceOf(config);
   const sentLog: Array<{ cid: string; text: string }> = [];
   // --send：真发（走企业机器人 sendGroupMessage）；不带则只渲染
   let bot: DingTalkBot | null = null;
@@ -455,6 +502,24 @@ export async function cmdLp(config: AppConfig, logger: ILogger, sub: string, arg
   }
   console.error(`未知 lp 子命令: ${sub}（支持 daily / triggers）`);
   return 1;
+}
+
+/** dashboard 调试：渲染 summary.json 到 web.summaryOut 或 --out 指定路径。只写文件不推送。 */
+export async function cmdDashboard(config: AppConfig, args: string[]): Promise<number> {
+  const outIdx = args.indexOf('--out');
+  const target = outIdx >= 0 && args[outIdx + 1] ? path.resolve(args[outIdx + 1]) : config.web?.summaryOut;
+  if (!target) {
+    console.error('未配置 web 段且未指定 --out；用法: dashboard [--out <路径>]');
+    return 1;
+  }
+  const summary = await aggregateDashboard(createEventSourceOf(config), Date.now());
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.writeFileSync(target, JSON.stringify(summary, null, 1), 'utf8');
+  console.log(`written: ${target}`);
+  for (const [inst, s] of Object.entries(summary.instances)) {
+    console.log(inst, JSON.stringify(s.stats));
+  }
+  return 0;
 }
 
 export function cmdAnalyses(): number {
@@ -506,6 +571,8 @@ function usage(): void {
   analyses           列出可用分析器（含参数说明）
   analyze <名字> [symbol] [window] [instance] [top=N]
                      跑一次分析并打印报告（长得像窗口的裸参数一律当 window）
+  dashboard [--out <路径>]
+                     渲染看板 summary.json（只写文件不推送；缺省写 web.summaryOut）
   help               本说明
 `);
 }
@@ -550,6 +617,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
       return cmdVerify(buildContext(config, logger), argv[1] ?? '');
     case 'analyses':
       return cmdAnalyses();
+    case 'dashboard':
+      return cmdDashboard(config, argv.slice(1));
     case 'lp':
       return cmdLp(config, logger, argv[1] ?? 'daily', argv.slice(2));
     case 'analyze': {
