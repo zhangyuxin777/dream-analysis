@@ -357,3 +357,29 @@ test('collectFacts：从假事件源聚合（总利润/今天/未收口轮/最�
   assert.equal(f.topupCount, 1);
   assert.equal(f.zeroToday, true);
 });
+
+// 2026-10-11 实盘踩坑回归：常驻器若持有固定事件源实例，水位线快照就被冻结，
+// 之后新同步的天分片永远不可见（日报"数据只到昨天 23 点"）。必须每次任务重建。
+test('常驻器：每次渲染/触发判定都通过 createSource 重建事件源（不冻结快照）', async () => {
+  const fs = require('fs');
+  const os = require('os');
+  const path = require('path');
+  const { LpReporter } = require('../../../dist/lp/lpReporter');
+
+  let builds = 0;
+  const emptySource = {
+    availableDays: () => [],
+    scan: async () => undefined,
+  };
+  const reporter = new LpReporter({
+    configLp: { accounts: [ACCOUNT] },
+    createSource: () => { builds += 1; return emptySource; },
+    stateDir: fs.mkdtempSync(path.join(os.tmpdir(), 'lpreporter-test-')),
+    send: async () => true,
+    logger: { debug() {}, info() {}, warn() {}, error() {} },
+    now: () => NOW,
+  });
+  await reporter.runTriggers(); // 无数据 → 跳过推送，但事件源必须已经重建
+  await reporter.runDaily();
+  assert.equal(builds, 2, `两次任务必须各自重建事件源（实际 ${builds} 次）`);
+});

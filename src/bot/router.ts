@@ -35,25 +35,28 @@ export interface RouterDeps {
 
 export class CommandRouter {
   private now: () => Date;
-  private source: EventSourceLike | null;
 
   constructor(private readonly deps: RouterDeps) {
     if (!deps.config.bot) throw new Error('未配置 bot（config.bot 为空时不该创建 router）');
     this.now = deps.now ?? (() => new Date());
-    this.source = deps.source ?? null;
   }
 
+  /**
+   * 每条消息重建事件源：**不能缓存**。
+   * 分片清单来自 sync-state.json 的快照 —— 常驻进程里缓存一次，之后新拉的
+   * 天分片就永远不在清单里（2026-10-11 实盘踩坑：机器人报告"数据只到昨天 23 点"）。
+   * 成本 = 读一个 JSON，每条消息一次，可忽略。
+   */
   private buildSource(): EventSourceLike {
-    if (this.source) return this.source;
+    if (this.deps.source) return this.deps.source;
     const { config } = this.deps;
     const { state } = loadState(statePathOf(config));
-    this.source = new LocalEventSource({
+    return new LocalEventSource({
       dataDir: config.runtime.dataDir,
       prefix: config.oss.prefix,
       state,
       countIncludesHeader: config.sync.countIncludesHeader,
     });
-    return this.source;
   }
 
   async handle(msg: IncomingMessage): Promise<string> {

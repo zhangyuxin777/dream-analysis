@@ -132,18 +132,21 @@ export function startLpIfConfigured(
   botRef: { bot: DingTalkBot | null },
 ): LpReporter | null {
   if (!config.lp || config.lp.accounts.length === 0) return null;
-  const { state } = loadState(statePathOf(config));
-  const source = new LocalEventSource({
-    dataDir: config.runtime.dataDir,
-    prefix: config.oss.prefix,
-    state,
-    countIncludesHeader: config.sync.countIncludesHeader,
-  });
+  // 工厂而非实例：常驻进程里事件源必须每次都拿到最新水位线（分片清单是快照，冻结即丢新分片）
+  const createSource = () => {
+    const { state } = loadState(statePathOf(config));
+    return new LocalEventSource({
+      dataDir: config.runtime.dataDir,
+      prefix: config.oss.prefix,
+      state,
+      countIncludesHeader: config.sync.countIncludesHeader,
+    });
+  };
   const lpLogger = logger.child('lp');
   lpLogger.info('LP 报告已配置', { accounts: config.lp.accounts.map((a) => a.instance) });
   return new LpReporter({
     configLp: config.lp,
-    source,
+    createSource,
     stateDir: config.runtime.stateDir,
     send: (conversationId, text) => {
       const bot = botRef.bot;
@@ -398,13 +401,15 @@ export async function cmdLp(config: AppConfig, logger: ILogger, sub: string, arg
   }
   const instanceArg = args[0];
   const sendFlag = args.includes('--send');
-  const { state } = loadState(statePathOf(config));
-  const source = new LocalEventSource({
-    dataDir: config.runtime.dataDir,
-    prefix: config.oss.prefix,
-    state,
-    countIncludesHeader: config.sync.countIncludesHeader,
-  });
+  const createSource = () => {
+    const { state } = loadState(statePathOf(config));
+    return new LocalEventSource({
+      dataDir: config.runtime.dataDir,
+      prefix: config.oss.prefix,
+      state,
+      countIncludesHeader: config.sync.countIncludesHeader,
+    });
+  };
   const sentLog: Array<{ cid: string; text: string }> = [];
   // --send：真发（走企业机器人 sendGroupMessage）；不带则只渲染
   let bot: DingTalkBot | null = null;
@@ -420,7 +425,7 @@ export async function cmdLp(config: AppConfig, logger: ILogger, sub: string, arg
   }
   const reporter = new LpReporter({
     configLp: config.lp,
-    source,
+    createSource,
     stateDir: config.runtime.stateDir,
     send: async (cid, text) => {
       if (!bot) { sentLog.push({ cid, text }); return false; }

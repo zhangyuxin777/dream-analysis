@@ -155,6 +155,30 @@ test('r：中文"报告"也算（老人记不住字母时可用）', async () =>
   assert.ok(text.includes('【日报】'));
 });
 
+// 2026-10-11 实盘踩坑回归：常驻进程的 router 缓存了启动时的水位线快照，
+// 当天新同步的分片不在清单里 ⇒ 机器人报告永远"数据只到昨天"。必须每条消息重建事件源。
+const DAY2_EVENTS = [
+  { ts: '2026-10-02T08:00:00.000Z', event: 'NEW_ROUND', symbol: 'ETHFDUSD', roundId: 'R002', localDate: '2026-10-02', seq: 1, data: {} },
+  { ts: '2026-10-02T08:30:00.000Z', event: 'BUY_FILLED', symbol: 'ETHFDUSD', roundId: 'R002', localDate: '2026-10-02', seq: 2, data: { buyPrice: 2700, accCost: 500 } },
+  { ts: '2026-10-02T09:00:00.000Z', event: 'ROUND_COMPLETED', symbol: 'ETHFDUSD', roundId: 'R002', localDate: '2026-10-02', seq: 3, data: { profit: 2.5, durationHours: 1 } },
+  { ts: '2026-10-02T11:00:00.000Z', event: 'ACCOUNT_OBSERVED', symbol: '__account__', localDate: '2026-10-02', seq: 4, data: { totalValue: 100002.5, balances: [{ asset: 'FDUSD', qtyFree: 99999 }] } },
+];
+
+test('r：不冻结水位线 —— 新同步进来的分片下一条消息必须可见', async () => {
+  const env = makeEnv();
+  installShard(env.config, 'boye888', '2026-10-01', ROUND_EVENTS);
+  const router = makeRouter(env);
+  const first = await router.handle(msg('r'));
+  assert.ok(first.includes('累计收益：+$1.60'), `首日报告：\n${first}`);
+  assert.ok(first.includes('运行：第 1 天'), `首日报告：\n${first}`);
+  // 模拟"常驻进程运行中，第二天的分片同步进来了"
+  installShard(env.config, 'boye888', '2026-10-02', DAY2_EVENTS);
+  const second = await router.handle(msg('r'));
+  assert.ok(second.includes('运行：第 2 天'), `第二次报告必须看到新分片：\n${second}`);
+  assert.ok(second.includes('数据时间：10/02 19:00'), `第二次报告必须用新分片的观测时间：\n${second}`);
+  assert.ok(second.includes('今日收益：+$2.50'), `第二次报告必须计入新分片利润：\n${second}`);
+});
+
 test('r：还没有数据 → 友好提示', async () => {
   const env = makeEnv();
   const router = makeRouter(env);

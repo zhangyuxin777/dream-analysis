@@ -550,7 +550,12 @@ export function evaluateTriggers(
 
 export interface LpReporterDeps {
   configLp: { accounts: LpAccountConfig[] };
-  source: EventSourceLike;
+  /**
+   * 每次渲染/触发判定时调用，拿到**当时最新**水位线的事件源。
+   * 不能传固定实例：分片清单是 sync-state.json 的快照，常驻进程里冻结一次，
+   * 之后新拉的天分片就永远不可见（2026-10-11 实盘踩坑：日报"数据只到昨天 23 点"）。
+   */
+  createSource: () => EventSourceLike;
   stateDir: string;
   /** 推送通道（钉钉 sendGroupMessage 或测试桩） */
   send: (conversationId: string, text: string) => Promise<boolean>;
@@ -595,7 +600,7 @@ export class LpReporter {
         this.deps.logger.debug('LP 日报今天已发过，跳过', { instance: account.instance });
         continue;
       }
-      const facts = await collectFacts(this.deps.source, account, this.now());
+      const facts = await collectFacts(this.deps.createSource(), account, this.now());
       if (facts.days.length === 0) {
         this.deps.logger.warn('LP 日报跳过：无本地数据', { instance: account.instance });
         continue;
@@ -619,7 +624,7 @@ export class LpReporter {
     const results: Array<{ account: string; hits: TriggerHit[] }> = [];
     for (const account of this.deps.configLp.accounts) {
       this.deps.logger.info('LP 触发判定开始', { instance: account.instance });
-      const facts = await collectFacts(this.deps.source, account, this.now());
+      const facts = await collectFacts(this.deps.createSource(), account, this.now());
       if (facts.days.length === 0) continue;
       const { hits, next } = evaluateTriggers(facts, account, this.now(), this.state.checks[account.instance]);
       this.state.checks[account.instance] = next;
