@@ -67,7 +67,7 @@ pm2 restart dream-analysis
       "instance": "boye888",          // OSS 里的实例名
       "label": "你的账户（10 万 U）",  // 报告抬头
       "principal": 100000,            // 本金（算累计收益用）
-      "conversationId": "cidXXX==",   // 钉钉群 ID，群里发 whoami 获取
+      "conversationId": "cidXXX==",   // 钉钉群 ID（一次性配置，找管理员要）
       "dailyHour": 21, "dailyMinute": 7,  // 日报发送时刻（北京时间）
       "dayProfitAlertPct": 0.3,       // 单日已实现 ≥ 本金 0.3% 时发"行情馈赠"通知
       "stuckAlertHours": 24           // 持仓超 N 小时未卖出发通知
@@ -82,8 +82,10 @@ pm2 restart dream-analysis
 
 | 类型 | 频率 | 说明 |
 |---|---|---|
-| 日报 | 每天 Beijing 21:07 | 每个账户一条，去重状态在 `runtime/lp-reporter-state.json` |
+| 日报 | 每天 Beijing 21:07 | 每个账户一条，去重状态在 `runtime/lp-reporter-state.json`；**末尾附看板"详情链接"**（`web.publicUrl`，LP 点进去看报告/挂单明细） |
 | 异常通知（B 触发） | 实时 | 三种：急跌已退出（48h 内）、持仓超时未卖出、单日超额收益；同一事件只推一次 |
+
+> 机器人**不响应任何群指令**（`r`/`o` 已随交互层移除，2026-10-12）：它是纯推送通道，LP 的交互入口只有 web 看板。
 
 ## 常见问题
 

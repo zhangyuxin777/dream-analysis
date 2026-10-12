@@ -5,7 +5,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { renderDaily, renderOpenOrders, evaluateTriggers, collectFacts } = require('../../../dist/lp/lpReporter');
+const { renderDaily, evaluateTriggers, collectFacts } = require('../../../dist/lp/lpReporter');
 
 const ACCOUNT = {
   instance: 'boye888',
@@ -28,7 +28,6 @@ function facts(over = {}) {
     todayRounds: 25,
     completedRounds: 25,
     latestObs: { t: '2026-10-07T12:00:00.000Z', total: 100137.02, fdusdFree: 94444 },
-    latestPrices: {},
     openRounds: [],
     crashes: [],
     topupCount: 0,
@@ -45,6 +44,30 @@ test('日报：正常日渲染（含数据时间，无"无需任何操作"）', 
   assert.ok(text.includes('正常运作中，今天完成 25 轮买卖'));
   assert.ok(text.includes('数据时间：'));
   assert.ok(!text.includes('无需任何操作'));
+});
+
+test('日报：当前年化 = 累计收益率直线外推（÷运行天数×365），负值也带符号', () => {
+  const up = renderDaily(facts(), ACCOUNT, NOW);
+  // 累计 +137.02（+0.13702%），1 天 ⇒ ×365 = +50.0%
+  assert.ok(up.includes('｜ 运行：第 1 天 ｜ 当前年化：+50.0%'), up);
+
+  const down = renderDaily(
+    facts({ latestObs: { t: '2026-10-07T12:00:00.000Z', total: 99969.02, fdusdFree: 94444 } }),
+    ACCOUNT, NOW,
+  );
+  // 累计 -30.98（-0.03098%），1 天 ⇒ -11.3%
+  assert.ok(down.includes('当前年化：-11.3%'), down);
+  assert.ok(!down.includes('+$-'));
+  assert.ok(!down.includes('+-'));
+});
+
+test('日报：详情 —— 配了 dashboardUrl 放最后一行，没配不附', () => {
+  const withUrl = renderDaily(facts(), ACCOUNT, NOW, { dashboardUrl: 'https://dash.example.com' });
+  assert.ok(withUrl.includes('详情：https://dash.example.com'));
+  assert.ok(withUrl.trimEnd().endsWith('详情：https://dash.example.com'), '链接必须是最后一行');
+
+  const without = renderDaily(facts(), ACCOUNT, NOW);
+  assert.ok(!without.includes('详情：'), '没配 publicUrl 时日报不应出现链接');
 });
 
 test('日报：零盈利日状态行不同', () => {
@@ -212,47 +235,7 @@ test('collectFacts：重启恢复的残影轮不算未平仓（只认同轮号�
   assert.equal(f.totalProfit, 4.0);
 });
 
-test('挂单详情：正常持仓 —— 卖单价/数量/距离/预计收益齐全', () => {
-  const f = facts({
-    latestObs: { t: '2026-10-08T22:00:02Z', total: 97994.07, fdusdFree: 49340 },
-    latestPrices: { ETH: 2485.1, BTC: 81886.3 },
-    openRounds: [{
-      roundId: 'R059-231427', symbol: 'ETHFDUSD', lastBuyAt: '2026-10-07T02:01:18Z',
-      sellPrice: 2655.09, sellQty: 9.1248, sellPlacedAt: '2026-10-08T02:02:16Z', sellLive: true,
-      buyCount: 30, totalCost: 24189.95, avgBuyPrice: 2652.1, lastBuyPrice: 2609.1, topupCount: 0,
-    }],
-  });
-  const text = renderOpenOrders(f, ACCOUNT, NOW);
-  assert.ok(text.includes('【挂单详情】你的账户（10 万 U）'));
-  assert.ok(text.includes('◆ ETH 持仓'));
-  assert.ok(text.includes('挂卖价：$2,655.09（9.12 个）'));
-  assert.ok(text.includes('已投入 $24,189.95，分 30 笔买入，均价 $2,652.10'));
-  assert.ok(text.includes('最新价 $2,485.10，再涨 6.8% 自动成交'));
-  assert.ok(text.includes('成交后预计赚：+$37.22')); // 2655.09×9.1248 − 24189.95 ≈ 37.22
-  assert.ok(text.includes('数据时间：'));
-});
-
-test('挂单详情：无持仓 —— 资金待命口径', () => {
-  const text = renderOpenOrders(facts({ openRounds: [] }), ACCOUNT, NOW);
-  assert.ok(text.includes('当前没有持仓，全部资金在场外待命'));
-  assert.ok(!text.includes('◆'));
-});
-
-test('挂单详情：卖单被撤未重挂 —— 说"调整中"不报预计收益', () => {
-  const f = facts({
-    openRounds: [{
-      roundId: 'R1', symbol: 'BTCFDUSD', lastBuyAt: '2026-10-08T04:00:00Z',
-      sellPrice: 84385.07, sellQty: 0.27328, sellPlacedAt: '2026-10-08T15:37:57Z', sellLive: false,
-      buyCount: 5, totalCost: 22300, avgBuyPrice: 81500, lastBuyPrice: 81000, topupCount: 0,
-    }],
-  });
-  const text = renderOpenOrders(f, ACCOUNT, NOW);
-  assert.ok(text.includes('程序正在调整中（暂时撤下）'));
-  assert.ok(!text.includes('成交后预计赚'));
-  assert.ok(!text.includes('再涨'));
-});
-
-test('collectFacts：挂单详情 —— 两种 PROFIT 格式都认，撤销后未重挂 = 卖单不在市', async () => {
+test('collectFacts：挂单解析 —— 两种 PROFIT 格式都认，撤销后未重挂 = 卖单不在市', async () => {
   const evs = [
     { ts: '2026-10-07T02:00:00Z', event: 'NEW_ROUND', symbol: 'ETHFDUSD', roundId: 'R1', data: {} },
     { ts: '2026-10-07T02:01:00Z', event: 'BUY_FILLED', symbol: 'ETHFDUSD', roundId: 'R1', data: { buyPrice: 2600, accCost: 1000 } },
@@ -264,8 +247,6 @@ test('collectFacts：挂单详情 —— 两种 PROFIT 格式都认，撤销后�
     { ts: '2026-10-07T03:02:00Z', event: 'PROFIT_PLACE_PARAMS', symbol: 'BTCFDUSD', roundId: 'R2', data: { price: 84500.1, quantity: 0.0238, side: 'SELL' } },
     // 新挂的卖单 1 秒后被撤（side=SELL 的 ORDER_CANCELED），且没有重挂
     { ts: '2026-10-07T03:02:01Z', event: 'ORDER_CANCELED', symbol: 'BTCFDUSD', roundId: 'R2', data: { orderInfo: '{"c":"x","S":"SELL","q":"0.02380000","p":"84500.10000000"}' } },
-    // 快照给市价
-    { ts: '2026-10-07T04:00:02Z', event: 'ACCOUNT_OBSERVED', symbol: '__account__', data: { totalValue: 99000, balances: [{ asset: 'ETH', qtyFree: 0, qtyLocked: 0.38, value: 944.06 }, { asset: 'FDUSD', qtyFree: 97000 }] } },
   ];
   const fakeSource = {
     availableDays: () => ['2026-10-07'],
@@ -280,7 +261,6 @@ test('collectFacts：挂单详情 —— 两种 PROFIT 格式都认，撤销后�
   const btc = f.openRounds.find((r) => r.symbol === 'BTCFDUSD');
   assert.equal(btc.sellPrice, 84500.1); // 新格式直接字段
   assert.equal(btc.sellLive, false); // 撤销晚于挂出 → 不在市
-  assert.ok(Math.abs(f.latestPrices.ETH - 944.06 / 0.38) < 0.01);
 });
 
 test('collectFacts：重启恢复接管后仍未平仓 —— 仓位必须还在（2026-10-09 实盘踩坑回归）', async () => {

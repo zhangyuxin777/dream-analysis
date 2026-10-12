@@ -6,6 +6,8 @@
  * - 收益口径 = 已实现网格利润（ΣROUND_COMPLETED.profit），与实盘业绩记录一致
  * - 坏消息抢在 LP 发现之前说；没事绝不打扰
  * - "无需任何操作"是默认假设，消息里不写
+ * - 机器人**只推送不交互**：LP 想看挂单/明细，点日报末尾的看板"详情链接"（web.publicUrl），
+ *   不保留任何群里查询指令 —— 交互入口只留看板一个，免得两处口径漂移
  *
  * 触发状态持久化在 stateDir/lp-reporter-state.json，重启/重复同步不重复推送。
  */
@@ -28,8 +30,6 @@ export interface AccountFacts {
   completedRounds: number;
   /** 最新账户估值快照 */
   latestObs: { t: string; total: number; fdusdFree: number } | null;
-  /** 各币种最新市价（由最新 ACCOUNT_OBSERVED 的 balances value/qty 推算） */
-  latestPrices: Record<string, number>;
   /** 未收口且已建仓的轮（可能跨多天） */
   openRounds: OpenRound[];
   /** 深跌事件（含退出信息，若窗口内有） */
@@ -102,7 +102,6 @@ export async function collectFacts(
   let todayRounds = 0;
   let completedRounds = 0;
   let latestObs: AccountFacts['latestObs'] = null;
-  const latestPrices: Record<string, number> = {};
   const crashes = new Map<string, CrashInfo>();
   let topupCount = 0;
   // 当前挂卖单：每轮取最新一次 PROFIT_PLACE_PARAMS（日志里出现过两种格式：
@@ -157,14 +156,6 @@ export async function collectFacts(
       const fdusdFree = Number(balances.find((b) => b.asset === 'FDUSD')?.qtyFree ?? NaN);
       if (Number.isFinite(total) && Number.isFinite(fdusdFree)) {
         latestObs = { t: e.ts, total, fdusdFree };
-      }
-      // 顺手从快照余额推算各币种市价（value / 总持仓量），给挂单详情的"还差多少"用
-      for (const b of balances) {
-        const qty = Number((b as { qtyFree?: number; qtyLocked?: number }).qtyFree ?? 0) + Number((b as { qtyLocked?: number }).qtyLocked ?? 0);
-        const value = Number((b as { value?: number }).value ?? NaN);
-        if (Number.isFinite(qty) && qty > 0 && Number.isFinite(value) && value > 0) {
-          latestPrices[b.asset] = value / qty;
-        }
       }
     } else if (ev === 'PROFIT_PLACE_PARAMS' && rid) {
       // 新格式：price/quantity 直接在 data 上；老格式：data.params 是 JSON 字符串
@@ -272,7 +263,7 @@ export async function collectFacts(
 
   return {
     days, totalProfit, todayProfit, todayRounds, completedRounds,
-    latestObs, latestPrices, openRounds, crashes: [...crashes.values()], topupCount,
+    latestObs, openRounds, crashes: [...crashes.values()], topupCount,
     zeroToday: todayProfit === 0,
   };
 }
@@ -306,12 +297,21 @@ function shortSymbol(symbol: string): string {
 // ============ A 节奏：日报渲染 ============
 
 /** LP 日报（格式与 dream/docs 里 LP 确认的模板一致） */
-export function renderDaily(facts: AccountFacts, account: LpAccountConfig, now: Date): string {
+export function renderDaily(
+  facts: AccountFacts,
+  account: LpAccountConfig,
+  now: Date,
+  opts?: { dashboardUrl?: string },
+): string {
   // 累计收益用权益口径（估值-本金），与"账户估值"一行自洽；LP 视角"我的钱现在值多少"优先于会计口径
   const valuation = facts.latestObs ? facts.latestObs.total : account.principal + facts.totalProfit;
   const cum = valuation - account.principal;
   const cumPct = (cum / account.principal) * 100;
-  const dayLabel = `第 ${Math.max(1, facts.days.length)} 天`;
+  const dayCount = Math.max(1, facts.days.length);
+  const dayLabel = `第 ${dayCount} 天`;
+  // 当前年化：直线单利外推（累计收益率 ÷ 运行天数 × 365）。运行初期数字会很大/很抖，
+  // 只作"当前节奏的标尺"，不是承诺 —— 所以 LP 确认的模板里它紧跟"运行：第 N 天"
+  const annPct = (cumPct / dayCount) * 365;
   const obsTime = facts.latestObs ? beijingTimeOf(facts.latestObs.t).slice(5) : beijingTimeOf(now.toISOString()).slice(5);
 
   const lines = [
@@ -319,7 +319,7 @@ export function renderDaily(facts: AccountFacts, account: LpAccountConfig, now: 
     '━━━━━━━━━━━━━━━',
     `今日收益：${facts.todayProfit < 0 ? '-' : '+'}$${money(Math.abs(facts.todayProfit))}`,
     `累计收益：${cum < 0 ? '-' : '+'}$${money(Math.abs(cum))}（${signedPct(cumPct)}）`,
-    `账户估值：$${money(valuation)} ｜ 运行：${dayLabel}`,
+    `账户估值：$${money(valuation)} ｜ 运行：${dayLabel} ｜ 当前年化：${signedPct(annPct, 1)}`,
     '━━━━━━━━━━━━━━━',
   ];
 
@@ -362,68 +362,8 @@ export function renderDaily(facts: AccountFacts, account: LpAccountConfig, now: 
     lines.push(`状态：正常运作中，今天完成 ${facts.todayRounds} 轮买卖`);
   }
   lines.push(`数据时间：${obsTime}`);
-  return lines.join('\n');
-}
-
-// ============ 挂单详情（o 命令）============
-
-/** 持仓数量：大数量取整、中等两位小数、小数量四位小数（BTC 0.2733 / ETH 9.12），去掉尾零 */
-function fmtQty(n: number): string {
-  const s = n >= 100 ? n.toFixed(0) : n >= 1 ? n.toFixed(2) : n.toFixed(4);
-  return s.replace(/\.?0+$/, '');
-}
-
-/**
- * 挂单详情：LP 视角的当前持仓与卖单一览 —— 卖单价、预计收益、距离成交还差多少。
- * 设计目标：缓解"卡单焦虑"——让 LP 看到"挂着单、等着价、成交能赚多少"。
- */
-export function renderOpenOrders(facts: AccountFacts, account: LpAccountConfig, now: Date): string {
-  const lines = [
-    `【挂单详情】${account.label}`,
-    '━━━━━━━━━━━━━━━',
-  ];
-
-  if (facts.openRounds.length === 0) {
-    lines.push('当前没有持仓，全部资金在场外待命');
-    lines.push('下一波回调程序会自动开始接货。');
-  }
-
-  for (const r of facts.openRounds) {
-    const sym = shortSymbol(r.symbol);
-    lines.push(`◆ ${sym} 持仓`);
-    if (r.sellPrice != null && r.sellLive) {
-      const qtyPart = r.sellQty != null ? `（${fmtQty(r.sellQty)} 个）` : '';
-      lines.push(`· 挂卖价：$${money(r.sellPrice)}${qtyPart}`);
-    } else if (r.sellPrice != null && !r.sellLive) {
-      lines.push('· 卖单：程序正在调整中（暂时撤下），会尽快重新挂出');
-    }
-    const costParts: string[] = [];
-    if (r.totalCost != null && Number.isFinite(r.totalCost)) costParts.push(`已投入 $${money(r.totalCost)}`);
-    costParts.push(`分 ${r.buyCount} 笔买入`);
-    if (r.avgBuyPrice != null) costParts.push(`均价 $${money(r.avgBuyPrice)}`);
-    lines.push(`· ${costParts.join('，')}`);
-
-    // 距离成交：用最新快照推算的市价对比挂卖价
-    const price = facts.latestPrices[sym];
-    if (r.sellPrice != null && r.sellLive && price != null && price > 0) {
-      const gapPct = ((r.sellPrice - price) / price) * 100;
-      if (gapPct <= 0.05) {
-        lines.push('· 价格已到成交区间，正在排队成交');
-      } else {
-        lines.push(`· 最新价 $${money(price)}，再涨 ${gapPct.toFixed(1)}% 自动成交`);
-      }
-    }
-    // 成交后预计收益 = 卖单总额 - 已投入（不含手续费，属估算）；只在卖单确实挂着时才报
-    if (r.sellPrice != null && r.sellQty != null && r.sellLive && r.totalCost != null && Number.isFinite(r.totalCost)) {
-      const est = r.sellPrice * r.sellQty - r.totalCost;
-      if (est > 0) lines.push(`· 成交后预计赚：+$${money(est)}`);
-    }
-    if (r.topupCount > 0) lines.push(`· 已动用备用金 ${r.topupCount} 次（策略允许的安全机制）`);
-    lines.push('━━━━━━━━━━━━━━━');
-  }
-
-  const obsTime = facts.latestObs ? beijingTimeOf(facts.latestObs.t).slice(5) : beijingTimeOf(now.toISOString()).slice(5);
-  lines.push(`数据时间：${obsTime}`);
+  // 详情放在最后一行：LP 的交互入口只有看板，群里不再提供查询指令
+  if (opts?.dashboardUrl) lines.push(`详情：${opts.dashboardUrl}`);
   return lines.join('\n');
 }
 
@@ -559,6 +499,11 @@ export interface LpReporterDeps {
   stateDir: string;
   /** 推送通道（钉钉 sendGroupMessage 或测试桩） */
   send: (conversationId: string, text: string) => Promise<boolean>;
+  /**
+   * 看板外网地址（config.web.publicUrl）：日报末尾附"详情链接"给 LP 点去看明细。
+   * 为空/未配 = 日报不附链接（不报错 —— 看板是可选功能）。
+   */
+  dashboardUrl?: string;
   logger: ILogger;
   now?: () => Date;
 }
@@ -605,7 +550,7 @@ export class LpReporter {
         this.deps.logger.warn('LP 日报跳过：无本地数据', { instance: account.instance });
         continue;
       }
-      const text = renderDaily(facts, account, this.now());
+      const text = renderDaily(facts, account, this.now(), { dashboardUrl: this.deps.dashboardUrl });
       let sent = false;
       if (account.conversationId) {
         sent = await this.deps.send(account.conversationId, text);

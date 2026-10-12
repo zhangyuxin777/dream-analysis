@@ -37,7 +37,6 @@ import { AnalysisRunError, runAnalysis } from '../analysis/runner';
 import { WindowParseError, WindowTooLongError } from '../common/time';
 import { buildStatusText } from '../report/status';
 import { DingTalkBot } from '../bot/dingtalk-bot';
-import { CommandRouter } from '../bot/router';
 import { isConnection } from '../analysis/events';
 import { LocalEventSource } from '../store/eventSource';
 import { LpReporter } from '../lp/lpReporter';
@@ -133,12 +132,15 @@ export function verifyTmpPathOf(config: AppConfig, instance: string, date: strin
 
 /**
  * 配了 `bot` 段才启机器人；**任何失败都只记日志**（机器人不该有停掉同步/分析的权力）。
- * 这里同时做三件接线：客户端、指令路由、以及"路由怎么二次回复"（绑到客户端的 replyText）。
+ *
+ * 定位（2026-10-12 定）：机器人是**纯推送通道** —— 只发 LP 日报与异常实时通知，
+ * 不响应任何群指令（@ 它不会有回复）。LP 想看报告/挂单明细，点日报末尾的看板"详情链接"，
+ * 交互入口只留 web 看板一个，免得机器人和看板两处口径漂移。
  */
 export function startBotIfConfigured(config: AppConfig, logger: ILogger): DingTalkBot | null {
   const botCfg = config.bot;
   if (!botCfg) {
-    logger.info('未配置 bot 段 —— 只跑定时同步（要对话请填 env.json 的 bot 段）');
+    logger.info('未配置 bot 段 —— 只跑定时同步（要推送请填 env.json 的 bot 段）');
     return null;
   }
   if (botCfg.type !== 'dingtalk') {
@@ -150,11 +152,6 @@ export function startBotIfConfigured(config: AppConfig, logger: ILogger): DingTa
     { clientId: botCfg.appId, clientSecret: botCfg.appSecret, allowedStaffIds: botCfg.allowedStaffIds },
     botLogger,
   );
-  const router = new CommandRouter({
-    config,
-    logger: botLogger,
-  });
-  bot.setHandler((msg) => router.handle(msg));
   void bot.start().catch((err) => {
     logger.error('机器人启动异常（不影响同步与分析）', { detail: err instanceof Error ? err.message : String(err) });
   });
@@ -179,6 +176,7 @@ export function startLpIfConfigured(
     configLp: config.lp,
     createSource,
     stateDir: config.runtime.stateDir,
+    dashboardUrl: config.web?.publicUrl || undefined,
     send: (conversationId, text) => {
       const bot = botRef.bot;
       if (!bot) {
@@ -474,6 +472,7 @@ export async function cmdLp(config: AppConfig, logger: ILogger, sub: string, arg
     configLp: config.lp,
     createSource,
     stateDir: config.runtime.stateDir,
+    dashboardUrl: config.web?.publicUrl || undefined,
     send: async (cid, text) => {
       if (!bot) { sentLog.push({ cid, text }); return false; }
       return bot.sendGroupMessage(cid, text);

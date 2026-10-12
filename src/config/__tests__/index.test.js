@@ -101,7 +101,7 @@ test('bot：全空 = 不配置；填一半 = 报错；填全 = 生效且空白�
   assert.equal(filled.config.bot.type, 'dingtalk');
   assert.equal(filled.config.bot.adminStaffIds[0], 'u1');
   assert.deepEqual(filled.config.bot.allowedConversationIds, [], '不填群白名单 = 不限制群');
-  assert.ok(filled.warnings.some((w) => w.includes('都能发指令')), filled.warnings.join('|'));
+  assert.ok(filled.warnings.some((w) => w.includes('纯推送通道')), filled.warnings.join('|'));
 });
 
 test('bot.allowedConversationIds：填了要能读到（whoami 取 conversationId 回填）', () => {
@@ -163,4 +163,23 @@ test('bot.allowedStaffIds 里有非字符串 → 报错（不许静默丢弃）'
 test('根节点不是对象 / provider 不支持 → 报错', () => {
   assert.throws(() => parseConfig([], { rootDir: ROOT }), /根节点/);
   assert.throws(() => parseConfig(base({ oss: { ...base().oss, provider: 'ali-oss' } }), { rootDir: ROOT }), /provider/);
+});
+
+test('web：不写 = 关闭；publicUrl 必须是 http(s) 完整地址（尾斜杠归一化）', () => {
+  assert.equal(parseConfig(base(), { rootDir: ROOT }).config.web, null, '不写 web 段 = 看板关闭');
+
+  const noUrl = parseConfig(base({ web: { enabled: true, host: '127.0.0.1', port: 7100 } }), { rootDir: ROOT });
+  assert.equal(noUrl.config.web.publicUrl, '', '不配 publicUrl = 日报不附详情链接（合法）');
+
+  const withUrl = parseConfig(base({ web: { enabled: true, host: '127.0.0.1', port: 7100, publicUrl: 'https://dash.example.com/' } }), { rootDir: ROOT });
+  assert.equal(withUrl.config.web.publicUrl, 'https://dash.example.com', '尾斜杠必须归一化，否则日报链接出现 //');
+
+  assert.throws(
+    () => parseConfig(base({ web: { enabled: true, host: '127.0.0.1', port: 7100, publicUrl: 'dash.example.com' } }), { rootDir: ROOT }),
+    /web\.publicUrl/,
+  );
+  assert.throws(
+    () => parseConfig(base({ web: { enabled: true, host: '127.0.0.1', port: 7100, publicUrl: 'ftp://x.com' } }), { rootDir: ROOT }),
+    /web\.publicUrl/,
+  );
 });

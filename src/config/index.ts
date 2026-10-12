@@ -92,6 +92,11 @@ export interface WebConfig {
   port: number;
   /** 聚合产物路径（默认 web/dist/data/summary.json，正好被静态服务挂在 /data/ 下） */
   summaryOut: string;
+  /**
+   * LP 从钉钉点开看板的外网地址（http(s):// 完整地址，通常经反向代理/frp 暴露）。
+   * 日报末尾的"详情链接"用它；为空 = 日报不附链接（ host:port 是内网监听地址，LP 打不开，不能拿来拼）。
+   */
+  publicUrl: string;
 }
 
 export class ConfigError extends Error {
@@ -232,10 +237,10 @@ export function parseConfig(raw: unknown, opts: { rootDir: string }): ParseResul
       const allowedConversationIds = strArray(botRaw.allowedConversationIds, 'bot.allowedConversationIds', problems);
       const adminStaffIds = strArray(botRaw.adminStaffIds, 'bot.adminStaffIds', problems);
       if (allowedStaffIds.length === 0) {
-        warnings.push('bot.allowedStaffIds 为空 ⇒ **任何人**（含应用所在群里的人）都能发指令；配之前请确认应用只加在可信群里');
+        warnings.push('bot.allowedStaffIds 为空：可留空 —— 机器人是纯推送通道，不响应群指令，没有"谁能发指令"的问题');
       }
       if (adminStaffIds.length === 0) {
-        warnings.push('bot.adminStaffIds 为空 ⇒ 所有人都能触发 sync（只读分析不受影响）');
+        warnings.push('bot.adminStaffIds 为空：可留空 —— 指令时代遗留字段，已无写类指令');
       }
       const notifyRaw = isObject(botRaw.notify) ? botRaw.notify : {};
       bot = {
@@ -302,11 +307,17 @@ export function parseConfig(raw: unknown, opts: { rootDir: string }): ParseResul
       problems.push('web.host 必须是 IP 或 localhost');
     }
     if (!(port >= 1 && port <= 65535)) problems.push('web.port 必须在 1~65535 之间');
+    // 尾斜杠归一化，避免日报链接出现 "…com//" 这种拼接瑕疵
+    const publicUrl = str(webRaw.publicUrl, '').trim().replace(/\/+$/, '');
+    if (publicUrl !== '' && !/^https?:\/\//.test(publicUrl)) {
+      problems.push('web.publicUrl 必须是 http(s):// 开头的完整外网地址（LP 从钉钉点开看板用；不配就留空）');
+    }
     web = {
       enabled: true,
       host,
       port,
       summaryOut: path.resolve(opts.rootDir, summaryOut),
+      publicUrl,
     };
   }
 
