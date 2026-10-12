@@ -21,8 +21,11 @@ export function fmtNum(v: number | null | undefined, digits = 2): string {
 export function fmtHours(h: number | null | undefined): string {
   if (h == null) return '—'
   if (h < 1) return Math.round(h * 60) + ' 分钟'
-  if (h < 48) return h.toFixed(1) + ' 小时'
-  return (h / 24).toFixed(1) + ' 天'
+  if (h < 24) return h.toFixed(1) + ' 小时'
+  // ≥1 天统一「X 天 Y 小时」（2026-10-12 LP 反馈：5.2 天这种小数天数不直观）
+  const d = Math.floor(h / 24)
+  const hr = Math.round(h % 24)
+  return hr > 0 ? `${d} 天 ${hr} 小时` : `${d} 天`
 }
 
 export function fmtDateTime(iso: string | null | undefined): string {

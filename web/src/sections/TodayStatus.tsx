@@ -1,7 +1,7 @@
 import { Card, CardContent } from '@/components/ui/card'
 import { CheckCircle2, PartyPopper, ShieldAlert } from 'lucide-react'
 import type { InstanceData } from '@/types/summary'
-import { coinOf, fmtMoney, fmtNum } from '@/lib/format'
+import { coinOf, fmtHours, fmtMoney } from '@/lib/format'
 
 /**
  * 今日状态：一句话告诉 LP 今天发生了什么。
@@ -30,7 +30,7 @@ export function TodayStatus({ inst }: { inst: InstanceData }) {
   const unstuck = inst.completedRounds.filter((r) => r.t.slice(0, 10) === dayStr && r.hours >= 24)
   for (const r of unstuck.slice(0, 2)) {
     parts.push({
-      text: `被套 ${fmtNum(r.hours)} 小时的 ${coinOf(r.symbol)} 今天解套，落袋 ${fmtMoney(r.profit, true)}`,
+      text: `被套 ${fmtHours(r.hours)} 的 ${coinOf(r.symbol)} 今天解套，落袋 ${fmtMoney(r.profit, true)}`,
       tone: 'good',
     })
   }
