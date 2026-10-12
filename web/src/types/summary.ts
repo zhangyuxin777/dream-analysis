@@ -42,6 +42,8 @@ export interface StuckRound {
   lastPrice: number | null
   floating: number | null
   floatingPct: number | null
+  /** 当前挂卖单价（卖单撤下未重挂时为 null） */
+  sellPrice: number | null
   resets: number
   reductions: number
   crash: boolean

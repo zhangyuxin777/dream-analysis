@@ -33,7 +33,7 @@ export function StuckPanel({ inst }: { inst: InstanceData }) {
                 <TableHead>币种</TableHead>
                 <TableHead className="text-right">加权均价</TableHead>
                 <TableHead className="text-right">最新价</TableHead>
-                <TableHead className="text-right">浮动盈亏</TableHead>
+                <TableHead className="text-right">挂单卖价</TableHead>
                 <TableHead className="text-right">已等待</TableHead>
                 <TableHead className="text-center">状态</TableHead>
               </TableRow>
@@ -44,13 +44,8 @@ export function StuckPanel({ inst }: { inst: InstanceData }) {
                   <TableCell className="font-medium">{coinOf(s.symbol)}</TableCell>
                   <TableCell className="text-right tabular-nums">${fmtNum(s.avgBuy)}</TableCell>
                   <TableCell className="text-right tabular-nums">${fmtNum(s.lastPrice)}</TableCell>
-                  <TableCell
-                    className={`text-right tabular-nums font-medium ${
-                      (s.floating ?? 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'
-                    }`}
-                    title={s.floatingPct != null ? `浮动 ${s.floatingPct}%` : undefined}
-                  >
-                    {s.floating != null ? `${fmtMoney(s.floating, true)} · ${s.floatingPct}%` : '—'}
+                  <TableCell className="text-right tabular-nums font-medium">
+                    {s.sellPrice != null ? `$${fmtNum(s.sellPrice)}` : '调整中'}
                   </TableCell>
                   <TableCell className="text-right tabular-nums text-amber-400" title={`轮次 ${s.roundNo} · 占用 ${fmtMoney(s.accCost)} · 买入时间 ${fmtDateTime(s.since)}${s.reductions > 0 ? ` · 已降档 ${s.reductions} 次` : ''} · 最后事件 ${s.lastEvent}`}>
                     {fmtHours(s.hours)}
@@ -78,7 +73,7 @@ export function StuckPanel({ inst }: { inst: InstanceData }) {
             {inst.stats.lastEquity
               ? ((inst.stuck.reduce((a, b) => a + b.accCost, 0) / inst.stats.lastEquity) * 100).toFixed(0)
               : '—'}
-            % 总权益。解法见评审 P2：对「价格持续远离」的轮次改用反弹分批减仓，先把资金解放回网格。
+            % 总权益。等止盈是网格策略的正常状态。
           </p>
         )}
       </CardContent>

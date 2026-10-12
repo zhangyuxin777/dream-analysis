@@ -26,7 +26,6 @@ function Kpi({ label, value, sub, tone }: { label: string; value: string; sub?: 
 
 export function KpiStrip({ inst }: { inst: InstanceData }) {
   const s = inst.stats
-  const killRate = s.newCount > 0 ? (s.resetKilledCount / s.newCount) * 100 : 0
   const stuckCost = inst.stuck.reduce((a, b) => a + b.accCost, 0)
   const depositSum = inst.deposits.reduce((a, b) => a + b.amount, 0)
   const adjDelta = s.equityDelta != null ? s.equityDelta - depositSum : null
@@ -42,7 +41,7 @@ export function KpiStrip({ inst }: { inst: InstanceData }) {
   const apy = days > 0 && principal > 0 ? (totalPnl / principal / days) * 365 * 100 : null
 
   return (
-    <div className="grid grid-cols-2 md:grid-cols-4 xl:grid-cols-8 gap-3">
+    <div className="grid grid-cols-2 md:grid-cols-4 xl:grid-cols-7 gap-3">
       <Kpi
         label="当前总权益"
         value={fmtMoney(s.lastEquity)}
@@ -69,12 +68,6 @@ export function KpiStrip({ inst }: { inst: InstanceData }) {
         label="轮次吞吐"
         value={`${s.completedCount}/${s.newCount}`}
         sub={`完成 / 新开 · 中位 ${fmtHours(s.medianRoundHours)}`}
-      />
-      <Kpi
-        label="攀涨复位掐死"
-        value={`${s.resetKilledCount} 次`}
-        sub={`占新开轮 ${killRate.toFixed(0)}%`}
-        tone={killRate > 30 ? 'warn' : undefined}
       />
       <Kpi
         label="卡单持仓"

@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Badge } from '@/components/ui/badge'
 import { useSummary } from '@/hooks/useSummary'
+import { TodayStatus } from '@/sections/TodayStatus'
 import { KpiStrip } from '@/sections/KpiStrip'
 import { EquityChart } from '@/sections/EquityChart'
 import { ProfitCalendar } from '@/sections/ProfitCalendar'
@@ -45,6 +46,8 @@ export default function Home() {
             </SelectContent>
           </Select>
         </header>
+
+        <TodayStatus inst={inst} />
 
         <KpiStrip inst={inst} />
 

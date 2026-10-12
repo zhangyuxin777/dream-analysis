@@ -158,3 +158,44 @@ test('aggregateDashboard 跳过 localtest 与点目录', async () => {
   assert.deepEqual(Object.keys(summary.instances).sort(), ['a']);
   assert.equal(summary.timezone, 'Asia/Shanghai');
 });
+
+test('深跌轮口径：段内出现过 CRASH_ENTERED 即算，完成时 isCrashMode=false 也算（2026-10-12 BTC R073 实盘回归）', () => {
+  const events = [
+    ev('2026-10-07T13:38:54Z', 'NEW_ROUND', 'BTCFDUSD', {}, 'R073-230148'),
+    ev('2026-10-07T13:39:00Z', 'BUY_FILLED', 'BTCFDUSD', { buyPrice: 83272, accCost: 500 }, 'R073-230148', 1),
+    ev('2026-10-07T13:38:54Z', 'CRASH_ENTERED', 'BTCFDUSD', { dropPercent: 0.04 }, 'R073-230148', 2),
+    // 策略静默退出深跌：无 CRASH_EXITED，完成时 isCrashMode=false（实盘原样）
+    ev('2026-10-12T05:04:41Z', 'ROUND_COMPLETED', 'BTCFDUSD', {
+      profit: 18.86, durationHours: 85.44, accCost: 23016.19, avgBuyPrice: 84222, sellPrice: 84291.05, isCrashMode: false,
+    }, 'R073-161717-RCV', 3),
+  ];
+  const s = summarizeInstance('a', events.map((e) => ({
+    tsMs: Date.parse(e.ts), seq: e.seq ?? 0, event: e.event, symbol: e.symbol, roundId: e.roundId, data: e.data,
+  })), NOW_MS);
+  assert.equal(s.completedRounds.length, 1);
+  assert.equal(s.completedRounds[0].isCrash, true, '段内有 CRASH_ENTERED 的完成轮必须算深跌轮');
+  assert.equal(s.stats.crashRoundCount, 1);
+});
+
+test('卡单挂单卖价：新老两种 PROFIT 格式都认，取段内最新一次', () => {
+  const events = [
+    ev('2026-10-03T01:00:00Z', 'NEW_ROUND', 'ETHFDUSD', {}, 'R001'),
+    ev('2026-10-03T01:01:00Z', 'BUY_FILLED', 'ETHFDUSD', { buyPrice: 100, accCost: 50 }, 'R001', 1),
+    // 老格式：params 是 JSON 字符串
+    ev('2026-10-03T01:02:00Z', 'PROFIT_PLACE_PARAMS', 'ETHFDUSD', { params: '{"price":105.5,"quantity":0.5,"side":"SELL"}' }, 'R001', 2),
+    // 新格式：price 直接在 data 上，且更新 → 必须取这个
+    ev('2026-10-03T01:03:00Z', 'PROFIT_PLACE_PARAMS', 'ETHFDUSD', { price: 106.2, quantity: 0.5, side: 'SELL' }, 'R001', 3),
+    // 另一个币种：只有老格式
+    ev('2026-10-03T02:00:00Z', 'NEW_ROUND', 'BTCFDUSD', {}, 'R002'),
+    ev('2026-10-03T02:01:00Z', 'BUY_FILLED', 'BTCFDUSD', { buyPrice: 100, accCost: 50 }, 'R002', 1),
+    ev('2026-10-03T02:02:00Z', 'PROFIT_PLACE_PARAMS', 'BTCFDUSD', { params: '{"price":61000.1,"quantity":0.01,"side":"SELL"}' }, 'R002', 2),
+  ];
+  const s = summarizeInstance('a', events.map((e) => ({
+    tsMs: Date.parse(e.ts), seq: e.seq ?? 0, event: e.event, symbol: e.symbol, roundId: e.roundId, data: e.data,
+  })), NOW_MS);
+  assert.equal(s.stuck.length, 2);
+  const eth = s.stuck.find((x) => x.symbol === 'ETHFDUSD');
+  const btc = s.stuck.find((x) => x.symbol === 'BTCFDUSD');
+  assert.equal(eth.sellPrice, 106.2, '取段内最新一次挂卖价（新格式覆盖老格式）');
+  assert.equal(btc.sellPrice, 61000.1, '老格式 params 字符串也要解析出来');
+});

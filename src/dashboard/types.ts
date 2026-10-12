@@ -52,6 +52,8 @@ export interface DashboardStuckRound {
   lastPrice: number | null;
   floating: number | null;
   floatingPct: number | null;
+  /** 当前挂卖单价（段内最新 PROFIT_PLACE_PARAMS；卖单撤下未重挂时可能为 null） */
+  sellPrice: number | null;
   resets: number;
   reductions: number;
   crash: boolean;
