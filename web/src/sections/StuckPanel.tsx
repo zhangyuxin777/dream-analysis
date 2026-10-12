@@ -10,11 +10,11 @@ export function StuckPanel({ inst }: { inst: InstanceData }) {
     <Card className="bg-card/60">
       <CardHeader className="pb-2">
         <CardTitle className="text-base flex items-center gap-2">
-          卡单持仓
+          当前持仓
           {inst.stuck.length > 0 && (
             <Badge variant="outline" className="text-amber-400 border-amber-500/40">
               <AlertTriangle className="w-3 h-3 mr-1" />
-              {inst.stuck.length} 笔未解套
+              {inst.stuck.length} 笔等待止盈
             </Badge>
           )}
         </CardTitle>

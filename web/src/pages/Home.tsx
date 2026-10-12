@@ -74,7 +74,7 @@ export default function Home() {
         <footer className="text-xs text-muted-foreground space-y-1 pt-2 border-t border-border/60">
           <p>
             口径说明：轮次按「币种 + 轮号」切段统计（轮号会复用，遇 completed 开新段，-RCV 接管链并入同轮号）；
-            「攀涨复位掐死」= 段内只有向上复位、没有任何买入成交的轮；卡单时长截至数据末尾。
+            「攀涨复位掐死」= 段内只有向上复位、没有任何买入成交的轮；持仓时长截至数据末尾。
           </p>
           <p className="flex items-center gap-2">
             资金日历与资金曲线同为账户总权益口径（含浮盈浮亏，已剔除入金）；轮次图中的「累计套利」仅含 SELL 成交利润。

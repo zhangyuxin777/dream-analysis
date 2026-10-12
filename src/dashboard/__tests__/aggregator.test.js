@@ -177,6 +177,29 @@ test('深跌轮口径：段内出现过 CRASH_ENTERED 即算，完成时 isCrash
   assert.equal(s.stats.crashRoundCount, 1);
 });
 
+test('深跌退出判定（方案②）：防守轮完成卖出即视为事件结束，无需 CRASH_EXITED（2026-10-12 BTC R073 实盘回归）', () => {
+  const events = [
+    ev('2026-10-07T13:38:54Z', 'NEW_ROUND', 'BTCFDUSD', {}, 'R073-230148'),
+    ev('2026-10-07T13:38:54Z', 'CRASH_ENTERED', 'BTCFDUSD', { dropPercent: 0.04 }, 'R073-230148', 1),
+    ev('2026-10-07T13:40:00Z', 'BUY_FILLED', 'BTCFDUSD', { buyPrice: 83272, accCost: 500 }, 'R073-230148', 2),
+    // 重启恢复接管（-RCV 新 id，轮号不变），之后完成 —— 事件流里**没有** CRASH_EXITED
+    ev('2026-10-09T08:17:17Z', 'RECOVERY_APPLIED', 'BTCFDUSD', {}, 'R073-161717-RCV', 3),
+    ev('2026-10-12T05:04:41Z', 'ROUND_COMPLETED', 'BTCFDUSD', { profit: 18.86, durationHours: 85.44 }, 'R073-161717-RCV', 4),
+  ];
+  const s = summarizeInstance('a', events.map((e) => ({
+    tsMs: Date.parse(e.ts), seq: e.seq ?? 0, event: e.event, symbol: e.symbol, roundId: e.roundId, data: e.data,
+  })), NOW_MS);
+  assert.equal(s.crashes.length, 1);
+  assert.equal(s.crashes[0].end, '2026-10-12T13:04:41.000+08:00', '完成时刻（北京时间）即事件退出时刻');
+
+  // 对照：防守轮一直没完成 → 仍然"防守中"（不许误判结束）
+  const open = summarizeInstance('a', events.slice(0, 3).map((e) => ({
+    tsMs: Date.parse(e.ts), seq: e.seq ?? 0, event: e.event, symbol: e.symbol, roundId: e.roundId, data: e.data,
+  })), NOW_MS);
+  assert.equal(open.crashes.length, 1);
+  assert.equal(open.crashes[0].end, null);
+});
+
 test('卡单挂单卖价：新老两种 PROFIT 格式都认，取段内最新一次', () => {
   const events = [
     ev('2026-10-03T01:00:00Z', 'NEW_ROUND', 'ETHFDUSD', {}, 'R001'),

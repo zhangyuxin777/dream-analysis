@@ -30,6 +30,15 @@ export function KpiStrip({ inst }: { inst: InstanceData }) {
   const depositSum = inst.deposits.reduce((a, b) => a + b.amount, 0)
   const adjDelta = s.equityDelta != null ? s.equityDelta - depositSum : null
 
+  // 持仓卡标签：空仓 = 「当前持仓」；有仓 = 「超 X 天 Y 小时持仓」（取等得最久的一笔）
+  const maxStuckHours = inst.stuck.length > 0 ? Math.max(...inst.stuck.map((x) => x.hours)) : 0
+  const stuckLabel = (() => {
+    if (inst.stuck.length === 0) return '当前持仓'
+    const d = Math.floor(maxStuckHours / 24)
+    const h = Math.round(maxStuckHours % 24)
+    return d > 0 ? `超 ${d} 天 ${h} 小时持仓` : `超 ${Math.round(maxStuckHours)} 小时持仓`
+  })()
+
   // 年化收益率（APY）= 净盈亏（含浮盈浮亏，已剔除入金）÷ 净投入本金 ÷ 运行天数 × 365
   // 净投入本金 = 当前总权益 − 净盈亏（即刨掉账面盈亏后实际投入多少）
   const days =
@@ -70,9 +79,9 @@ export function KpiStrip({ inst }: { inst: InstanceData }) {
         sub={`完成 / 新开 · 中位 ${fmtHours(s.medianRoundHours)}`}
       />
       <Kpi
-        label="卡单持仓"
+        label={stuckLabel}
         value={`${inst.stuck.length} 笔`}
-        sub={stuckCost > 0 ? `占用资金 ${fmtMoney(stuckCost)}` : '当前无卡单'}
+        sub={stuckCost > 0 ? `占用资金 ${fmtMoney(stuckCost)}` : '全部资金在网格里运转'}
         tone={inst.stuck.length > 0 ? 'warn' : 'up'}
       />
       <Kpi

@@ -281,22 +281,37 @@ export function summarizeInstance(instance: string, events: RawEvent[], nowMs: n
   }
   const daily = [...dailyByDay.values()].sort((a, b) => a.date.localeCompare(b.date));
 
-  // 深跌事件：进入/退出按币种配对（窗口内）
+  // 深跌事件：进入/退出按币种配对（窗口内）。
+  // 退出判定（2026-10-12 方案②，LP 视角的"事实结束"）：策略静默退出深跌时**不发 CRASH_EXITED**
+  // （实盘 BTC R073：10/7 进入防守、10/12 仓位获利了结，但事件流里永远没有退出）——
+  // 因此"进入深跌的那一轮完成卖出"即视为事件结束（end = 完成时刻）；真 CRASH_EXITED 优先。
   const crashes: DashboardCrashEvent[] = [];
-  const openCrash = new Map<string, DashboardCrashEvent>();
+  const openCrash = new Map<string, DashboardCrashEvent & { entryMs: number; roundNo: string }>();
+  const closeCrash = (symbol: string, tsMs: number): void => {
+    const c = openCrash.get(symbol);
+    if (!c) return;
+    c.end = beijingIsoOf(tsMs);
+    crashes.push(c);
+    openCrash.delete(symbol);
+  };
   for (const e of events) {
     if (e.event === 'CRASH_ENTERED') {
       openCrash.set(e.symbol, {
         symbol: e.symbol,
         start: beijingIsoOf(e.tsMs),
+        entryMs: e.tsMs,
+        roundNo: e.roundId === '' ? '' : roundNoOf(e.roundId),
         dropPct: Math.round(num(e.data.dropPercent) * 10_000) / 100,
         end: null,
       });
-    } else if (e.event === 'CRASH_EXITED' && openCrash.has(e.symbol)) {
+    } else if (e.event === 'CRASH_EXITED') {
+      closeCrash(e.symbol, e.tsMs);
+    } else if (e.event === 'ROUND_COMPLETED' && openCrash.has(e.symbol)) {
+      // 恢复接管链的完成轮挂在 -RCV 新 id 下（roundNo 不变），按轮号匹配即可
       const c = openCrash.get(e.symbol)!;
-      c.end = beijingIsoOf(e.tsMs);
-      crashes.push(c);
-      openCrash.delete(e.symbol);
+      if (c.roundNo !== '' && roundNoOf(e.roundId) === c.roundNo && e.tsMs > c.entryMs) {
+        closeCrash(e.symbol, e.tsMs);
+      }
     }
   }
   crashes.push(...openCrash.values());
