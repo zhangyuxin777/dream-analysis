@@ -1,6 +1,6 @@
 import { Card, CardContent } from '@/components/ui/card'
 import type { InstanceData } from '@/types/summary'
-import { fmtMoney, fmtPct } from '@/lib/format'
+import { coinOf, fmtMoney, fmtNum, fmtPct } from '@/lib/format'
 import { cn } from '@/lib/utils'
 
 function Kpi({ label, value, sub, tone }: { label: string; value: string; sub?: string; tone?: 'up' | 'down' | 'warn' }) {
@@ -24,7 +24,8 @@ function Kpi({ label, value, sub, tone }: { label: string; value: string; sub?: 
   )
 }
 
-export function KpiStrip({ inst }: { inst: InstanceData }) {
+export function KpiStrip({ inst, coin }: { inst: InstanceData; coin?: string }) {
+  if (coin) return <CoinKpiStrip inst={inst} coin={coin} />
   const s = inst.stats
   const depositSum = inst.deposits.reduce((a, b) => a + b.amount, 0)
   const adjDelta = s.equityDelta != null ? s.equityDelta - depositSum : null
@@ -71,4 +72,46 @@ export function KpiStrip({ inst }: { inst: InstanceData }) {
       <Kpi label="深跌模式完成轮" value={String(s.crashRoundCount)} sub={`复位后仍完成的轮内复位 ${s.resetsInsideRounds} 次`} />
     </div>
   )
+}
+
+/** 单币种口径：账户级指标（总权益/APY/资金占比）拆不到币，换成该币种的持仓与轮次指标 */
+function CoinKpiStrip({ inst, coin }: { inst: InstanceData; coin: string }) {
+  const holding = [...inst.equity].reverse().find((p) => p.coins?.[coin])
+  const h = holding?.coins[coin]
+  const rounds = inst.completedRounds.filter((r) => coinOf(r.symbol) === coin)
+  const stuck = inst.stuck.filter((r) => coinOf(r.symbol) === coin)
+  const profit = rounds.reduce((a, b) => a + b.profit, 0)
+  const avg = rounds.length > 0 ? profit / rounds.length : null
+  const crashRounds = rounds.filter((r) => r.isCrash).length
+  const stuckCost = stuck.reduce((a, b) => a + b.accCost, 0)
+
+  return (
+    <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-5 gap-3">
+      <Kpi
+        label={`${coin} 持仓市值`}
+        value={h ? fmtMoney(h.value) : '—'}
+        sub={h ? `${fmtNum(h.qty, 4)} ${coin} @ $${fmtNum(h.price)}` : '当前无持仓'}
+        tone={h ? 'up' : undefined}
+      />
+      <Kpi label="套利收益" value={fmtMoney(profit, true)} sub={`${rounds.length} 轮 · 均 ${fmtMoney(avg)}/轮`} tone="up" />
+      <Kpi
+        label="卡单占用"
+        value={stuck.length > 0 ? fmtMoney(stuckCost) : '—'}
+        sub={stuck.length > 0 ? `${stuck.length} 笔等待止盈` : '当前无持仓'}
+        tone={stuck.length > 0 ? 'warn' : undefined}
+      />
+      <Kpi label="深跌模式完成轮" value={String(crashRounds)} sub={`窗口内 ${coin} 完成轮 ${rounds.length} 次`} />
+      <Kpi
+        label="完成轮中位时长"
+        value={avgHours(rounds) != null ? `${avgHours(rounds)!.toFixed(1)} 小时` : '—'}
+        sub="从开仓到止盈卖出的中位耗时"
+      />
+    </div>
+  )
+}
+
+function avgHours(rounds: Array<{ hours: number }>): number | null {
+  if (rounds.length === 0) return null
+  const sorted = rounds.map((r) => r.hours).sort((a, b) => a - b)
+  return sorted[Math.floor(sorted.length / 2)]
 }

@@ -77,12 +77,13 @@ interface Segment {
   roundNo: string;
 }
 
-/** 收集一个实例的全部事件（按 ts、seq 升序，与分片内序一致） */
-async function loadEvents(source: EventSourceLike, instance: string): Promise<RawEvent[]> {
+/** 收集一个实例的全部事件（按 ts、seq 升序，与分片内序一致）；顺带返回是否有非 final 分片（当天数据「暂定」） */
+async function loadEvents(source: EventSourceLike, instance: string): Promise<{ events: RawEvent[]; provisional: boolean }> {
   const days = source.availableDays(instance);
   const window = { label: '全部', fromMs: 0, toMs: Number.MAX_SAFE_INTEGER, days };
   const events: RawEvent[] = [];
-  await source.scan({ window, instance }, (e: LoadedEventLike) => {
+  let provisional = false;
+  const stats = await source.scan({ window, instance }, (e: LoadedEventLike) => {
     const tsMs = Date.parse(e.ts);
     if (!Number.isFinite(tsMs)) return;
     events.push({
@@ -94,15 +95,21 @@ async function loadEvents(source: EventSourceLike, instance: string): Promise<Ra
       data: (e.data ?? {}) as Record<string, unknown>,
     });
   });
+  provisional = stats.provisional;
   events.sort((a, b) => a.tsMs - b.tsMs || a.seq - b.seq);
-  return events;
+  return { events, provisional };
 }
 
 /** 汇总单个实例（口径与 build_summary.py 的 summarize() 逐条对应） */
-export function summarizeInstance(instance: string, events: RawEvent[], nowMs: number): DashboardInstanceData {
+export function summarizeInstance(
+  instance: string,
+  events: RawEvent[],
+  nowMs: number,
+  opts: { provisional?: boolean } = {},
+): DashboardInstanceData {
   const datasetEndMs = events.length > 0 ? events[events.length - 1].tsMs : nowMs;
 
-  // 资金曲线：每个 ACCOUNT_OBSERVED 快照一点（FDUSD 的可用/锁定 + 总权益）
+  // 资金曲线：每个 ACCOUNT_OBSERVED 快照一点（FDUSD 的可用/锁定 + 总权益 + 各币种持仓）
   const equity: DashboardEquityPoint[] = [];
   // 每币种最新市价：从持仓估值反推（深跌期间 bidPrice 停更，不可靠）
   const lastPrice = new Map<string, number>();
@@ -117,19 +124,24 @@ export function summarizeInstance(instance: string, events: RawEvent[], nowMs: n
       locked += num(b.qtyLocked);
     }
     const total = num(e.data.totalValue);
+    const coins: Record<string, { qty: number; value: number; price: number }> = {};
+    for (const b of balances) {
+      if (b.asset === 'FDUSD') continue;
+      const qty = num(b.qtyFree) + num(b.qtyLocked);
+      const value = num(b.value);
+      if (qty > 0 && value > 0) {
+        coins[coinOf(String(b.asset))] = { qty: round6(qty), value: round2(value), price: round2(value / qty) };
+        lastPrice.set(String(b.asset), round2(value / qty));
+      }
+    }
     equity.push({
       t: beijingIsoOf(e.tsMs),
       total: round2(total),
       free: round2(free),
       locked: round2(locked),
       idlePct: total > 0 ? Math.round((free / total) * 1000) / 10 : 0,
+      coins,
     });
-    for (const b of balances) {
-      if (b.asset === 'FDUSD') continue;
-      const qty = num(b.qtyFree) + num(b.qtyLocked);
-      const value = num(b.value);
-      if (qty > 0 && value > 0) lastPrice.set(String(b.asset), round2(value / qty));
-    }
   }
 
   // 入金检测：相邻快照权益跳升 > 3% 记为一次注资
@@ -251,27 +263,44 @@ export function summarizeInstance(instance: string, events: RawEvent[], nowMs: n
   }
   stuck.sort((a, b) => b.hours - a.hours);
 
-  // 日维度（北京时间）
+  // 日维度（北京时间）；账户级与按币级两套并行累计（币种维度的净盈亏拆不出来，不给 net）
   const dailyByDay = new Map<string, DashboardDailyStat>();
+  const dailyByCoinDay = new Map<string, DashboardDailyStat>();
+  const emptyDaily = (day: string): DashboardDailyStat => ({ date: day, profit: 0, rounds: 0, new: 0, resets: 0, crashIn: 0, crashOut: 0, sells: 0 });
   for (const e of events) {
     const day = beijingDayOfMs(e.tsMs);
     let d = dailyByDay.get(day);
     if (!d) {
-      d = { date: day, profit: 0, rounds: 0, new: 0, resets: 0, crashIn: 0, crashOut: 0, sells: 0 };
+      d = emptyDaily(day);
       dailyByDay.set(day, d);
     }
-    switch (e.event) {
-      case 'ROUND_COMPLETED':
-        d.profit = round2(d.profit + num(e.data.profit));
-        d.rounds += 1;
-        break;
-      case 'NEW_ROUND': d.new += 1; break;
-      case 'WORKER_DEVIATION_RESET': d.resets += 1; break;
-      case 'CRASH_ENTERED': d.crashIn += 1; break;
-      case 'CRASH_EXITED': d.crashOut += 1; break;
-      case 'SELL_FILLED': d.sells += 1; break;
-      default: break;
+    let dc: DashboardDailyStat | null = null;
+    // ACCOUNT_OBSERVED 的 symbol 是 '__account__'（账户级标记，不是币种），不进按币维度
+    if (e.symbol !== '' && e.symbol !== '__account__') {
+      const key = `${coinOf(e.symbol)}|${day}`;
+      dc = dailyByCoinDay.get(key) ?? null;
+      if (!dc) {
+        dc = emptyDaily(day);
+        dailyByCoinDay.set(key, dc);
+      }
     }
+    const bump = (stat: DashboardDailyStat | null): void => {
+      if (!stat) return;
+      switch (e.event) {
+        case 'ROUND_COMPLETED':
+          stat.profit = round2(stat.profit + num(e.data.profit));
+          stat.rounds += 1;
+          break;
+        case 'NEW_ROUND': stat.new += 1; break;
+        case 'WORKER_DEVIATION_RESET': stat.resets += 1; break;
+        case 'CRASH_ENTERED': stat.crashIn += 1; break;
+        case 'CRASH_EXITED': stat.crashOut += 1; break;
+        case 'SELL_FILLED': stat.sells += 1; break;
+        default: break;
+      }
+    };
+    bump(d);
+    bump(dc);
   }
   // 合并每日净盈亏（权益口径）；无快照的日期保持 net=null
   for (const [day, net] of dayNet) {
@@ -280,6 +309,12 @@ export function summarizeInstance(instance: string, events: RawEvent[], nowMs: n
     else dailyByDay.set(day, { date: day, profit: 0, net, rounds: 0, new: 0, resets: 0, crashIn: 0, crashOut: 0, sells: 0 });
   }
   const daily = [...dailyByDay.values()].sort((a, b) => a.date.localeCompare(b.date));
+  const dailyByCoin: Record<string, DashboardDailyStat[]> = {};
+  for (const [key, stat] of dailyByCoinDay) {
+    const coin = key.slice(0, key.indexOf('|'));
+    (dailyByCoin[coin] ??= []).push(stat);
+  }
+  for (const list of Object.values(dailyByCoin)) list.sort((a, b) => a.date.localeCompare(b.date));
 
   // 深跌事件：进入/退出按币种配对（窗口内）。
   // 退出判定（2026-10-12 方案②，LP 视角的"事实结束"）：策略静默退出深跌时**不发 CRASH_EXITED**
@@ -329,12 +364,14 @@ export function summarizeInstance(instance: string, events: RawEvent[], nowMs: n
   return {
     instance,
     datasetEnd: beijingIsoOf(datasetEndMs),
+    datasetEndProvisional: opts.provisional ?? false,
     range: {
       from: equity.length > 0 ? equity[0].t : null,
       to: equity.length > 0 ? equity[equity.length - 1].t : null,
     },
     equity,
     daily,
+    dailyByCoin,
     completedRounds,
     stuck,
     crashes,
@@ -371,8 +408,8 @@ export async function aggregateDashboard(
   const instances: Record<string, DashboardInstanceData> = {};
   for (const instance of source.instances()) {
     if (skip.has(instance) || instance.startsWith('.')) continue;
-    const events = await loadEvents(source, instance);
-    instances[instance] = summarizeInstance(instance, events, nowMs);
+    const { events, provisional } = await loadEvents(source, instance);
+    instances[instance] = summarizeInstance(instance, events, nowMs, { provisional });
   }
   return {
     generatedAt: beijingIsoOf(nowMs),

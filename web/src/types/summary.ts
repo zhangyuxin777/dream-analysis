@@ -1,9 +1,17 @@
+export interface CoinHolding {
+  qty: number
+  value: number
+  price: number
+}
+
 export interface EquityPoint {
   t: string
   total: number
   free: number
   locked: number
   idlePct: number
+  /** 该快照时刻各币种持仓（价格 = 市值÷数量，由聚合器反推） */
+  coins: Record<string, CoinHolding>
 }
 
 export interface DailyStat {
@@ -77,9 +85,13 @@ export interface InstanceStats {
 export interface InstanceData {
   instance: string
   datasetEnd: string
+  /** 数据末尾当天分片还不是 final（当天数据会修订，展示侧标「暂定」） */
+  datasetEndProvisional: boolean
   range: { from: string | null; to: string | null }
   equity: EquityPoint[]
   daily: DailyStat[]
+  /** 按币种的日维度（net 是账户级口径拆不到币，单币种条目一律无 net） */
+  dailyByCoin: Record<string, DailyStat[]>
   completedRounds: CompletedRound[]
   stuck: StuckRound[]
   crashes: CrashEvent[]

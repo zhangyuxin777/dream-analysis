@@ -93,6 +93,7 @@ test('完成轮 + 卡单 + 重号切段 + RCV 链合并 + 深跌 + 入金', asyn
   // 资金曲线与入金
   assert.equal(s.equity.length, 2);
   assert.equal(s.equity[0].idlePct, 0.9);
+  assert.deepEqual(s.equity[0].coins.ETH, { qty: 1.2, value: 240, price: 200 }, '快照里要带出每币种持仓明细（单币种资金曲线的价格来源）');
   assert.equal(s.deposits.length, 1);
   assert.equal(s.deposits[0].amount, 4500);
 
@@ -139,6 +140,20 @@ test('完成轮 + 卡单 + 重号切段 + RCV 链合并 + 深跌 + 入金', asyn
   assert.equal(d.crashIn, 1);
   assert.equal(d.crashOut, 1);
 
+  // 按币日维度：ETH/BTC 各成一套，币内计数与账户级一致；net 拆不到币，必须缺省
+  const ethDaily = s.dailyByCoin.ETH;
+  const btcDaily = s.dailyByCoin.BTC;
+  assert.equal(ethDaily.length, 1);
+  assert.deepEqual(
+    { profit: ethDaily[0].profit, rounds: ethDaily[0].rounds, new: ethDaily[0].new, resets: ethDaily[0].resets, crashIn: ethDaily[0].crashIn, crashOut: ethDaily[0].crashOut, net: ethDaily[0].net ?? null },
+    { profit: 1.5, rounds: 1, new: 3, resets: 1, crashIn: 1, crashOut: 1, net: null },
+  );
+  assert.equal(btcDaily.length, 1);
+  assert.deepEqual(
+    { new: btcDaily[0].new, resets: btcDaily[0].resets, profit: btcDaily[0].profit },
+    { new: 1, resets: 1, profit: 0 },
+  );
+
   // stats
   assert.equal(s.stats.realizedProfit, 1.5);
   assert.equal(s.stats.completedCount, 1);
@@ -157,6 +172,18 @@ test('aggregateDashboard 跳过 localtest 与点目录', async () => {
   const summary = await aggregateDashboard(source, NOW_MS);
   assert.deepEqual(Object.keys(summary.instances).sort(), ['a']);
   assert.equal(summary.timezone, 'Asia/Shanghai');
+  assert.equal(summary.instances.a.datasetEndProvisional, false, 'fakeSource 的分片都是 final → 不标暂定');
+});
+
+test('datasetEndProvisional：扫到非 final 分片时标暂定', async () => {
+  const source = fakeSource({ a: [obs('2026-10-03T00:00:00Z')] });
+  const origScan = source.scan;
+  source.scan = async (filter, cb) => {
+    const stats = await origScan(filter, cb);
+    return { ...stats, provisional: true };
+  };
+  const summary = await aggregateDashboard(source, NOW_MS);
+  assert.equal(summary.instances.a.datasetEndProvisional, true);
 });
 
 test('深跌轮口径：段内出现过 CRASH_ENTERED 即算，完成时 isCrashMode=false 也算（2026-10-12 BTC R073 实盘回归）', () => {

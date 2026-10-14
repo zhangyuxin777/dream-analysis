@@ -21,22 +21,23 @@ const tooltipStyle = {
   fontSize: 12,
 } as const
 
-export function DailyFlow({ inst }: { inst: InstanceData }) {
+export function DailyFlow({ inst, coin }: { inst: InstanceData; coin?: string }) {
+  const daily = coin ? (inst.dailyByCoin?.[coin] ?? []) : inst.daily
   const data = useMemo(() => {
     let cum = 0
-    return inst.daily.map((d) => {
+    return daily.map((d) => {
       cum += d.profit
       return { ...d, cum: Math.round(cum * 100) / 100 }
     })
-  }, [inst])
+  }, [daily])
 
   return (
     <Card className="bg-card/60">
       <CardHeader className="pb-2">
-        <CardTitle className="text-base">轮次吞吐 与 累计套利收益</CardTitle>
+        <CardTitle className="text-base">轮次吞吐 与 累计套利收益{coin ? `（${coin}）` : ''}</CardTitle>
         <CardDescription>
           柱子 = 每天新开（蓝）、完成（绿）、被攀涨掐死（红）的轮次；绿线 = 累计套利收益（右轴）。
-          10/7 起柱子全消失 = 深跌防守：不开新轮、没有新收益，利润引擎停摆
+          {coin ? '单币种口径：只统计该币种的轮次。' : '10/7 起柱子全消失 = 深跌防守：不开新轮、没有新收益，利润引擎停摆'}
         </CardDescription>
       </CardHeader>
       <CardContent>

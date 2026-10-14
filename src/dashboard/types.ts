@@ -7,12 +7,21 @@
  * 2026-10-11 由 Python 逐条翻译为 TS，同分片产物逐字段 diff 全过后切换。
  */
 
+/** 单个权益快照里某币种的持仓明细（市值/数量从 balances 直接读，价格 = 市值÷数量反推） */
+export interface DashboardCoinHolding {
+  qty: number;
+  value: number;
+  price: number;
+}
+
 export interface DashboardEquityPoint {
   t: string;
   total: number;
   free: number;
   locked: number;
   idlePct: number;
+  /** 该快照时刻各币种的持仓（无持仓的币种不出现；账户级字段拆不到币，所以另给这个） */
+  coins: Record<string, DashboardCoinHolding>;
 }
 
 export interface DashboardDailyStat {
@@ -87,9 +96,13 @@ export interface DashboardInstanceStats {
 export interface DashboardInstanceData {
   instance: string;
   datasetEnd: string;
+  /** 数据末尾当天分片还不是 final（当天数据会随后续快照修订，展示侧应标「暂定」） */
+  datasetEndProvisional: boolean;
   range: { from: string | null; to: string | null };
   equity: DashboardEquityPoint[];
   daily: DashboardDailyStat[];
+  /** 按币种的日维度（键 = 去掉 FDUSD 后缀的币种，如 BTC/ETH）；net 是账户级口径拆不到币，此处的条目一律无 net */
+  dailyByCoin: Record<string, DashboardDailyStat[]>;
   completedRounds: DashboardCompletedRound[];
   stuck: DashboardStuckRound[];
   crashes: DashboardCrashEvent[];

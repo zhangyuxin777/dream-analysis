@@ -28,13 +28,15 @@ function cellAppearance(value: number | null, isNet: boolean, max: number): { bg
   return { cls: 'bg-muted/30 text-muted-foreground' }
 }
 
-export function ProfitCalendar({ inst }: { inst: InstanceData }) {
+export function ProfitCalendar({ inst, coin }: { inst: InstanceData; coin?: string }) {
+  const daily = coin ? (inst.dailyByCoin?.[coin] ?? []) : inst.daily
   const { weeks, maxAbs, extreme, byDate } = useMemo(() => {
-    const map = new Map(inst.daily.map((d) => [d.date, d]))
-    // 净盈亏（含浮盈浮亏）优先；灰色格（无权益快照）退回已实现利润
-    const vals = inst.daily.map((d) => (d.net != null ? d.net : d.profit))
+    const map = new Map(daily.map((d) => [d.date, d]))
+    // 净盈亏（含浮盈浮亏）优先；灰色格（无权益快照）退回已实现利润。
+    // 单币种口径没有 net（账户级权益拆不到币），一律用已实现利润
+    const vals = daily.map((d) => (d.net != null ? d.net : d.profit))
     const maxAbs = Math.max(1, ...vals.map((v) => Math.abs(v)))
-    const dates = inst.daily.map((d) => d.date).sort()
+    const dates = daily.map((d) => d.date).sort()
     const first = dates[0] ?? '2026-10-01'
     const last = dates[dates.length - 1] ?? first
     const [fy, fm] = first.split('-').map(Number)
@@ -52,7 +54,8 @@ export function ProfitCalendar({ inst }: { inst: InstanceData }) {
         date: key,
         day: d.getDate(),
         value: stat ? (stat.net != null ? stat.net : stat.profit) : null,
-        isNet: stat?.net != null,
+        // 单币种口径没有 net（账户级权益拆不到币），有数据即按盈亏着色；isNet 在这里退化成「有数据可着色」
+        isNet: stat ? (coin ? true : stat.net != null) : false,
       })
       if (cur.length === 7) {
         weeks.push(cur)
@@ -65,21 +68,23 @@ export function ProfitCalendar({ inst }: { inst: InstanceData }) {
     }
     // 极值日：按 |值| 找最大的一天，保留真实符号和日期
     let extreme: { value: number; date: string } | null = null
-    for (const d of inst.daily) {
+    for (const d of daily) {
       const v = d.net != null ? d.net : d.profit
       if (extreme == null || Math.abs(v) > Math.abs(extreme.value)) {
         extreme = { value: v, date: d.date }
       }
     }
     return { weeks, maxAbs, extreme, byDate: map }
-  }, [inst])
+  }, [daily])
 
   return (
     <Card className="bg-card/60">
       <CardHeader className="pb-2">
-        <CardTitle className="text-base">资金日历</CardTitle>
+        <CardTitle className="text-base">资金日历{coin ? `（${coin}）` : ''}</CardTitle>
         <CardDescription>
-          每日净盈亏 = 当日账户权益变化（含持仓浮盈浮亏，与资金曲线同口径）；灰色格 = 当日无权益快照，退回显示套利收益
+          {coin
+            ? '单币种口径：每日已实现套利收益（净盈亏是账户级权益口径，拆不到单币种）；红亏绿赚，灰格 = 当日无该币种数据'
+            : '每日净盈亏 = 当日账户权益变化（含持仓浮盈浮亏，与资金曲线同口径）；灰色格 = 当日没有任何账户权益快照（快照缺失或滞后），净盈亏算不出来，退回显示已实现套利收益'}
         </CardDescription>
       </CardHeader>
       <CardContent>
@@ -99,8 +104,8 @@ export function ProfitCalendar({ inst }: { inst: InstanceData }) {
                     key={j}
                     title={
                       cell.value != null
-                        ? `${cell.date}：${cell.isNet ? '净盈亏（含浮盈浮亏）' : '套利收益（无权益快照）'} ${fmtMoney(cell.value, true)} · 完成 ${byDate.get(cell.date)?.rounds ?? 0} 轮 · 新开 ${byDate.get(cell.date)?.new ?? 0} · 复位 ${byDate.get(cell.date)?.resets ?? 0}`
-                        : `${cell.date}：无数据`
+                        ? `${cell.date}：${coin ? '已实现套利收益（单币种口径）' : cell.isNet ? '净盈亏（含浮盈浮亏）' : '套利收益（当日无权益快照）'} ${fmtMoney(cell.value, true)} · 完成 ${byDate.get(cell.date)?.rounds ?? 0} 轮 · 新开 ${byDate.get(cell.date)?.new ?? 0} · 复位 ${byDate.get(cell.date)?.resets ?? 0}`
+                        : `${cell.date}：${coin ? '当日无该币种数据' : '当日无权益快照'}`
                     }
                     style={(() => {
                       const a = cellAppearance(cell.value, cell.isNet, maxAbs)
@@ -123,13 +128,13 @@ export function ProfitCalendar({ inst }: { inst: InstanceData }) {
         </div>
         <div className="flex items-center gap-4 mt-3 text-[11px] text-muted-foreground">
           <span className="flex items-center gap-1.5">
-            <span className="inline-block w-3 h-3 rounded-sm" style={{ background: 'rgba(244,63,94,0.6)' }} /> 净亏损
+            <span className="inline-block w-3 h-3 rounded-sm" style={{ background: 'rgba(244,63,94,0.6)' }} /> {coin ? '亏损' : '净亏损'}
           </span>
           <span className="flex items-center gap-1.5">
-            <span className="inline-block w-3 h-3 rounded-sm" style={{ background: 'rgba(16,185,129,0.6)' }} /> 净盈利（越深越多）
+            <span className="inline-block w-3 h-3 rounded-sm" style={{ background: 'rgba(16,185,129,0.6)' }} /> {coin ? '盈利（越深越多）' : '净盈利（越深越多）'}
           </span>
           <span className="flex items-center gap-1.5">
-            <span className="inline-block w-3 h-3 rounded-sm bg-muted/40" /> 灰 = 无快照（仅套利收益）
+            <span className="inline-block w-3 h-3 rounded-sm bg-muted/40" /> {coin ? '灰 = 当日无该币种数据' : '灰 = 当日无权益快照（仅套利收益）'}
           </span>
           <span className="ml-auto">
             单日极值{' '}

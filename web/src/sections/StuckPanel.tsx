@@ -5,16 +5,17 @@ import { AlertTriangle, ShieldAlert } from 'lucide-react'
 import type { InstanceData } from '@/types/summary'
 import { coinOf, fmtDateTime, fmtHours, fmtMoney, fmtNum } from '@/lib/format'
 
-export function StuckPanel({ inst }: { inst: InstanceData }) {
+export function StuckPanel({ inst, coin }: { inst: InstanceData; coin?: string }) {
+  const stuck = coin ? inst.stuck.filter((s) => coinOf(s.symbol) === coin) : inst.stuck
   return (
     <Card className="bg-card/60">
       <CardHeader className="pb-2">
         <CardTitle className="text-base flex items-center gap-2">
-          当前持仓
-          {inst.stuck.length > 0 && (
+          当前持仓{coin ? `（${coin}）` : ''}
+          {stuck.length > 0 && (
             <Badge variant="outline" className="text-amber-400 border-amber-500/40">
               <AlertTriangle className="w-3 h-3 mr-1" />
-              {inst.stuck.length} 笔等待止盈
+              {stuck.length} 笔等待止盈
             </Badge>
           )}
         </CardTitle>
@@ -24,7 +25,7 @@ export function StuckPanel({ inst }: { inst: InstanceData }) {
         </CardDescription>
       </CardHeader>
       <CardContent>
-        {inst.stuck.length === 0 ? (
+        {stuck.length === 0 ? (
           <div className="text-sm text-emerald-400 py-6 text-center">当前没有持仓，全部资金都在网格里运转。</div>
         ) : (
           <Table>
@@ -39,7 +40,7 @@ export function StuckPanel({ inst }: { inst: InstanceData }) {
               </TableRow>
             </TableHeader>
             <TableBody>
-              {inst.stuck.map((s) => (
+              {stuck.map((s) => (
                 <TableRow key={s.roundNo + s.symbol}>
                   <TableCell className="font-medium">{coinOf(s.symbol)}</TableCell>
                   <TableCell className="text-right tabular-nums">${fmtNum(s.avgBuy)}</TableCell>
@@ -67,11 +68,11 @@ export function StuckPanel({ inst }: { inst: InstanceData }) {
             </TableBody>
           </Table>
         )}
-        {inst.stuck.length > 0 && (
+        {stuck.length > 0 && (
           <p className="text-xs text-muted-foreground mt-3">
-            合计占用 {fmtMoney(inst.stuck.reduce((a, b) => a + b.accCost, 0))}，占比约{' '}
+            合计占用 {fmtMoney(stuck.reduce((a, b) => a + b.accCost, 0))}，占比约{' '}
             {inst.stats.lastEquity
-              ? ((inst.stuck.reduce((a, b) => a + b.accCost, 0) / inst.stats.lastEquity) * 100).toFixed(0)
+              ? ((stuck.reduce((a, b) => a + b.accCost, 0) / inst.stats.lastEquity) * 100).toFixed(0)
               : '—'}
             % 总权益。等止盈是网格策略的正常状态。
           </p>
