@@ -33,6 +33,8 @@ export function TodayStatus({ inst, coin }: { inst: InstanceData; coin?: string 
   const defending = inst.crashes.filter(
     (c) => c.end === null && c.start.slice(0, 10) !== dayStr && (!coin || coinOf(c.symbol) === coin),
   )
+  // 防守中的深跌轮本身也以「等止盈持仓」挂在 stuck 里（同一笔），卡单消息不再重复报
+  const defendingKeys = new Set(defending.map((c) => `${c.symbol}|${c.roundNo}`))
   const endMs = new Date(inst.datasetEnd).getTime()
   for (const c of defending.slice(0, 2)) {
     const hours = (endMs - new Date(c.start).getTime()) / 3600000
@@ -53,8 +55,10 @@ export function TodayStatus({ inst, coin }: { inst: InstanceData; coin?: string 
     })
   }
 
-  // 卡单：当前持仓等止盈的已等待时长（LP 点名要盯的口径）
-  const stuckNow = inst.stuck.filter((s) => !coin || coinOf(s.symbol) === coin)
+  // 卡单：当前持仓等止盈的已等待时长（LP 点名要盯的口径）；深跌防守中的轮已在上文报过，跳过
+  const stuckNow = inst.stuck.filter(
+    (s) => (!coin || coinOf(s.symbol) === coin) && !defendingKeys.has(`${s.symbol}|${s.roundNo}`),
+  )
   for (const s of stuckNow.slice(0, 2)) {
     parts.push({
       text: `${coin ? '' : coinOf(s.symbol)} 有一笔持仓在等止盈，已卡单 ${fmtHours(s.hours)}（挂卖 $${s.sellPrice?.toFixed(2) ?? '—'}）`,
@@ -83,8 +87,8 @@ export function TodayStatus({ inst, coin }: { inst: InstanceData; coin?: string 
   const hasWarn = parts.some((p) => p.tone === 'warn')
 
   return (
-    <Card className={hasWarn ? 'bg-amber-500/5 border-amber-500/30' : 'bg-emerald-500/5 border-emerald-500/20'}>
-      <CardContent className="pt-3 pb-3 px-4 flex items-start gap-2.5">
+    <Card className={hasWarn ? 'bg-amber-500/5 border-amber-500/30 py-0' : 'bg-emerald-500/5 border-emerald-500/20 py-0'}>
+      <CardContent className="px-3 py-2.5 md:px-4 md:py-3 flex items-start gap-2.5">
         {hasWarn ? (
           <ShieldAlert className="w-4 h-4 mt-0.5 text-amber-400 shrink-0" />
         ) : parts.some((p) => p.text.includes('大赚') || p.text.includes('解套')) ? (
@@ -92,7 +96,7 @@ export function TodayStatus({ inst, coin }: { inst: InstanceData; coin?: string 
         ) : (
           <CheckCircle2 className="w-4 h-4 mt-0.5 text-emerald-400 shrink-0" />
         )}
-        <div className="text-sm leading-6">
+        <div className="text-[13px] leading-5 md:text-sm md:leading-6">
           <span className="text-muted-foreground mr-2">
             {dayStr} 今日状态{coin ? `（${coin}）` : ''}
           </span>

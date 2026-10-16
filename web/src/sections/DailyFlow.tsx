@@ -41,7 +41,7 @@ export function DailyFlow({ inst, coin }: { inst: InstanceData; coin?: string })
         </CardDescription>
       </CardHeader>
       <CardContent>
-        <div className="h-72">
+        <div className="h-56 md:h-72">
           <ResponsiveContainer width="100%" height="100%">
             <ComposedChart data={data} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
               <CartesianGrid strokeDasharray="3 3" stroke="hsl(240 4% 16%)" vertical={false} />

@@ -42,11 +42,11 @@ export default function Home() {
 
   return (
     <div className="min-h-screen bg-background text-foreground">
-      <div className="max-w-6xl mx-auto px-4 py-6 space-y-4">
-        <header className="flex flex-wrap items-end justify-between gap-3">
+      <div className="max-w-6xl mx-auto px-3 py-4 space-y-3 md:px-4 md:py-6 md:space-y-4">
+        <header className="flex flex-wrap items-end justify-between gap-2 md:gap-3">
           <div>
-            <h1 className="text-2xl font-bold tracking-tight">Dream 网格策略 · 数据看板</h1>
-            <p className="text-sm text-muted-foreground mt-1">
+            <h1 className="text-xl md:text-2xl font-bold tracking-tight">Dream 网格策略 · 数据看板</h1>
+            <p className="text-xs md:text-sm text-muted-foreground mt-1">
               数据窗口 {fmtDateTime(inst.range.from)} ~ {fmtDateTime(inst.datasetEnd)}（北京时间）· 策略快照整点产出，
               滞后约 1 小时
               {inst.datasetEndProvisional && (
@@ -66,7 +66,7 @@ export default function Home() {
                     aria-selected={curCoin === c}
                     onClick={() => setCoin(c)}
                     className={cn(
-                      'px-3 py-1.5 text-sm transition-colors',
+                      'px-2.5 py-1 text-xs md:px-3 md:py-1.5 md:text-sm transition-colors',
                       curCoin === c
                         ? 'bg-primary text-primary-foreground font-medium'
                         : 'text-muted-foreground hover:text-foreground hover:bg-muted/50',
@@ -78,7 +78,7 @@ export default function Home() {
               </div>
             )}
             <Select value={current} onValueChange={setActive}>
-              <SelectTrigger className="w-44" aria-label="选择实例">
+              <SelectTrigger className="w-32 md:w-44" aria-label="选择实例">
                 <SelectValue placeholder="选择实例" />
               </SelectTrigger>
               <SelectContent>
@@ -94,20 +94,40 @@ export default function Home() {
 
         <TodayStatus inst={inst} coin={curCoin} />
 
-        <KpiStrip inst={inst} coin={curCoin} />
+        {/* 分币种视图：LP 先看的轮次事实（日历/吞吐）放最前，概览卡片殿后；总览视图保持卡片优先 */}
+        {curCoin ? (
+          <>
+            <div className="grid grid-cols-1 xl:grid-cols-5 gap-3 md:gap-4">
+              <div className="xl:col-span-3">
+                <ProfitCalendar inst={inst} coin={curCoin} />
+              </div>
+              <div className="xl:col-span-2">
+                <EquityChart inst={inst} coin={curCoin} />
+              </div>
+            </div>
 
-        <div className="grid grid-cols-1 xl:grid-cols-5 gap-4">
-          <div className="xl:col-span-3">
-            <EquityChart inst={inst} coin={curCoin} />
-          </div>
-          <div className="xl:col-span-2">
-            <ProfitCalendar inst={inst} coin={curCoin} />
-          </div>
-        </div>
+            <DailyFlow inst={inst} coin={curCoin} />
 
-        <DailyFlow inst={inst} coin={curCoin} />
+            <KpiStrip inst={inst} coin={curCoin} />
+          </>
+        ) : (
+          <>
+            <KpiStrip inst={inst} coin={curCoin} />
 
-        <div className="grid grid-cols-1 xl:grid-cols-5 gap-4">
+            <div className="grid grid-cols-1 xl:grid-cols-5 gap-3 md:gap-4">
+              <div className="xl:col-span-3">
+                <EquityChart inst={inst} coin={curCoin} />
+              </div>
+              <div className="xl:col-span-2">
+                <ProfitCalendar inst={inst} coin={curCoin} />
+              </div>
+            </div>
+
+            <DailyFlow inst={inst} coin={curCoin} />
+          </>
+        )}
+
+        <div className="grid grid-cols-1 xl:grid-cols-5 gap-3 md:gap-4">
           <div className="xl:col-span-3">
             <StuckPanel inst={inst} coin={curCoin} />
           </div>

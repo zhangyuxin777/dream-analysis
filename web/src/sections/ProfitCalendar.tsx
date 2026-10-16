@@ -112,7 +112,7 @@ export function ProfitCalendar({ inst, coin }: { inst: InstanceData; coin?: stri
                       return a.bg ? { background: a.bg } : undefined
                     })()}
                     className={cn(
-                      'h-11 rounded-md flex flex-col items-center justify-center text-xs tabular-nums transition-transform hover:scale-105 cursor-default',
+                      'h-9 md:h-11 rounded-md flex flex-col items-center justify-center text-xs tabular-nums transition-transform hover:scale-105 cursor-default',
                       cellAppearance(cell.value, cell.isNet, maxAbs).cls,
                     )}
                   >

@@ -1,16 +1,16 @@
 import { Card, CardContent } from '@/components/ui/card'
 import type { InstanceData } from '@/types/summary'
-import { coinOf, fmtMoney, fmtNum, fmtPct } from '@/lib/format'
+import { coinOf, fmtMoney, fmtPct } from '@/lib/format'
 import { cn } from '@/lib/utils'
 
 function Kpi({ label, value, sub, tone }: { label: string; value: string; sub?: string; tone?: 'up' | 'down' | 'warn' }) {
   return (
-    <Card className="bg-card/60">
-      <CardContent className="pt-4 pb-3 px-4">
+    <Card className="bg-card/60 py-0">
+      <CardContent className="px-3 py-2.5 md:px-4 md:pt-4 md:pb-3">
         <div className="text-xs text-muted-foreground">{label}</div>
         <div
           className={cn(
-            'text-xl font-semibold tabular-nums mt-1',
+            'text-lg md:text-xl font-semibold tabular-nums mt-1',
             tone === 'up' && 'text-emerald-400',
             tone === 'down' && 'text-rose-400',
             tone === 'warn' && 'text-amber-400',
@@ -41,7 +41,7 @@ export function KpiStrip({ inst, coin }: { inst: InstanceData; coin?: string }) 
   const apy = days > 0 && principal > 0 ? (totalPnl / principal / days) * 365 * 100 : null
 
   return (
-    <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-5 gap-3">
+    <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-5 gap-2 md:gap-3">
       <Kpi
         label="当前总权益"
         value={fmtMoney(s.lastEquity)}
@@ -74,32 +74,16 @@ export function KpiStrip({ inst, coin }: { inst: InstanceData; coin?: string }) 
   )
 }
 
-/** 单币种口径：账户级指标（总权益/APY/资金占比）拆不到币，换成该币种的持仓与轮次指标 */
+/** 单币种口径：只保留轮次收益类指标（持仓市值/卡单占用已按 LP 要求移除，明细在下方持仓面板） */
 function CoinKpiStrip({ inst, coin }: { inst: InstanceData; coin: string }) {
-  const holding = [...inst.equity].reverse().find((p) => p.coins?.[coin])
-  const h = holding?.coins[coin]
   const rounds = inst.completedRounds.filter((r) => coinOf(r.symbol) === coin)
-  const stuck = inst.stuck.filter((r) => coinOf(r.symbol) === coin)
   const profit = rounds.reduce((a, b) => a + b.profit, 0)
   const avg = rounds.length > 0 ? profit / rounds.length : null
   const crashRounds = rounds.filter((r) => r.isCrash).length
-  const stuckCost = stuck.reduce((a, b) => a + b.accCost, 0)
 
   return (
-    <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-5 gap-3">
-      <Kpi
-        label={`${coin} 持仓市值`}
-        value={h ? fmtMoney(h.value) : '—'}
-        sub={h ? `${fmtNum(h.qty, 4)} ${coin} @ $${fmtNum(h.price)}` : '当前无持仓'}
-        tone={h ? 'up' : undefined}
-      />
+    <div className="grid grid-cols-3 gap-2 md:gap-3">
       <Kpi label="套利收益" value={fmtMoney(profit, true)} sub={`${rounds.length} 轮 · 均 ${fmtMoney(avg)}/轮`} tone="up" />
-      <Kpi
-        label="卡单占用"
-        value={stuck.length > 0 ? fmtMoney(stuckCost) : '—'}
-        sub={stuck.length > 0 ? `${stuck.length} 笔等待止盈` : '当前无持仓'}
-        tone={stuck.length > 0 ? 'warn' : undefined}
-      />
       <Kpi label="深跌模式完成轮" value={String(crashRounds)} sub={`窗口内 ${coin} 完成轮 ${rounds.length} 次`} />
       <Kpi
         label="完成轮中位时长"

@@ -24,7 +24,7 @@ export function CrashTimeline({ inst, coin }: { inst: InstanceData; coin?: strin
               const end = c.end ? new Date(c.end) : null
               const hours = end ? (end.getTime() - start.getTime()) / 3600000 : null
               return (
-                <div key={i} className="flex items-center gap-3 rounded-lg border border-border/60 px-4 py-3">
+                <div key={i} className="flex items-center gap-3 rounded-lg border border-border/60 px-3 py-2.5 md:px-4 md:py-3">
                   {end ? (
                     <ShieldCheck className="w-5 h-5 text-emerald-400 shrink-0" />
                   ) : (

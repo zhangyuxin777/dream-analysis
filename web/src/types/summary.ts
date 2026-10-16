@@ -61,6 +61,10 @@ export interface StuckRound {
 export interface CrashEvent {
   symbol: string
   start: string
+  /** 深跌进入时刻（ms），聚合器直出 */
+  entryMs: number
+  /** 进入深跌时的轮号（恢复接管链按轮号匹配退出） */
+  roundNo: string
   dropPct: number
   end: string | null
 }
